@@ -27,7 +27,15 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
-REXCVAR_DECLARE(int32_t, frame_rate_limit);
+REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
+                     "Caps the frame rate to this many frames per second. Paces the guest's own "
+                     "Update+Render+Present tick (see ThrottleGuestTickRate in "
+                     "xboxkrnl_video.cpp); the host presents each guest frame as it arrives, so "
+                     "this one limiter sets the displayed frame rate too. 0 = the guest ticks at "
+                     "a safe 30Hz default. Some of the game's own gameplay timing math assumes a "
+                     "fixed ~30Hz cadence and doesn't automatically scale with a higher rate.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
