@@ -214,6 +214,18 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  X_INPUT_STATE state = {};
+  X_RESULT result = GetDevicesState(user_index, &state);
+  if (state_filter_) {
+    result = state_filter_(user_index, result, &state);
+  }
+  if (result == X_ERROR_SUCCESS && out_state) {
+    *out_state = state;
+  }
+  return result;
+}
+
+X_RESULT InputSystem::GetDevicesState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -295,6 +307,19 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  X_INPUT_KEYSTROKE keystroke = {};
+  X_RESULT result = GetDevicesKeystroke(user_index, flags, &keystroke);
+  if (keystroke_filter_) {
+    result = keystroke_filter_(user_index, result, &keystroke);
+  }
+  if (result == X_ERROR_SUCCESS && out_keystroke) {
+    *out_keystroke = keystroke;
+  }
+  return result;
+}
+
+X_RESULT InputSystem::GetDevicesKeystroke(uint32_t user_index, uint32_t flags,
+                                          X_INPUT_KEYSTROKE* out_keystroke) {
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

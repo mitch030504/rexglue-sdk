@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -42,6 +43,16 @@ class InputSystem : public system::IInputSystem {
   /// Replaces any previous assignment. Call before the guest starts polling.
   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
 
+  /// Sees every guest state/keystroke read after the devices answer, and may rewrite it: for
+  /// input record/replay and netplay, which must control exactly what the guest reads. Takes the
+  /// devices' result and returns the one the guest gets. Set before the guest starts polling.
+  using StateFilter = std::function<X_RESULT(uint32_t user_index, X_RESULT result,
+                                             X_INPUT_STATE* state)>;
+  using KeystrokeFilter = std::function<X_RESULT(uint32_t user_index, X_RESULT result,
+                                                 X_INPUT_KEYSTROKE* keystroke)>;
+  void SetStateFilter(StateFilter filter) { state_filter_ = std::move(filter); }
+  void SetKeystrokeFilter(KeystrokeFilter filter) { keystroke_filter_ = std::move(filter); }
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
@@ -51,6 +62,9 @@ class InputSystem : public system::IInputSystem {
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();
+  X_RESULT GetDevicesState(uint32_t user_index, X_INPUT_STATE* out_state);
+  X_RESULT GetDevicesKeystroke(uint32_t user_index, uint32_t flags,
+                               X_INPUT_KEYSTROKE* out_keystroke);
   InputDriver* DriverForDevice(DeviceId id);
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
 
@@ -59,6 +73,8 @@ class InputSystem : public system::IInputSystem {
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 
   std::unique_ptr<DeviceAssignment> assignment_;
+  StateFilter state_filter_;
+  KeystrokeFilter keystroke_filter_;
   ActiveDeviceTracker active_devices_;
 
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
