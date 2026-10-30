@@ -140,6 +140,22 @@ function(rexglue_configure_target target_name)
                 )
             endif()
         endforeach()
+        # The prebuilt SDK 2.4 runtime: loaded at runtime, so stage it the same way, with its
+        # licence (which redistribution requires).
+        foreach(_fx IN LISTS REXGLUE_FIDELITYFX_PREBUILT_FILES)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_fx}"
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endforeach()
+        if(REXGLUE_FIDELITYFX_PREBUILT_LICENSE)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${REXGLUE_FIDELITYFX_PREBUILT_LICENSE}"
+                    $<TARGET_FILE_DIR:${target_name}>/amd_fidelityfx_license.md
+                VERBATIM
+            )
+        endif()
     endif()
 
     # Stage requested GPU emulation plugins next to the executable. Plugins

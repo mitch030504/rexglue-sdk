@@ -136,6 +136,14 @@ endif()
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
+# Windows: AMD's prebuilt SDK 2.4 runtime (FSR 4.1.2) for both graphics APIs. The 1.1.4 tree above
+# still provides the CAS/FSR1 shader headers (sdk/include); nothing else of it is built.
+include(${CMAKE_CURRENT_LIST_DIR}/rexglue_fidelityfx_prebuilt.cmake)
+if(REXGLUE_FIDELITYFX_PREBUILT)
+    message(STATUS "FidelityFX: prebuilt SDK 2.4 runtime (FSR 4.1.2, FSR 3.1 fallback), D3D12 + Vulkan")
+    return()
+endif()
+
 # ── Backend selection ────────────────────────────────────────────────────
 set(REXGLUE_FIDELITYFX_BACKEND "auto" CACHE STRING
     "FidelityFX backend to build (auto, vk, dx12)")

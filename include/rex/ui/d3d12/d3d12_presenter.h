@@ -12,12 +12,15 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+#include <rex/ui/d3d12/d3d12_temporal_inputs.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 
@@ -269,8 +272,17 @@ class D3D12Presenter final : public Presenter {
                                 ID3D12Resource* input_resource, uint32_t input_width,
                                 uint32_t input_height, ID3D12Resource* output_resource,
                                 uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config);
+                                const GuestOutputPaintConfig& config, uint64_t frame_index);
+  // Whether output_resource still holds the upscaled image of this guest frame, so a repaint can
+  // reuse it instead of feeding the same frame to the upscaler twice.
+  bool TemporalUpscalerHasFrame(uint64_t frame_index, ID3D12Resource* output_resource,
+                                uint32_t output_width, uint32_t output_height) const;
   void DestroyTemporalUpscalerContext();
+  // present_temporal_dump_prefix: copy the upscaler's output (in UNORDERED_ACCESS) to a readback
+  // buffer, and write it out once the paint that copied it has completed on the GPU.
+  void RecordTemporalDump(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource,
+                          uint32_t width, uint32_t height, uint64_t frame_index);
+  void WriteCompletedTemporalDump();
 #endif
 
   const D3D12Provider& provider_;
@@ -319,6 +331,19 @@ class D3D12Presenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
+  std::unique_ptr<D3D12TemporalInputs> temporal_inputs_;
+  std::chrono::steady_clock::time_point temporal_last_time_;
+  ID3D12Resource* temporal_last_output_resource_ = nullptr;
+  uint64_t temporal_last_frame_index_ = UINT64_MAX;
+  struct {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    UINT64 submission = 0;
+    uint64_t frame_index = 0;
+    uint64_t next_frame_index = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t row_pitch = 0;
+  } temporal_dump_;
 #endif
 };
 

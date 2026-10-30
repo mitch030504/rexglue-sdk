@@ -30,6 +30,8 @@
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/flags.h>
+#include "ui/ffx_runtime.h"
 #include <rex/ui/temporal_jitter.h>
 #include <rex/ui/vulkan/temporal_inputs.h>
 #include <rex/ui/vulkan/util.h>
@@ -65,14 +67,6 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-REXCVAR_DEFINE_STRING(present_temporal_dump_prefix, "", "UI/Presenter",
-                      "Development: write the temporal upscaler's output to "
-                      "<prefix><guest frame>.ppm every present_temporal_dump_interval guest frames.");
-REXCVAR_DEFINE_INT32(present_temporal_dump_interval, 300, "UI/Presenter",
-                     "Guest frames between present_temporal_dump_prefix images.")
-    .range(1, 1000000);
-#endif
 
 namespace rex {
 namespace ui {
@@ -273,7 +267,7 @@ void VulkanPresenter::DestroyTemporalUpscalerContext() {
     return;
   }
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  ffxDestroyContext(context, nullptr);
+  ffx::Get(ffx::Api::kVulkan)->DestroyContext(context, nullptr);
   temporal_upscaler_context_ = nullptr;
   temporal_upscaler_max_render_width_ = 0;
   temporal_upscaler_max_render_height_ = 0;
@@ -283,6 +277,10 @@ void VulkanPresenter::DestroyTemporalUpscalerContext() {
 
 bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                                     uint32_t output_width, uint32_t output_height) {
+  const ffx::Functions* ffx_functions = ffx::Get(ffx::Api::kVulkan);
+  if (!ffx_functions) {
+    return false;
+  }
   if (!temporal_upscaler_context_ || temporal_upscaler_max_render_width_ != render_width ||
       temporal_upscaler_max_render_height_ != render_height ||
       temporal_upscaler_max_output_width_ != output_width ||
@@ -305,8 +303,6 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     ffxCreateBackendVKDesc backend_desc = {};
     backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     backend_desc.header.pNext = nullptr;
-    backend_desc.vkDevice = vulkan_device_->device();
-    backend_desc.vkPhysicalDevice = vulkan_device_->physical_device();
     PFN_vkGetDeviceProcAddr vk_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
         vulkan_device_->vulkan_instance()->functions().vkGetInstanceProcAddr(
             vulkan_device_->vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
@@ -315,12 +311,21 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
       return false;
     }
     g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
+#if defined(REX_FIDELITYFX_PREBUILT) && REX_FIDELITYFX_PREBUILT
+    // SDK 2.4 moved the device into a VkDeviceContext.
+    backend_desc.deviceContext.vkDevice = vulkan_device_->device();
+    backend_desc.deviceContext.vkPhysicalDevice = vulkan_device_->physical_device();
+    backend_desc.deviceContext.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
+#else
+    backend_desc.vkDevice = vulkan_device_->device();
+    backend_desc.vkPhysicalDevice = vulkan_device_->physical_device();
     backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
+#endif
 
     create_desc.header.pNext = &backend_desc.header;
 
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-    if (ffxCreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
+    if (ffx_functions->CreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
       REXLOG_WARN(
           "VulkanPresenter: Failed to create FidelityFX temporal upscaler "
           "context");
@@ -340,7 +345,7 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     provider_version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     provider_version.header.pNext = nullptr;
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-    if (ffxQuery(context, &provider_version.header) == FFX_API_RETURN_OK &&
+    if (ffx_functions->Query(context, &provider_version.header) == FFX_API_RETURN_OK &&
         provider_version.versionName) {
       REXLOG_INFO("VulkanPresenter: FidelityFX upscaler provider {}", provider_version.versionName);
     }
@@ -528,7 +533,8 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
   dispatch_desc.flags = 0;
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  const ffxReturnCode_t dispatch_result = ffxDispatch(context, &dispatch_desc.header);
+  const ffxReturnCode_t dispatch_result =
+      ffx::Get(ffx::Api::kVulkan)->Dispatch(context, &dispatch_desc.header);
   if (dispatch_result != FFX_API_RETURN_OK) {
     static std::atomic<bool> logged = false;
     if (!logged.exchange(true)) {

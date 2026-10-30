@@ -14,6 +14,7 @@ set(REXUI_CORE_SOURCES
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     temporal_jitter.cpp
+    ffx_runtime.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -58,6 +59,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/d3d12_descriptor_heap_pool.cpp
         d3d12/d3d12_immediate_drawer.cpp
         d3d12/d3d12_presenter.cpp
+        d3d12/d3d12_temporal_inputs.cpp
         d3d12/d3d12_provider.cpp
         d3d12/d3d12_submission_tracker.cpp
         d3d12/d3d12_upload_buffer_pool.cpp
@@ -127,6 +129,12 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
+if(REXGLUE_FIDELITYFX_PREBUILT AND REXGLUE_FIDELITYFX_PREBUILT_INCLUDE_DIR)
+    # Ahead of the 1.1.4 ffx-api/include, which has the same <ffx_api/...> names.
+    target_include_directories(rexui BEFORE PRIVATE "${REXGLUE_FIDELITYFX_PREBUILT_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_FIDELITYFX_PREBUILT=1)
+    set(REXUI_HAS_FIDELITYFX_RUNTIME ON)
+endif()
 if(TARGET amd_fidelityfx_vk)
     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)
     set(REXUI_HAS_FIDELITYFX_RUNTIME ON)

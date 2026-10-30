@@ -25,6 +25,7 @@
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
+#include "ui/ffx_runtime.h"
 #endif
 
 REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
@@ -36,6 +37,15 @@ REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
                      "fixed ~30Hz cadence and doesn't automatically scale with a higher rate.")
     .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Shared by the D3D12 and Vulkan presenters' temporal upscalers.
+REXCVAR_DEFINE_STRING(
+    present_temporal_dump_prefix, "", "UI/Presenter",
+    "Development: write the temporal upscaler's output to "
+    "<prefix><guest frame>.ppm every present_temporal_dump_interval guest frames.");
+REXCVAR_DEFINE_INT32(present_temporal_dump_interval, 300, "UI/Presenter",
+                     "Guest frames between present_temporal_dump_prefix images.")
+    .range(1, 1000000);
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
@@ -240,8 +250,9 @@ bool QueryTemporalFsrRenderResolutionFromQualityMode(uint32_t display_width,
   query_desc.qualityMode = api_mode;
   query_desc.pOutRenderWidth = &render_width_out;
   query_desc.pOutRenderHeight = &render_height_out;
-  if (ffxQuery(nullptr, &query_desc.header) == FFX_API_RETURN_OK && render_width_out &&
-      render_height_out) {
+  const rex::ui::ffx::Functions* ffx_functions = rex::ui::ffx::GetAny();
+  if (ffx_functions && ffx_functions->Query(nullptr, &query_desc.header) == FFX_API_RETURN_OK &&
+      render_width_out && render_height_out) {
     return true;
   }
 #endif
