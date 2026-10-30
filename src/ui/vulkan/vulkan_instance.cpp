@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,10 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_BOOL(dlss5_layer, false, "GPU",
+                    "Linux, NVIDIA: run the presented image through DLSS5VKLayer (DLSS 5 neural "
+                    "rendering, a separate install; see the README)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace ui {
@@ -223,6 +228,20 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (try_enable_validation) {
     requested_layers.emplace("VK_LAYER_KHRONOS_validation", &layer_khronos_validation);
   }
+  // DLSS5VKLayer is an implicit layer that stays off unless VKLayer_DLSS5=1, and the loader only
+  // lists it once that's set, so set it before enumerating. Requesting it by name as well tells us
+  // whether it's installed.
+  bool layer_dlss5 = false;
+  if (REXCVAR_GET(dlss5_layer)) {
+#if REX_PLATFORM_LINUX
+    setenv("VKLayer_DLSS5", "1", 1);
+    requested_layers.emplace("VK_LAYER_NV_dlssnr", &layer_dlss5);
+#else
+    REXLOG_WARN(
+        "dlss5_layer: DLSS5VKLayer is a Linux Vulkan layer; under Proton, launch with "
+        "VKLayer_DLSS5=1 instead");
+#endif
+  }
 
   std::vector<const char*> enabled_layers;
 
@@ -325,6 +344,18 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
           *requested_layer_it->second = true;
         }
       }
+    }
+  }
+
+  if (REXCVAR_GET(dlss5_layer) && REX_PLATFORM_LINUX) {
+    if (layer_dlss5) {
+      REXLOG_INFO(
+          "dlss5_layer: DLSS5VKLayer enabled; it needs an NVIDIA GPU and its running helper "
+          "(dlssnr-helper start), and passes frames through otherwise");
+    } else {
+      REXLOG_WARN(
+          "dlss5_layer: DLSS5VKLayer (VK_LAYER_NV_dlssnr) isn't installed; see the README, "
+          "\"DLSS 5 on Linux\"");
     }
   }
 

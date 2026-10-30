@@ -41,6 +41,8 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DECLARE(bool, dlss5_layer);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -529,6 +531,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       properties.deviceName, VK_VERSION_MAJOR(properties.apiVersion),
       VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion),
       properties.vendorID, properties.deviceID, properties.driverVersion);
+  if (REXCVAR_GET(dlss5_layer) && properties.vendorID != 0x10DE) {
+    REXLOG_WARN("dlss5_layer: DLSS 5 needs an NVIDIA GPU; DLSS5VKLayer will pass frames through");
+  }
   if (unclamped_api_version != properties.apiVersion) {
     REXLOG_INFO(
         "Device supports Vulkan API {}.{}.{}, but the used version is limited "
