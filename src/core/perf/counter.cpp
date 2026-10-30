@@ -154,8 +154,19 @@ void SetCsvLogPath(const std::string& path) {
 }
 
 void WriteCsvFrame() {
-  if (!g_csv_file)
-    return;
+  if (!g_csv_file) {
+    // Nothing else opens perf_log_csv, so the first frame does (once, so a bad path warns once).
+    static bool cvar_checked = false;
+    if (cvar_checked)
+      return;
+    cvar_checked = true;
+    const std::string path = REXCVAR_GET(perf_log_csv);
+    if (path.empty())
+      return;
+    SetCsvLogPath(path);
+    if (!g_csv_file)
+      return;
+  }
 
   for (size_t i = 0; i < kNumCounters; ++i) {
     if (i > 0)
