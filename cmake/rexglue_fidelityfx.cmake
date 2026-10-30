@@ -58,6 +58,27 @@ if(NOT fidelityfx_POPULATED)
     FetchContent_Populate(fidelityfx)
 endif()
 
+# Ninja runs custom commands through /bin/sh, which is bash on Arch-based distros, and bash
+# brace-expands the shader compiler's "-DX={0,1}" permutation lists into "-DX=0 -DX=1" (glslang:
+# "Macro redefined"). Escape the brace so every shell passes it through literally.
+if(NOT WIN32)
+    set(_rexglue_ffx_sc_file
+        "${fidelityfx_SOURCE_DIR}/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt")
+    file(READ "${_rexglue_ffx_sc_file}" _rexglue_ffx_sc_text)
+    string(FIND "${_rexglue_ffx_sc_text}" "Keep {0,1} permutation lists" _rexglue_ffx_sc_done)
+    if(_rexglue_ffx_sc_done EQUAL -1)
+        set(_rexglue_ffx_sc_anchor "\t\tset(SC_ARGS \${BASE_ARGS} \${API_BASE_ARGS} \${PERMUTATION_ARGS})\n")
+        string(FIND "${_rexglue_ffx_sc_text}" "${_rexglue_ffx_sc_anchor}" _rexglue_ffx_sc_pos)
+        if(_rexglue_ffx_sc_pos EQUAL -1)
+            message(FATAL_ERROR "FidelityFX shader compile script changed; update the brace-escape patch")
+        endif()
+        string(REPLACE "${_rexglue_ffx_sc_anchor}"
+            "${_rexglue_ffx_sc_anchor}\t\t# Keep {0,1} permutation lists away from shell brace expansion.\n\t\tif (NOT WIN32)\n\t\t\tstring(REPLACE \"{\" \"\\\\{\" SC_ARGS \"\${SC_ARGS}\")\n\t\tendif()\n"
+            _rexglue_ffx_sc_text "${_rexglue_ffx_sc_text}")
+        file(WRITE "${_rexglue_ffx_sc_file}" "${_rexglue_ffx_sc_text}")
+    endif()
+endif()
+
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
