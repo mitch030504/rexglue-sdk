@@ -144,11 +144,12 @@ function(rexglue_configure_target target_name)
 
     # Stage requested GPU emulation plugins next to the executable. Plugins
     # are runtime-loaded (never linked), so TARGET_RUNTIME_DLLS misses them.
+    # A POST_BUILD copy only ran when the executable relinked, which a plugin-only change doesn't
+    # do, so the staged plugin went stale. Copy on every build instead (a no-op when up to date).
     foreach(_plugin IN LISTS ARG_GPU_PLUGINS)
+        set(_stage_target ${target_name}_stage_gpu_${_plugin})
         if(TARGET rexgpu-${_plugin})
-            # In-tree build: depend on it so it gets built.
             set(_plugin_target rexgpu-${_plugin})
-            add_dependencies(${target_name} ${_plugin_target})
         elseif(TARGET rex::gpu-${_plugin})
             # Installed SDK import.
             set(_plugin_target rex::gpu-${_plugin})
@@ -157,13 +158,20 @@ function(rexglue_configure_target target_name)
                 "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
                 "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
         endif()
-        add_custom_command(TARGET ${target_name} POST_BUILD
+        add_custom_target(${_stage_target}
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target_name}>
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:${_plugin_target}>
                 $<TARGET_FILE_DIR:${target_name}>
             VERBATIM
         )
+        if(TARGET rexgpu-${_plugin})
+            # In-tree build: build the plugin before staging it.
+            add_dependencies(${_stage_target} ${_plugin_target})
+        endif()
+        add_dependencies(${target_name} ${_stage_target})
         unset(_plugin_target)
+        unset(_stage_target)
     endforeach()
 
     if(APPLE AND REXGLUE_USE_VULKAN)
