@@ -23,6 +23,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/video_mode_util.h>
+#include <rex/ui/temporal_jitter.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -650,6 +651,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+  // One swap packet per call: the temporal upscaler's jitter is keyed by this count.
+  rex::ui::temporal::OnGuestSwap();
 
   // See the frame_rate_limit comment near the top of this file: this reproduces the implicit
   // vblank-wait real Present() had, since nothing else in the guest's synchronous

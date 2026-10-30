@@ -11,13 +11,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -25,6 +30,8 @@
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/temporal_jitter.h>
+#include <rex/ui/vulkan/temporal_inputs.h>
 #include <rex/ui/vulkan/util.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -57,6 +64,15 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+REXCVAR_DEFINE_STRING(present_temporal_dump_prefix, "", "UI/Presenter",
+                      "Development: write the temporal upscaler's output to "
+                      "<prefix><guest frame>.ppm every present_temporal_dump_interval guest frames.");
+REXCVAR_DEFINE_INT32(present_temporal_dump_interval, 300, "UI/Presenter",
+                     "Guest frames between present_temporal_dump_prefix images.")
+    .range(1, 1000000);
+#endif
 
 namespace rex {
 namespace ui {
@@ -209,6 +225,8 @@ VulkanPresenter::~VulkanPresenter() {
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
+  temporal_inputs_.reset();
+  temporal::SetInactive();
 #endif
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
@@ -274,7 +292,10 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
     ffxCreateContextDescUpscale create_desc = {};
     create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     create_desc.header.pNext = nullptr;
-    create_desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    // The guest output is display-referred (gamma-encoded) LDR, and the motion vectors are
+    // estimated from jittered images, so they contain the jitter.
+    create_desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE |
+                        FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
     create_desc.maxRenderSize.width = render_width;
     create_desc.maxRenderSize.height = render_height;
     create_desc.maxUpscaleSize.width = output_width;
@@ -329,80 +350,177 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
   return temporal_upscaler_context_ != nullptr;
 }
 
+void VulkanPresenter::RecordTemporalDump(VkCommandBuffer command_buffer, VkImage image,
+                                         uint32_t width, uint32_t height, uint64_t frame_index) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  if (!util::CreateDedicatedAllocationBuffer(vulkan_device_, VkDeviceSize(width) * height * 4,
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             util::MemoryPurpose::kReadback, temporal_dump_.buffer,
+                                             temporal_dump_.memory)) {
+    return;
+  }
+  VkImageMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange = util::InitializeSubresourceRange();
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+  VkBufferImageCopy region = {};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {width, height, 1};
+  dfn.vkCmdCopyImageToBuffer(command_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             temporal_dump_.buffer, 1, &region);
+  // Back to where the caller expects the upscaler's output.
+  std::swap(barrier.oldLayout, barrier.newLayout);
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                           &barrier);
+  temporal_dump_.submission = paint_context_.submission_tracker.GetCurrentSubmission();
+  temporal_dump_.frame_index = frame_index;
+  temporal_dump_.width = width;
+  temporal_dump_.height = height;
+}
+
+void VulkanPresenter::WriteCompletedTemporalDump() {
+  if (!temporal_dump_.buffer ||
+      paint_context_.submission_tracker.UpdateAndGetCompletedSubmission() <
+          temporal_dump_.submission) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  void* mapping = nullptr;
+  if (dfn.vkMapMemory(device, temporal_dump_.memory, 0, VK_WHOLE_SIZE, 0, &mapping) ==
+      VK_SUCCESS) {
+    VkMappedMemoryRange range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr,
+                                 temporal_dump_.memory, 0, VK_WHOLE_SIZE};
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    const std::string path = fmt::format("{}{:06}.ppm", REXCVAR_GET(present_temporal_dump_prefix),
+                                         temporal_dump_.frame_index);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+      // kGuestOutputFormat: R in bits 0-9, G in 10-19, B in 20-29.
+      std::fprintf(file, "P6\n%u %u\n255\n", temporal_dump_.width, temporal_dump_.height);
+      const auto* pixels = static_cast<const uint32_t*>(mapping);
+      std::vector<uint8_t> row(size_t(temporal_dump_.width) * 3);
+      for (uint32_t y = 0; y < temporal_dump_.height; y++) {
+        for (uint32_t x = 0; x < temporal_dump_.width; x++) {
+          const uint32_t p = pixels[size_t(y) * temporal_dump_.width + x];
+          row[x * 3 + 0] = uint8_t(((p >> 0) & 1023) >> 2);
+          row[x * 3 + 1] = uint8_t(((p >> 10) & 1023) >> 2);
+          row[x * 3 + 2] = uint8_t(((p >> 20) & 1023) >> 2);
+        }
+        std::fwrite(row.data(), 1, row.size(), file);
+      }
+      std::fclose(file);
+    }
+    dfn.vkUnmapMemory(device, temporal_dump_.memory);
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, temporal_dump_.buffer);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, temporal_dump_.memory);
+}
+
+bool VulkanPresenter::TemporalUpscalerHasFrame(uint64_t frame_index, VkImage output_image,
+                                               uint32_t output_width,
+                                               uint32_t output_height) const {
+  return temporal_last_output_image_ == output_image &&
+         temporal_last_frame_index_ == frame_index &&
+         temporal_upscaler_max_output_width_ == output_width &&
+         temporal_upscaler_max_output_height_ == output_height;
+}
+
 bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
                                                uint32_t input_width, uint32_t input_height,
                                                VkImage output_image, uint32_t output_width,
                                                uint32_t output_height,
-                                               const GuestOutputPaintConfig& config) {
+                                               const GuestOutputPaintConfig& config,
+                                               uint64_t frame_index) {
+  WriteCompletedTemporalDump();
   if (command_buffer == VK_NULL_HANDLE || input_image == VK_NULL_HANDLE ||
       output_image == VK_NULL_HANDLE || !input_width || !input_height || !output_width ||
       !output_height) {
     return false;
   }
+  // Both the context and the input images are recreated on a size change; neither may still be
+  // in use by earlier paints.
+  if (temporal_upscaler_context_ &&
+      (temporal_upscaler_max_render_width_ != input_width ||
+       temporal_upscaler_max_render_height_ != input_height ||
+       temporal_upscaler_max_output_width_ != output_width ||
+       temporal_upscaler_max_output_height_ != output_height)) {
+    paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+  }
   if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
+  if (!temporal_inputs_) {
+    temporal_inputs_ = VulkanTemporalInputs::Create(vulkan_device_);
+    if (!temporal_inputs_) {
+      return false;
+    }
+  }
+  bool has_history = false;
+  if (!temporal_inputs_->Record(command_buffer, input_image, input_width, input_height,
+                                has_history)) {
+    return false;
+  }
 
-  VkImageCreateInfo source_image_create_info = {};
-  source_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  source_image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  source_image_create_info.format = kGuestOutputFormat;
-  source_image_create_info.extent.width = input_width;
-  source_image_create_info.extent.height = input_height;
-  source_image_create_info.extent.depth = 1;
-  source_image_create_info.mipLevels = 1;
-  source_image_create_info.arrayLayers = 1;
-  source_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-  source_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  source_image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-  source_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  source_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-  FfxApiResourceDescription source_desc = ffxApiGetImageResourceDescriptionVK(
-      input_image, source_image_create_info, FFX_API_RESOURCE_USAGE_READ_ONLY);
-  FfxApiResource source = ffxApiGetResourceVK(reinterpret_cast<void*>(input_image), source_desc,
-                                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  FfxApiResource depth =
-      ffxApiGetResourceVK(reinterpret_cast<void*>(input_image),
-                          ffxApiGetImageResourceDescriptionVK(input_image, source_image_create_info,
-                                                              FFX_API_RESOURCE_USAGE_DEPTHTARGET),
-                          FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-  FfxApiResource motion_vectors = source;
-
-  VkImageCreateInfo output_image_create_info = source_image_create_info;
+  auto describe = [](const VulkanTemporalInputs::Image& image, uint32_t usage) {
+    return ffxApiGetResourceVK(reinterpret_cast<void*>(image.image),
+                               ffxApiGetImageResourceDescriptionVK(image.image, image.info, usage),
+                               FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  };
+  VkImageCreateInfo output_image_create_info = temporal_inputs_->color().info;
   output_image_create_info.extent.width = output_width;
   output_image_create_info.extent.height = output_height;
-  FfxApiResourceDescription output_desc = ffxApiGetImageResourceDescriptionVK(
-      output_image, output_image_create_info,
-      FFX_API_RESOURCE_USAGE_UAV | FFX_API_RESOURCE_USAGE_READ_ONLY);
-  FfxApiResource output = ffxApiGetResourceVK(reinterpret_cast<void*>(output_image), output_desc,
-                                              FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  output_image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  FfxApiResource output = ffxApiGetResourceVK(
+      reinterpret_cast<void*>(output_image),
+      ffxApiGetImageResourceDescriptionVK(output_image, output_image_create_info,
+                                          FFX_API_RESOURCE_USAGE_UAV |
+                                              FFX_API_RESOURCE_USAGE_READ_ONLY),
+      FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+
+  const auto now = std::chrono::steady_clock::now();
+  float frame_time_ms =
+      has_history ? std::chrono::duration<float, std::milli>(now - temporal_last_time_).count()
+                  : 16.666f;
+  temporal_last_time_ = now;
 
   ffxDispatchDescUpscale dispatch_desc = {};
   dispatch_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-  dispatch_desc.header.pNext = nullptr;
   dispatch_desc.commandList = command_buffer;
-  dispatch_desc.color = source;
-  dispatch_desc.depth = depth;
-  dispatch_desc.motionVectors = motion_vectors;
+  dispatch_desc.color = describe(temporal_inputs_->color(), FFX_API_RESOURCE_USAGE_READ_ONLY);
+  dispatch_desc.depth = describe(temporal_inputs_->depth(), FFX_API_RESOURCE_USAGE_READ_ONLY);
+  dispatch_desc.motionVectors =
+      describe(temporal_inputs_->motion(), FFX_API_RESOURCE_USAGE_READ_ONLY);
   dispatch_desc.exposure = {};
   dispatch_desc.reactive = {};
   dispatch_desc.transparencyAndComposition = {};
   dispatch_desc.output = output;
-  dispatch_desc.jitterOffset.x = 0.0f;
-  dispatch_desc.jitterOffset.y = 0.0f;
-  dispatch_desc.motionVectorScale.x = float(input_width);
-  dispatch_desc.motionVectorScale.y = float(input_height);
+  // The guest rendered this frame with this offset (rex/ui/temporal_jitter.h).
+  temporal::JitterForFrame(frame_index, dispatch_desc.jitterOffset.x,
+                           dispatch_desc.jitterOffset.y);
+  // Motion is in pixels: previous position minus current.
+  dispatch_desc.motionVectorScale.x = 1.0f;
+  dispatch_desc.motionVectorScale.y = 1.0f;
   dispatch_desc.renderSize.width = input_width;
   dispatch_desc.renderSize.height = input_height;
   dispatch_desc.upscaleSize.width = output_width;
   dispatch_desc.upscaleSize.height = output_height;
   dispatch_desc.enableSharpening = true;
   dispatch_desc.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
-  dispatch_desc.reset = true;
-  dispatch_desc.frameTimeDelta = 16.666f;
+  dispatch_desc.reset = !has_history;
+  dispatch_desc.frameTimeDelta = std::clamp(frame_time_ms, 1.0f, 100.0f);
   dispatch_desc.preExposure = 1.0f;
+  // Unknown for a recompiled game, and only used with real depth, which this doesn't have.
   dispatch_desc.cameraNear = 0.1f;
   dispatch_desc.cameraFar = 1000.0f;
   dispatch_desc.cameraFovAngleVertical = 1.0472f;
@@ -410,8 +528,26 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
   dispatch_desc.flags = 0;
 
   ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  if (ffxDispatch(context, &dispatch_desc.header) != FFX_API_RETURN_OK) {
+  const ffxReturnCode_t dispatch_result = ffxDispatch(context, &dispatch_desc.header);
+  if (dispatch_result != FFX_API_RETURN_OK) {
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true)) {
+      REXLOG_WARN("VulkanPresenter: FidelityFX upscale dispatch failed ({}), using spatial FSR",
+                  dispatch_result);
+    }
     return false;
+  }
+  temporal::SetActive(input_width, input_height);
+  temporal_last_output_image_ = output_image;
+  temporal_last_frame_index_ = frame_index;
+
+  const std::string dump_prefix = REXCVAR_GET(present_temporal_dump_prefix);
+  // Not every guest frame is painted, so take the first one at or after each interval.
+  if (!dump_prefix.empty() && !temporal_dump_.buffer &&
+      frame_index >= temporal_dump_.next_frame_index) {
+    const uint64_t interval = uint64_t(REXCVAR_GET(present_temporal_dump_interval));
+    temporal_dump_.next_frame_index = (frame_index / interval + 1) * interval;
+    RecordTemporalDump(command_buffer, output_image, output_width, output_height, frame_index);
   }
   return true;
 }
@@ -1868,6 +2004,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
 #endif
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+        if (!temporal_effect_selected) {
+          temporal::SetInactive();  // stop the guest's projection jitter
+        }
+#endif
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
@@ -1897,6 +2038,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
           bool use_temporal_upscaler =
               temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu;
+          if (use_temporal_upscaler && !is_final_effect &&
+              TemporalUpscalerHasFrame(guest_output_properties.frame_index,
+                                       paint_context_.guest_output_intermediate_images[i]->image(),
+                                       effect_rect_size.first, effect_rect_size.second)) {
+            // A repaint of the same guest frame: the result is still in the image, in shader
+            // read layout, and feeding the frame to the upscaler again would corrupt its history.
+            continue;
+          }
           if (use_temporal_upscaler && !is_final_effect) {
             VkImage source_image =
                 i ? paint_context_.guest_output_intermediate_images[i - 1]->image()
@@ -1925,7 +2074,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
             if (DispatchTemporalUpscaler(draw_command_buffer, source_image, effect_input_width,
                                          effect_input_height, output_image, effect_rect_size.first,
-                                         effect_rect_size.second, guest_output_paint_config)) {
+                                         effect_rect_size.second, guest_output_paint_config,
+                                         guest_output_properties.frame_index)) {
               VkImageMemoryBarrier barrier_to_shader_read = {};
               barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
               barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

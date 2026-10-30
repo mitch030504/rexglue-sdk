@@ -343,6 +343,12 @@ class Presenter {
   // them too.
   void PaintFromUIThread(bool force_paint = false);
 
+  // Called on the guest output thread right before RefreshGuestOutput, with the guest frame index
+  // of the output it's about to refresh (see rex/ui/temporal_jitter.h).
+  void SetNextGuestOutputFrameIndex(uint64_t frame_index) {
+    next_guest_output_frame_index_ = frame_index;
+  }
+
   // Pass 0 as width or height to disable guest output until the next refresh
   // with an actual size. The display aspect ratio may be specified like 16:9 or
   // like 1280:720, both are accepted, for simplicity, the guest display size
@@ -404,6 +410,8 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    // Guest frame this output belongs to (swaps processed before it), for temporal upscaling.
+    uint64_t frame_index = 0;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -977,6 +985,7 @@ class Presenter {
   // happens as part of painting.
   std::mutex guest_output_mailbox_consumer_mutex_;
 
+  uint64_t next_guest_output_frame_index_ = 0;
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.

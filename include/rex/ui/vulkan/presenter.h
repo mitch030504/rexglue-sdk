@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
+#include <rex/ui/vulkan/temporal_inputs.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
 namespace rex {
@@ -438,10 +440,18 @@ class VulkanPresenter final : public Presenter {
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                      uint32_t output_width, uint32_t output_height);
+  // present_temporal_dump_prefix: copy the upscaler's output to a readback buffer, and write it
+  // out once the paint that copied it has completed on the GPU.
+  void RecordTemporalDump(VkCommandBuffer command_buffer, VkImage image, uint32_t width,
+                          uint32_t height, uint64_t frame_index);
+  void WriteCompletedTemporalDump();
+  // Whether output_image already holds the upscaled guest frame frame_index (a repaint).
+  bool TemporalUpscalerHasFrame(uint64_t frame_index, VkImage output_image, uint32_t output_width,
+                                uint32_t output_height) const;
   bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
                                 uint32_t input_width, uint32_t input_height, VkImage output_image,
                                 uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config);
+                                const GuestOutputPaintConfig& config, uint64_t frame_index);
   void DestroyTemporalUpscalerContext();
 #endif
 
@@ -488,6 +498,19 @@ class VulkanPresenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
+  std::unique_ptr<VulkanTemporalInputs> temporal_inputs_;
+  VkImage temporal_last_output_image_ = VK_NULL_HANDLE;
+  uint64_t temporal_last_frame_index_ = UINT64_MAX;
+  std::chrono::steady_clock::time_point temporal_last_time_;
+  struct {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint64_t submission = 0;
+    uint64_t frame_index = 0;
+    uint64_t next_frame_index = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  } temporal_dump_;
 #endif
 };
 

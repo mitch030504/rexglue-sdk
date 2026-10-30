@@ -964,6 +964,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  if (auto* presenter = graphics_system_->presenter()) {
+    presenter->SetNextGuestOutputFrameIndex(guest_frame_count_.load(std::memory_order_relaxed));
+  }
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;

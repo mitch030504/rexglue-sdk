@@ -13,6 +13,7 @@ set(REXUI_CORE_SOURCES
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
+    temporal_jitter.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -43,6 +44,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_instance.cpp
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
+    vulkan/vulkan_temporal_inputs.cpp
     vulkan/vulkan_provider.cpp
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp

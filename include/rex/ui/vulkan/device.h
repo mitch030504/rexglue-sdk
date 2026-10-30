@@ -108,6 +108,7 @@ class VulkanDevice {
     bool fragmentStoresAndAtomics = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
+    bool shaderInt16 = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
 
@@ -122,6 +123,7 @@ class VulkanDevice {
     // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
 
     bool scalarBlockLayout = false;
+    bool shaderFloat16 = false;
 
     // VK_KHR_portability_subset (#164)
 
