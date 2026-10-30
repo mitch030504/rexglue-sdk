@@ -36,6 +36,12 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_STRING(guest_output_dump_prefix, "", "GPU",
+                      "Development: write the game's output image (no overlays) to "
+                      "<prefix><guest frame>.ppm every guest_output_dump_interval guest frames.");
+REXCVAR_DEFINE_INT32(guest_output_dump_interval, 300, "GPU",
+                     "Guest frames between guest_output_dump_prefix images.")
+    .range(1, 1000000);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -965,8 +971,38 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   // deliberately not shared with counter_ above, which also advances on
   // every vblank tick (see GraphicsSystem::MarkVblank) and would otherwise
   // double-count and inflate any FPS computed from it.
-  guest_frame_count_.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t frame = guest_frame_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+  const std::string dump_prefix = REXCVAR_GET(guest_output_dump_prefix);
+  if (!dump_prefix.empty() && frame % uint64_t(REXCVAR_GET(guest_output_dump_interval)) == 0) {
+    DumpGuestOutput(dump_prefix, frame);
+  }
   return true;
+}
+
+void CommandProcessor::DumpGuestOutput(const std::string& prefix, uint64_t frame) {
+  ui::RawImage image;
+  auto* presenter = graphics_system_->presenter();
+  if (!presenter || !presenter->CaptureGuestOutput(image)) {
+    REXGPU_WARN("guest_output_dump: couldn't capture guest frame {}", frame);
+    return;
+  }
+  const std::string path = fmt::format("{}{:06}.ppm", prefix, frame);
+  std::FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    REXGPU_WARN("guest_output_dump: can't write {}", path);
+    return;
+  }
+  // Binary PPM: the image is R8G8B8X8 rows, PPM wants R8G8B8.
+  std::fprintf(file, "P6\n%u %u\n255\n", image.width, image.height);
+  std::vector<uint8_t> row(size_t(image.width) * 3);
+  for (uint32_t y = 0; y < image.height; y++) {
+    const uint8_t* src = image.data.data() + y * image.stride;
+    for (uint32_t x = 0; x < image.width; x++) {
+      std::memcpy(&row[x * 3], src + x * 4, 3);
+    }
+    std::fwrite(row.data(), 1, row.size(), file);
+  }
+  std::fclose(file);
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,

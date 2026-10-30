@@ -241,6 +241,9 @@ class CommandProcessor {
 
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
+  // guest_output_dump_prefix: saves the presenter's current guest output as a PPM.
+  void DumpGuestOutput(const std::string& prefix, uint64_t frame);
+
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* register_file_ = nullptr;
 
