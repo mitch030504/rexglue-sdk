@@ -1562,11 +1562,19 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
-  if (swapchain != VK_NULL_HANDLE) {
-    submission_tracker.AwaitAllSubmissionsCompletion();
-  }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  if (swapchain != VK_NULL_HANDLE) {
+    submission_tracker.AwaitAllSubmissionsCompletion();
+    // The fences above don't cover vkQueuePresentKHR, and a swapchain can't be destroyed while a
+    // present still uses its images (VUID-vkDestroySwapchainKHR-swapchain-01282). Swapchains are
+    // only retired on resize and surface changes, so idling the present queue is cheap enough.
+    if (present_queue_family != UINT32_MAX) {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device->AcquireQueue(present_queue_family, 0);
+      dfn.vkQueueWaitIdle(queue_acquisition.queue());
+    }
+  }
   for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
     dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
