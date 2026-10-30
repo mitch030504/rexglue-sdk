@@ -225,6 +225,11 @@ endif()
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
 
 #=============================================================================
+# XeSS (optional, Windows, fetched on demand)
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_xess.cmake)
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")

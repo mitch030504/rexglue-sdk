@@ -15,6 +15,7 @@ set(REXUI_CORE_SOURCES
     sdl_virtual_key.cpp
     temporal_jitter.cpp
     ffx_runtime.cpp
+    xess_runtime.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -126,6 +127,11 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+endif()
+
+if(REXGLUE_ENABLE_XESS AND REXGLUE_XESS_INCLUDE_DIR)
+    target_include_directories(rexui PRIVATE "${REXGLUE_XESS_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_XESS=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

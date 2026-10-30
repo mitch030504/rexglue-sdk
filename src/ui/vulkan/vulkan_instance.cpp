@@ -10,6 +10,7 @@
  */
 
 #include <cstdlib>
+#include <deque>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter.h>
+#include "ui/xess_runtime.h"
 
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
@@ -171,6 +173,24 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
   }
+
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  // XeSS on Vulkan needs its instance extensions enabled when the instance is created.
+  std::deque<bool> xess_extensions_enabled;
+  if (xess::Selected()) {
+    uint32_t xess_extension_count = 0;
+    const char* const* xess_extensions = nullptr;
+    uint32_t xess_api_version = 0;
+    if (xess::Get()->VKGetRequiredInstanceExtensions(&xess_extension_count, &xess_extensions,
+                                                     &xess_api_version) == XESS_RESULT_SUCCESS) {
+      for (uint32_t i = 0; i < xess_extension_count; ++i) {
+        requested_extensions.emplace(xess_extensions[i], &xess_extensions_enabled.emplace_back());
+      }
+    } else {
+      REXLOG_WARN("XeSS: couldn't get its required Vulkan instance extensions");
+    }
+  }
+#endif
 
   std::vector<const char*> enabled_extensions;
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +22,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include "ui/xess_runtime.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -250,6 +252,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
 
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  // XeSS on Vulkan needs its device extensions and features enabled at device creation.
+  const bool xess_requested = xess::Selected() && get_physical_device_properties2_supported &&
+                              properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0);
+  std::deque<bool> xess_extensions_enabled;
+  if (xess_requested) {
+    uint32_t xess_extension_count = 0;
+    const char* const* xess_extensions = nullptr;
+    if (xess::Get()->VKGetRequiredDeviceExtensions(vulkan_instance->instance(), physical_device,
+                                                   &xess_extension_count,
+                                                   &xess_extensions) == XESS_RESULT_SUCCESS) {
+      for (uint32_t i = 0; i < xess_extension_count; ++i) {
+        requested_extensions.emplace(xess_extensions[i], &xess_extensions_enabled.emplace_back());
+      }
+    } else {
+      REXLOG_WARN("XeSS: couldn't get its required Vulkan device extensions");
+    }
+  }
+#endif
+
   std::vector<const char*> enabled_extensions;
   {
     uint32_t supported_extension_count = 0;
@@ -337,6 +359,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  // Not otherwise used; only linked for the features XeSS asks for.
+  VulkanFeatures<VkPhysicalDeviceVulkan11Features,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
+      xess_features_1_1;
+  VulkanFeatures<VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT>
+      xess_features_EXT_mutable_descriptor_type;
+  bool xess_mutable_descriptor_type_linked = false;
+#endif
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -378,6 +410,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
     }
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+    if (xess_requested) {
+      xess_features_1_1.Link(supported_features_2, device_create_info);
+      if (std::find_if(enabled_extensions.begin(), enabled_extensions.end(), [](const char* name) {
+            return std::strcmp(name, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) == 0;
+          }) != enabled_extensions.end()) {
+        xess_features_EXT_mutable_descriptor_type.Link(supported_features_2, device_create_info);
+        xess_mutable_descriptor_type_linked = true;
+      }
+    }
+#endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
   }
@@ -745,6 +788,78 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_PROPERTY_2
 #undef XE_UI_VULKAN_ENUM_PROPERTY_2
 #undef XE_UI_VULKAN_FEATURE_2
+
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  if (xess_requested) {
+    void* xess_features = nullptr;
+    if (xess::Get()->VKGetRequiredDeviceFeatures(vulkan_instance->instance(), physical_device,
+                                                 &xess_features) == XESS_RESULT_SUCCESS) {
+      // Turn on each feature XeSS asks for that the device has; if it lacks one, XeSS fails to
+      // start later and the upscaler falls back to FSR, rather than device creation failing here.
+      uint32_t unsupported = 0;
+      auto merge = [&](void* enabled, const void* requested, const void* supported, size_t offset,
+                       size_t size) {
+        for (size_t o = offset; o + sizeof(VkBool32) <= size; o += sizeof(VkBool32)) {
+          VkBool32 wanted, available;
+          std::memcpy(&wanted, static_cast<const uint8_t*>(requested) + o, sizeof(VkBool32));
+          std::memcpy(&available, static_cast<const uint8_t*>(supported) + o, sizeof(VkBool32));
+          if (wanted && available) {
+            const VkBool32 on = VK_TRUE;
+            std::memcpy(static_cast<uint8_t*>(enabled) + o, &on, sizeof(VkBool32));
+          } else if (wanted) {
+            ++unsupported;
+          }
+        }
+      };
+      // Feature structures: sType and pNext, then only VkBool32 members.
+      constexpr size_t kBoolsOffset = sizeof(VkBaseOutStructure);
+      for (auto* in = static_cast<const VkBaseInStructure*>(xess_features); in; in = in->pNext) {
+        switch (in->sType) {
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+            merge(&enabled_features,
+                  &reinterpret_cast<const VkPhysicalDeviceFeatures2*>(in)->features,
+                  &supported_features_2.features, 0, sizeof(VkPhysicalDeviceFeatures));
+            break;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+            merge(&xess_features_1_1.enabled, in, &xess_features_1_1.supported, kBoolsOffset,
+                  sizeof(VkPhysicalDeviceVulkan11Features));
+            break;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+            merge(&features_1_2.enabled, in, &features_1_2.supported, kBoolsOffset,
+                  sizeof(VkPhysicalDeviceVulkan12Features));
+            break;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+            if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+              merge(&features_1_3.enabled, in, &features_1_3.supported, kBoolsOffset,
+                    sizeof(VkPhysicalDeviceVulkan13Features));
+            } else {
+              ++unsupported;
+            }
+            break;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT:
+            if (xess_mutable_descriptor_type_linked) {
+              merge(&xess_features_EXT_mutable_descriptor_type.enabled, in,
+                    &xess_features_EXT_mutable_descriptor_type.supported, kBoolsOffset,
+                    sizeof(VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT));
+            } else {
+              ++unsupported;
+            }
+            break;
+          default:
+            REXLOG_WARN("XeSS: asks for Vulkan feature structure {}, which isn't merged",
+                        uint32_t(in->sType));
+            ++unsupported;
+            break;
+        }
+      }
+      if (unsupported) {
+        REXLOG_WARN("XeSS: {} Vulkan feature(s) it asks for aren't available", unsupported);
+      }
+    } else {
+      REXLOG_WARN("XeSS: couldn't get its required Vulkan device features");
+    }
+  }
+#endif
 
   // Create the device.
 

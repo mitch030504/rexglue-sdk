@@ -450,9 +450,16 @@ class VulkanPresenter final : public Presenter {
                                 uint32_t output_height) const;
   bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
                                 uint32_t input_width, uint32_t input_height, VkImage output_image,
-                                uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config, uint64_t frame_index);
+                                VkImageView output_view, uint32_t output_width,
+                                uint32_t output_height, const GuestOutputPaintConfig& config,
+                                uint64_t frame_index);
   void DestroyTemporalUpscalerContext();
+  // temporal_upscaler = xess: upscales temporal_inputs_' current frame with Intel XeSS. False if
+  // XeSS can't (missing DLL or Vulkan features, unsupported ratio), and the caller uses FidelityFX.
+  bool DispatchXess(VkCommandBuffer command_buffer, VkImage output_image, VkImageView output_view,
+                    uint32_t input_width, uint32_t input_height, uint32_t output_width,
+                    uint32_t output_height, float jitter_x, float jitter_y, bool reset);
+  void DestroyXessContext();
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -501,7 +508,16 @@ class VulkanPresenter final : public Presenter {
   std::unique_ptr<VulkanTemporalInputs> temporal_inputs_;
   VkImage temporal_last_output_image_ = VK_NULL_HANDLE;
   uint64_t temporal_last_frame_index_ = UINT64_MAX;
+  uint32_t temporal_last_output_width_ = 0;
+  uint32_t temporal_last_output_height_ = 0;
   std::chrono::steady_clock::time_point temporal_last_time_;
+  // An xess_context_handle_t, kept opaque so this header doesn't need the XeSS SDK.
+  void* xess_context_ = nullptr;
+  uint32_t xess_input_width_ = 0;
+  uint32_t xess_input_height_ = 0;
+  uint32_t xess_output_width_ = 0;
+  uint32_t xess_output_height_ = 0;
+  bool xess_failed_ = false;
   struct {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

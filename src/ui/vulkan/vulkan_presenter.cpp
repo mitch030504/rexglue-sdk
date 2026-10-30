@@ -32,6 +32,7 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/flags.h>
 #include "ui/ffx_runtime.h"
+#include "ui/xess_runtime.h"
 #include <rex/ui/temporal_jitter.h>
 #include <rex/ui/vulkan/temporal_inputs.h>
 #include <rex/ui/vulkan/util.h>
@@ -219,6 +220,7 @@ VulkanPresenter::~VulkanPresenter() {
   guest_output_image_refresher_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
+  DestroyXessContext();
   temporal_inputs_.reset();
   temporal::SetInactive();
 #endif
@@ -435,16 +437,122 @@ void VulkanPresenter::WriteCompletedTemporalDump() {
 bool VulkanPresenter::TemporalUpscalerHasFrame(uint64_t frame_index, VkImage output_image,
                                                uint32_t output_width,
                                                uint32_t output_height) const {
-  return temporal_last_output_image_ == output_image &&
-         temporal_last_frame_index_ == frame_index &&
-         temporal_upscaler_max_output_width_ == output_width &&
-         temporal_upscaler_max_output_height_ == output_height;
+  return temporal_last_output_image_ == output_image && temporal_last_frame_index_ == frame_index &&
+         temporal_last_output_width_ == output_width &&
+         temporal_last_output_height_ == output_height;
+}
+
+void VulkanPresenter::DestroyXessContext() {
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  if (xess_context_) {
+    if (const xess::Functions* functions = xess::Get()) {
+      functions->DestroyContext(static_cast<xess_context_handle_t>(xess_context_));
+    }
+  }
+#endif
+  xess_context_ = nullptr;
+  xess_input_width_ = 0;
+  xess_input_height_ = 0;
+  xess_output_width_ = 0;
+  xess_output_height_ = 0;
+}
+
+bool VulkanPresenter::DispatchXess(VkCommandBuffer command_buffer, VkImage output_image,
+                                   VkImageView output_view, uint32_t input_width,
+                                   uint32_t input_height, uint32_t output_width,
+                                   uint32_t output_height, float jitter_x, float jitter_y,
+                                   bool reset) {
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  const xess::Functions* functions = xess::Get();
+  if (!functions || output_view == VK_NULL_HANDLE) {
+    return false;
+  }
+  if (xess_context_ &&
+      (xess_input_width_ != input_width || xess_input_height_ != input_height ||
+       xess_output_width_ != output_width || xess_output_height_ != output_height)) {
+    DestroyXessContext();
+  }
+  if (!xess_context_) {
+    xess_context_handle_t context = nullptr;
+    if (functions->VKCreateContext(vulkan_device_->vulkan_instance()->instance(),
+                                   vulkan_device_->physical_device(), vulkan_device_->device(),
+                                   &context) != XESS_RESULT_SUCCESS) {
+      REXLOG_WARN("VulkanPresenter: Failed to create an XeSS context");
+      return false;
+    }
+    xess_context_ = context;
+    xess::AttachLogging(*functions, context);
+    const xess_2d_t input = {input_width, input_height};
+    const xess_2d_t output = {output_width, output_height};
+    xess_quality_settings_t quality;
+    if (!xess::ChooseQuality(*functions, context, input, output, quality)) {
+      REXLOG_WARN("VulkanPresenter: XeSS can't upscale {}x{} to {}x{}", input_width, input_height,
+                  output_width, output_height);
+      DestroyXessContext();
+      return false;
+    }
+    xess_vk_init_params_t init_params = {};
+    init_params.outputResolution = output;
+    init_params.qualitySetting = quality;
+    // The motion vectors are measured from the jittered images, so they include the jitter.
+    init_params.initFlags = XESS_INIT_FLAG_LDR_INPUT_COLOR | XESS_INIT_FLAG_JITTERED_MV;
+    if (const xess_result_t result = functions->VKInit(context, &init_params);
+        result != XESS_RESULT_SUCCESS) {
+      REXLOG_WARN("VulkanPresenter: Failed to initialize XeSS ({})", int32_t(result));
+      DestroyXessContext();
+      return false;
+    }
+    xess_input_width_ = input_width;
+    xess_input_height_ = input_height;
+    xess_output_width_ = output_width;
+    xess_output_height_ = output_height;
+    REXLOG_INFO("VulkanPresenter: XeSS {}x{} -> {}x{} (quality preset {})", input_width,
+                input_height, output_width, output_height, uint32_t(quality));
+  }
+  auto describe = [](VkImage image, VkImageView view, VkFormat format, uint32_t width,
+                     uint32_t height) {
+    xess_vk_image_view_info info = {};
+    info.image = image;
+    info.imageView = view;
+    // XeSS rejects VK_REMAINING_*; every image here has one mip and one layer.
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    info.format = format;
+    info.width = width;
+    info.height = height;
+    return info;
+  };
+  auto describe_input = [&](const VulkanTemporalInputs::Image& image) {
+    return describe(image.image, image.view, image.info.format, image.info.extent.width,
+                    image.info.extent.height);
+  };
+  xess_vk_execute_params_t execute_params = {};
+  execute_params.colorTexture = describe_input(temporal_inputs_->color());
+  execute_params.velocityTexture = describe_input(temporal_inputs_->motion());
+  execute_params.depthTexture = describe_input(temporal_inputs_->depth());
+  execute_params.outputTexture =
+      describe(output_image, output_view, temporal_inputs_->color().info.format, output_width,
+               output_height);
+  execute_params.jitterOffsetX = jitter_x;
+  execute_params.jitterOffsetY = jitter_y;
+  execute_params.exposureScale = 1.0f;
+  execute_params.resetHistory = reset ? 1 : 0;
+  execute_params.inputWidth = input_width;
+  execute_params.inputHeight = input_height;
+  const xess_result_t result = functions->VKExecute(
+      static_cast<xess_context_handle_t>(xess_context_), command_buffer, &execute_params);
+  if (result != XESS_RESULT_SUCCESS) {
+    REXLOG_WARN("VulkanPresenter: xessVKExecute failed ({})", int32_t(result));
+  }
+  return result == XESS_RESULT_SUCCESS;
+#else
+  return false;
+#endif
 }
 
 bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
                                                uint32_t input_width, uint32_t input_height,
-                                               VkImage output_image, uint32_t output_width,
-                                               uint32_t output_height,
+                                               VkImage output_image, VkImageView output_view,
+                                               uint32_t output_width, uint32_t output_height,
                                                const GuestOutputPaintConfig& config,
                                                uint64_t frame_index) {
   WriteCompletedTemporalDump();
@@ -453,16 +561,22 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
       !output_height) {
     return false;
   }
-  // Both the context and the input images are recreated on a size change; neither may still be
-  // in use by earlier paints.
-  if (temporal_upscaler_context_ &&
-      (temporal_upscaler_max_render_width_ != input_width ||
-       temporal_upscaler_max_render_height_ != input_height ||
-       temporal_upscaler_max_output_width_ != output_width ||
-       temporal_upscaler_max_output_height_ != output_height)) {
+  const bool use_xess = xess::Selected() && !xess_failed_;
+  // The contexts and the input images are recreated on a size change; none may still be in use by
+  // earlier paints.
+  const bool ffx_resized =
+      temporal_upscaler_context_ && (temporal_upscaler_max_render_width_ != input_width ||
+                                     temporal_upscaler_max_render_height_ != input_height ||
+                                     temporal_upscaler_max_output_width_ != output_width ||
+                                     temporal_upscaler_max_output_height_ != output_height);
+  const bool xess_resized =
+      xess_context_ && (xess_input_width_ != input_width || xess_input_height_ != input_height ||
+                        xess_output_width_ != output_width || xess_output_height_ != output_height);
+  if (ffx_resized || xess_resized) {
     paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
   }
-  if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+  if (!use_xess &&
+      !EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
   if (!temporal_inputs_) {
@@ -499,53 +613,73 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
                   : 16.666f;
   temporal_last_time_ = now;
 
-  ffxDispatchDescUpscale dispatch_desc = {};
-  dispatch_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-  dispatch_desc.commandList = command_buffer;
-  dispatch_desc.color = describe(temporal_inputs_->color(), FFX_API_RESOURCE_USAGE_READ_ONLY);
-  dispatch_desc.depth = describe(temporal_inputs_->depth(), FFX_API_RESOURCE_USAGE_READ_ONLY);
-  dispatch_desc.motionVectors =
-      describe(temporal_inputs_->motion(), FFX_API_RESOURCE_USAGE_READ_ONLY);
-  dispatch_desc.exposure = {};
-  dispatch_desc.reactive = {};
-  dispatch_desc.transparencyAndComposition = {};
-  dispatch_desc.output = output;
+  float jitter_x, jitter_y;
   // The guest rendered this frame with this offset (rex/ui/temporal_jitter.h).
-  temporal::JitterForFrame(frame_index, dispatch_desc.jitterOffset.x,
-                           dispatch_desc.jitterOffset.y);
-  // Motion is in pixels: previous position minus current.
-  dispatch_desc.motionVectorScale.x = 1.0f;
-  dispatch_desc.motionVectorScale.y = 1.0f;
-  dispatch_desc.renderSize.width = input_width;
-  dispatch_desc.renderSize.height = input_height;
-  dispatch_desc.upscaleSize.width = output_width;
-  dispatch_desc.upscaleSize.height = output_height;
-  dispatch_desc.enableSharpening = true;
-  dispatch_desc.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
-  dispatch_desc.reset = !has_history;
-  dispatch_desc.frameTimeDelta = std::clamp(frame_time_ms, 1.0f, 100.0f);
-  dispatch_desc.preExposure = 1.0f;
-  // Unknown for a recompiled game, and only used with real depth, which this doesn't have.
-  dispatch_desc.cameraNear = 0.1f;
-  dispatch_desc.cameraFar = 1000.0f;
-  dispatch_desc.cameraFovAngleVertical = 1.0472f;
-  dispatch_desc.viewSpaceToMetersFactor = 1.0f;
-  dispatch_desc.flags = 0;
-
-  ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
-  const ffxReturnCode_t dispatch_result =
-      ffx::Get(ffx::Api::kVulkan)->Dispatch(context, &dispatch_desc.header);
-  if (dispatch_result != FFX_API_RETURN_OK) {
-    static std::atomic<bool> logged = false;
-    if (!logged.exchange(true)) {
-      REXLOG_WARN("VulkanPresenter: FidelityFX upscale dispatch failed ({}), using spatial FSR",
-                  dispatch_result);
+  temporal::JitterForFrame(frame_index, jitter_x, jitter_y);
+  bool upscaled = false;
+  if (use_xess) {
+    upscaled = DispatchXess(command_buffer, output_image, output_view, input_width, input_height,
+                            output_width, output_height, jitter_x, jitter_y, !has_history);
+    if (!upscaled) {
+      xess_failed_ = true;
+      DestroyXessContext();
+      REXLOG_WARN("VulkanPresenter: XeSS failed; using FidelityFX instead");
+      if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+        return false;
+      }
     }
-    return false;
+  }
+  if (!upscaled) {
+    ffxDispatchDescUpscale dispatch_desc = {};
+    dispatch_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    dispatch_desc.commandList = command_buffer;
+    dispatch_desc.color = describe(temporal_inputs_->color(), FFX_API_RESOURCE_USAGE_READ_ONLY);
+    dispatch_desc.depth = describe(temporal_inputs_->depth(), FFX_API_RESOURCE_USAGE_READ_ONLY);
+    dispatch_desc.motionVectors =
+        describe(temporal_inputs_->motion(), FFX_API_RESOURCE_USAGE_READ_ONLY);
+    dispatch_desc.exposure = {};
+    dispatch_desc.reactive = {};
+    dispatch_desc.transparencyAndComposition = {};
+    dispatch_desc.output = output;
+    dispatch_desc.jitterOffset.x = jitter_x;
+    dispatch_desc.jitterOffset.y = jitter_y;
+    // Motion is in pixels: previous position minus current.
+    dispatch_desc.motionVectorScale.x = 1.0f;
+    dispatch_desc.motionVectorScale.y = 1.0f;
+    dispatch_desc.renderSize.width = input_width;
+    dispatch_desc.renderSize.height = input_height;
+    dispatch_desc.upscaleSize.width = output_width;
+    dispatch_desc.upscaleSize.height = output_height;
+    dispatch_desc.enableSharpening = true;
+    dispatch_desc.sharpness =
+        std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
+    dispatch_desc.reset = !has_history;
+    dispatch_desc.frameTimeDelta = std::clamp(frame_time_ms, 1.0f, 100.0f);
+    dispatch_desc.preExposure = 1.0f;
+    // Unknown for a recompiled game, and only used with real depth, which this doesn't have.
+    dispatch_desc.cameraNear = 0.1f;
+    dispatch_desc.cameraFar = 1000.0f;
+    dispatch_desc.cameraFovAngleVertical = 1.0472f;
+    dispatch_desc.viewSpaceToMetersFactor = 1.0f;
+    dispatch_desc.flags = 0;
+
+    ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
+    const ffxReturnCode_t dispatch_result =
+        ffx::Get(ffx::Api::kVulkan)->Dispatch(context, &dispatch_desc.header);
+    if (dispatch_result != FFX_API_RETURN_OK) {
+      static std::atomic<bool> logged = false;
+      if (!logged.exchange(true)) {
+        REXLOG_WARN("VulkanPresenter: FidelityFX upscale dispatch failed ({}), using spatial FSR",
+                    dispatch_result);
+      }
+      return false;
+    }
   }
   temporal::SetActive(input_width, input_height);
   temporal_last_output_image_ = output_image;
   temporal_last_frame_index_ = frame_index;
+  temporal_last_output_width_ = output_width;
+  temporal_last_output_height_ = output_height;
 
   const std::string dump_prefix = REXCVAR_GET(present_temporal_dump_prefix);
   // Not every guest frame is painted, so take the first one at or after each interval.
@@ -2086,10 +2220,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
             uint32_t effect_input_width = 0, effect_input_height = 0;
             guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
-            if (DispatchTemporalUpscaler(draw_command_buffer, source_image, effect_input_width,
-                                         effect_input_height, output_image, effect_rect_size.first,
-                                         effect_rect_size.second, guest_output_paint_config,
-                                         guest_output_properties.frame_index)) {
+            if (DispatchTemporalUpscaler(
+                    draw_command_buffer, source_image, effect_input_width, effect_input_height,
+                    output_image, paint_context_.guest_output_intermediate_images[i]->view(),
+                    effect_rect_size.first, effect_rect_size.second, guest_output_paint_config,
+                    guest_output_properties.frame_index)) {
               VkImageMemoryBarrier barrier_to_shader_read = {};
               barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
               barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

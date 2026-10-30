@@ -31,6 +31,7 @@
 #include <rex/ui/surface_win.h>
 #include <rex/ui/flags.h>
 #include "ui/ffx_runtime.h"
+#include "ui/xess_runtime.h"
 #include <rex/ui/temporal_jitter.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -71,6 +72,7 @@ D3D12Presenter::~D3D12Presenter() {
   ui_submission_tracker_.Shutdown();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
+  DestroyXessContext();
   temporal_inputs_.reset();
   temporal::SetInactive();
 #endif
@@ -230,12 +232,97 @@ void D3D12Presenter::WriteCompletedTemporalDump() {
   temporal_dump_.buffer.Reset();
 }
 
+void D3D12Presenter::DestroyXessContext() {
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  if (xess_context_) {
+    if (const xess::Functions* functions = xess::Get()) {
+      functions->DestroyContext(static_cast<xess_context_handle_t>(xess_context_));
+    }
+  }
+#endif
+  xess_context_ = nullptr;
+  xess_input_width_ = 0;
+  xess_input_height_ = 0;
+  xess_output_width_ = 0;
+  xess_output_height_ = 0;
+}
+
+bool D3D12Presenter::DispatchXess(ID3D12GraphicsCommandList* command_list,
+                                  ID3D12Resource* output_resource, uint32_t input_width,
+                                  uint32_t input_height, uint32_t output_width,
+                                  uint32_t output_height, float jitter_x, float jitter_y,
+                                  bool reset) {
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+  const xess::Functions* functions = xess::Get();
+  if (!functions) {
+    return false;
+  }
+  if (xess_context_ &&
+      (xess_input_width_ != input_width || xess_input_height_ != input_height ||
+       xess_output_width_ != output_width || xess_output_height_ != output_height)) {
+    DestroyXessContext();
+  }
+  if (!xess_context_) {
+    xess_context_handle_t context = nullptr;
+    if (functions->D3D12CreateContext(provider_.GetDevice(), &context) != XESS_RESULT_SUCCESS) {
+      REXLOG_WARN("D3D12Presenter: Failed to create an XeSS context");
+      return false;
+    }
+    xess_context_ = context;
+    xess::AttachLogging(*functions, context);
+    const xess_2d_t input = {input_width, input_height};
+    const xess_2d_t output = {output_width, output_height};
+    xess_quality_settings_t quality;
+    if (!xess::ChooseQuality(*functions, context, input, output, quality)) {
+      REXLOG_WARN("D3D12Presenter: XeSS can't upscale {}x{} to {}x{}", input_width, input_height,
+                  output_width, output_height);
+      DestroyXessContext();
+      return false;
+    }
+    xess_d3d12_init_params_t init_params = {};
+    init_params.outputResolution = output;
+    init_params.qualitySetting = quality;
+    // The motion vectors are measured from the jittered images, so they include the jitter.
+    init_params.initFlags = XESS_INIT_FLAG_LDR_INPUT_COLOR | XESS_INIT_FLAG_JITTERED_MV;
+    if (functions->D3D12Init(context, &init_params) != XESS_RESULT_SUCCESS) {
+      REXLOG_WARN("D3D12Presenter: Failed to initialize XeSS");
+      DestroyXessContext();
+      return false;
+    }
+    xess_input_width_ = input_width;
+    xess_input_height_ = input_height;
+    xess_output_width_ = output_width;
+    xess_output_height_ = output_height;
+    REXLOG_INFO("D3D12Presenter: XeSS {}x{} -> {}x{} (quality preset {})", input_width,
+                input_height, output_width, output_height, uint32_t(quality));
+  }
+  xess_d3d12_execute_params_t execute_params = {};
+  execute_params.pColorTexture = temporal_inputs_->color();
+  execute_params.pVelocityTexture = temporal_inputs_->motion();
+  execute_params.pDepthTexture = temporal_inputs_->depth();
+  execute_params.pOutputTexture = output_resource;
+  execute_params.jitterOffsetX = jitter_x;
+  execute_params.jitterOffsetY = jitter_y;
+  execute_params.exposureScale = 1.0f;
+  execute_params.resetHistory = reset ? 1 : 0;
+  execute_params.inputWidth = input_width;
+  execute_params.inputHeight = input_height;
+  const xess_result_t result = functions->D3D12Execute(
+      static_cast<xess_context_handle_t>(xess_context_), command_list, &execute_params);
+  if (result != XESS_RESULT_SUCCESS) {
+    REXLOG_WARN("D3D12Presenter: xessD3D12Execute failed ({})", int32_t(result));
+  }
+  return result == XESS_RESULT_SUCCESS;
+#else
+  return false;
+#endif
+}
+
 bool D3D12Presenter::TemporalUpscalerHasFrame(uint64_t frame_index, ID3D12Resource* output_resource,
                                               uint32_t output_width, uint32_t output_height) const {
   return temporal_last_output_resource_ == output_resource &&
-         temporal_last_frame_index_ == frame_index &&
-         temporal_upscaler_max_output_width_ == output_width &&
-         temporal_upscaler_max_output_height_ == output_height;
+         temporal_last_frame_index_ == frame_index && temporal_last_output_width_ == output_width &&
+         temporal_last_output_height_ == output_height;
 }
 
 bool D3D12Presenter::DispatchTemporalUpscaler(
@@ -247,15 +334,22 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
       !output_width || !output_height) {
     return false;
   }
-  // Both the context and the input resources are recreated on a size change; neither may still
-  // be in use by earlier paints.
-  if (temporal_upscaler_context_ && (temporal_upscaler_max_render_width_ != input_width ||
+  const bool use_xess = xess::Selected() && !xess_failed_;
+  // The contexts and the input resources are recreated on a size change; none may still be in use
+  // by earlier paints.
+  const bool ffx_resized =
+      temporal_upscaler_context_ && (temporal_upscaler_max_render_width_ != input_width ||
                                      temporal_upscaler_max_render_height_ != input_height ||
                                      temporal_upscaler_max_output_width_ != output_width ||
-                                     temporal_upscaler_max_output_height_ != output_height)) {
+                                     temporal_upscaler_max_output_height_ != output_height);
+  const bool xess_resized =
+      xess_context_ && (xess_input_width_ != input_width || xess_input_height_ != input_height ||
+                        xess_output_width_ != output_width || xess_output_height_ != output_height);
+  if (ffx_resized || xess_resized) {
     paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
   }
-  if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+  if (!use_xess &&
+      !EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
   if (!temporal_inputs_) {
@@ -276,6 +370,23 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
                   : 16.666f;
   temporal_last_time_ = now;
 
+  float jitter_x, jitter_y;
+  // The guest rendered this frame with this offset (rex/ui/temporal_jitter.h).
+  temporal::JitterForFrame(frame_index, jitter_x, jitter_y);
+  if (use_xess) {
+    if (DispatchXess(command_list, output_resource, input_width, input_height, output_width,
+                     output_height, jitter_x, jitter_y, !has_history)) {
+      return FinishTemporalUpscale(command_list, output_resource, input_width, input_height,
+                                   output_width, output_height, frame_index);
+    }
+    xess_failed_ = true;
+    DestroyXessContext();
+    REXLOG_WARN("D3D12Presenter: XeSS failed; using FidelityFX instead");
+    if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+      return false;
+    }
+  }
+
   constexpr uint32_t kReadState = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
   ffxDispatchDescUpscale dispatch_desc = {};
   dispatch_desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -289,8 +400,8 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
   dispatch_desc.transparencyAndComposition = ffxApiGetResourceDX12(nullptr, kReadState);
   dispatch_desc.output = ffxApiGetResourceDX12(
       output_resource, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
-  // The guest rendered this frame with this offset (rex/ui/temporal_jitter.h).
-  temporal::JitterForFrame(frame_index, dispatch_desc.jitterOffset.x, dispatch_desc.jitterOffset.y);
+  dispatch_desc.jitterOffset.x = jitter_x;
+  dispatch_desc.jitterOffset.y = jitter_y;
   // Motion is in pixels: previous position minus current.
   dispatch_desc.motionVectorScale.x = 1.0f;
   dispatch_desc.motionVectorScale.y = 1.0f;
@@ -321,9 +432,19 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
     }
     return false;
   }
+  return FinishTemporalUpscale(command_list, output_resource, input_width, input_height,
+                               output_width, output_height, frame_index);
+}
+
+bool D3D12Presenter::FinishTemporalUpscale(ID3D12GraphicsCommandList* command_list,
+                                           ID3D12Resource* output_resource, uint32_t input_width,
+                                           uint32_t input_height, uint32_t output_width,
+                                           uint32_t output_height, uint64_t frame_index) {
   temporal::SetActive(input_width, input_height);
   temporal_last_output_resource_ = output_resource;
   temporal_last_frame_index_ = frame_index;
+  temporal_last_output_width_ = output_width;
+  temporal_last_output_height_ = output_height;
 
   const std::string dump_prefix = REXCVAR_GET(present_temporal_dump_prefix);
   // Not every guest frame is painted, so take the first one at or after each interval.

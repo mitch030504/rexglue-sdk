@@ -283,6 +283,17 @@ class D3D12Presenter final : public Presenter {
   void RecordTemporalDump(ID3D12GraphicsCommandList* command_list, ID3D12Resource* resource,
                           uint32_t width, uint32_t height, uint64_t frame_index);
   void WriteCompletedTemporalDump();
+  // temporal_upscaler = xess: upscales temporal_inputs_' current frame with Intel XeSS. False if
+  // XeSS can't (missing DLL, unsupported ratio), and the caller falls back to FidelityFX.
+  bool DispatchXess(ID3D12GraphicsCommandList* command_list, ID3D12Resource* output_resource,
+                    uint32_t input_width, uint32_t input_height, uint32_t output_width,
+                    uint32_t output_height, float jitter_x, float jitter_y, bool reset);
+  void DestroyXessContext();
+  // Bookkeeping and the optional dump after either upscaler produced output_resource.
+  bool FinishTemporalUpscale(ID3D12GraphicsCommandList* command_list,
+                             ID3D12Resource* output_resource, uint32_t input_width,
+                             uint32_t input_height, uint32_t output_width, uint32_t output_height,
+                             uint64_t frame_index);
 #endif
 
   const D3D12Provider& provider_;
@@ -335,6 +346,15 @@ class D3D12Presenter final : public Presenter {
   std::chrono::steady_clock::time_point temporal_last_time_;
   ID3D12Resource* temporal_last_output_resource_ = nullptr;
   uint64_t temporal_last_frame_index_ = UINT64_MAX;
+  uint32_t temporal_last_output_width_ = 0;
+  uint32_t temporal_last_output_height_ = 0;
+  // An xess_context_handle_t, kept opaque so this header doesn't need the XeSS SDK.
+  void* xess_context_ = nullptr;
+  uint32_t xess_input_width_ = 0;
+  uint32_t xess_input_height_ = 0;
+  uint32_t xess_output_width_ = 0;
+  uint32_t xess_output_height_ = 0;
+  bool xess_failed_ = false;
   struct {
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
     UINT64 submission = 0;

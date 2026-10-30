@@ -149,6 +149,22 @@ function(rexglue_configure_target target_name)
                 VERBATIM
             )
         endforeach()
+        foreach(_fx IN LISTS REXGLUE_XESS_FILES)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_fx}"
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endforeach()
+        set(_rexglue_xess_licenses ${REXGLUE_XESS_LICENSES})
+        while(_rexglue_xess_licenses)
+            list(POP_FRONT _rexglue_xess_licenses _rexglue_license_source _rexglue_license_name)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_rexglue_license_source}"
+                    $<TARGET_FILE_DIR:${target_name}>/${_rexglue_license_name}
+                VERBATIM
+            )
+        endwhile()
         if(REXGLUE_FIDELITYFX_PREBUILT_LICENSE)
             add_custom_command(TARGET ${target_name} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${REXGLUE_FIDELITYFX_PREBUILT_LICENSE}"
