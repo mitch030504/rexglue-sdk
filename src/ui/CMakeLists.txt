@@ -16,6 +16,7 @@ set(REXUI_CORE_SOURCES
     temporal_jitter.cpp
     ffx_runtime.cpp
     xess_runtime.cpp
+    dlss_runtime.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -132,6 +133,15 @@ endif()
 if(REXGLUE_ENABLE_XESS AND REXGLUE_XESS_INCLUDE_DIR)
     target_include_directories(rexui PRIVATE "${REXGLUE_XESS_INCLUDE_DIR}")
     target_compile_definitions(rexui PRIVATE REX_HAS_XESS=1)
+endif()
+
+if(REXGLUE_ENABLE_DLSS AND REXGLUE_DLSS_LIBRARY)
+    target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_DLSS=1)
+    target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_LIBRARY}")
+    if(UNIX)
+        target_link_libraries(rexui PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

@@ -31,7 +31,11 @@
 #include <rex/ui/surface_win.h>
 #include <rex/ui/flags.h>
 #include "ui/ffx_runtime.h"
+#include "ui/dlss_runtime.h"
 #include "ui/xess_runtime.h"
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+#include <nvsdk_ngx_helpers.h>
+#endif
 #include <rex/ui/temporal_jitter.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -73,6 +77,7 @@ D3D12Presenter::~D3D12Presenter() {
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
   DestroyXessContext();
+  DestroyDlss();
   temporal_inputs_.reset();
   temporal::SetInactive();
 #endif
@@ -232,6 +237,112 @@ void D3D12Presenter::WriteCompletedTemporalDump() {
   temporal_dump_.buffer.Reset();
 }
 
+void D3D12Presenter::DestroyDlss() {
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+  if (dlss_feature_) {
+    NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(dlss_feature_));
+  }
+  if (dlss_parameters_) {
+    NVSDK_NGX_D3D12_DestroyParameters(static_cast<NVSDK_NGX_Parameter*>(dlss_parameters_));
+  }
+  if (dlss_initialized_) {
+    NVSDK_NGX_D3D12_Shutdown1(provider_.GetDevice());
+  }
+#endif
+  dlss_feature_ = nullptr;
+  dlss_parameters_ = nullptr;
+  dlss_initialized_ = false;
+}
+
+bool D3D12Presenter::DispatchDlss(ID3D12GraphicsCommandList* command_list,
+                                  ID3D12Resource* output_resource, uint32_t input_width,
+                                  uint32_t input_height, uint32_t output_width,
+                                  uint32_t output_height, float jitter_x, float jitter_y,
+                                  bool reset, float frame_time_ms) {
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+  if (!dlss_initialized_) {
+    NVSDK_NGX_Result result =
+        NVSDK_NGX_D3D12_Init_with_ProjectID(dlss::kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
+                                            dlss::ApplicationDataPath(), provider_.GetDevice());
+    if (NVSDK_NGX_FAILED(result)) {
+      REXLOG_WARN("D3D12Presenter: NGX didn't start ({}); DLSS needs an NVIDIA RTX GPU",
+                  dlss::ResultString(result));
+      return false;
+    }
+    dlss_initialized_ = true;
+    NVSDK_NGX_Parameter* parameters = nullptr;
+    result = NVSDK_NGX_D3D12_GetCapabilityParameters(&parameters);
+    if (NVSDK_NGX_FAILED(result)) {
+      REXLOG_WARN("D3D12Presenter: NGX capability query failed ({})", dlss::ResultString(result));
+      return false;
+    }
+    dlss_parameters_ = parameters;
+    int available = 0;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_Parameter_GetI(
+            parameters, NVSDK_NGX_Parameter_SuperSampling_Available, &available)) ||
+        !available) {
+      REXLOG_WARN("D3D12Presenter: DLSS isn't available on this GPU or driver");
+      return false;
+    }
+  }
+  auto* parameters = static_cast<NVSDK_NGX_Parameter*>(dlss_parameters_);
+  if (dlss_feature_ &&
+      (dlss_input_width_ != input_width || dlss_input_height_ != input_height ||
+       dlss_output_width_ != output_width || dlss_output_height_ != output_height)) {
+    NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(dlss_feature_));
+    dlss_feature_ = nullptr;
+  }
+  if (!dlss_feature_) {
+    NVSDK_NGX_DLSS_Create_Params create_params = {};
+    create_params.Feature.InWidth = input_width;
+    create_params.Feature.InHeight = input_height;
+    create_params.Feature.InTargetWidth = output_width;
+    create_params.Feature.InTargetHeight = output_height;
+    create_params.Feature.InPerfQualityValue =
+        dlss::QualityForRatio(float(output_width) / float(input_width));
+    // Render-resolution motion that's measured from the jittered images.
+    create_params.InFeatureCreateFlags =
+        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
+    dlss::SetRenderPresets(parameters);
+    NVSDK_NGX_Handle* feature = nullptr;
+    const NVSDK_NGX_Result result =
+        NGX_D3D12_CREATE_DLSS_EXT(command_list, 1, 1, &feature, parameters, &create_params);
+    if (NVSDK_NGX_FAILED(result)) {
+      REXLOG_WARN("D3D12Presenter: Failed to create DLSS ({})", dlss::ResultString(result));
+      return false;
+    }
+    dlss_feature_ = feature;
+    dlss_input_width_ = input_width;
+    dlss_input_height_ = input_height;
+    dlss_output_width_ = output_width;
+    dlss_output_height_ = output_height;
+    REXLOG_INFO("D3D12Presenter: DLSS {}x{} -> {}x{}", input_width, input_height, output_width,
+                output_height);
+  }
+  NVSDK_NGX_D3D12_DLSS_Eval_Params eval_params = {};
+  eval_params.Feature.pInColor = temporal_inputs_->color();
+  eval_params.Feature.pInOutput = output_resource;
+  eval_params.pInDepth = temporal_inputs_->depth();
+  eval_params.pInMotionVectors = temporal_inputs_->motion();
+  eval_params.InJitterOffsetX = jitter_x;
+  eval_params.InJitterOffsetY = jitter_y;
+  eval_params.InRenderSubrectDimensions = {input_width, input_height};
+  eval_params.InReset = reset ? 1 : 0;
+  eval_params.InMVScaleX = 1.0f;
+  eval_params.InMVScaleY = 1.0f;
+  eval_params.InFrameTimeDeltaInMsec = frame_time_ms;
+  const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSS_EXT(
+      command_list, static_cast<NVSDK_NGX_Handle*>(dlss_feature_), parameters, &eval_params);
+  if (NVSDK_NGX_FAILED(result)) {
+    REXLOG_WARN("D3D12Presenter: DLSS evaluation failed ({})", dlss::ResultString(result));
+    return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
 void D3D12Presenter::DestroyXessContext() {
 #if defined(REX_HAS_XESS) && REX_HAS_XESS
   if (xess_context_) {
@@ -335,6 +446,7 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
     return false;
   }
   const bool use_xess = xess::Selected() && !xess_failed_;
+  const bool use_dlss = dlss::Selected() && !dlss_failed_;
   // The contexts and the input resources are recreated on a size change; none may still be in use
   // by earlier paints.
   const bool ffx_resized =
@@ -345,10 +457,13 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
   const bool xess_resized =
       xess_context_ && (xess_input_width_ != input_width || xess_input_height_ != input_height ||
                         xess_output_width_ != output_width || xess_output_height_ != output_height);
-  if (ffx_resized || xess_resized) {
+  const bool dlss_resized =
+      dlss_feature_ && (dlss_input_width_ != input_width || dlss_input_height_ != input_height ||
+                        dlss_output_width_ != output_width || dlss_output_height_ != output_height);
+  if (ffx_resized || xess_resized || dlss_resized) {
     paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
   }
-  if (!use_xess &&
+  if (!use_xess && !use_dlss &&
       !EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
     return false;
   }
@@ -373,7 +488,20 @@ bool D3D12Presenter::DispatchTemporalUpscaler(
   float jitter_x, jitter_y;
   // The guest rendered this frame with this offset (rex/ui/temporal_jitter.h).
   temporal::JitterForFrame(frame_index, jitter_x, jitter_y);
-  if (use_xess) {
+  if (use_dlss) {
+    if (DispatchDlss(command_list, output_resource, input_width, input_height, output_width,
+                     output_height, jitter_x, jitter_y, !has_history,
+                     std::clamp(frame_time_ms, 1.0f, 100.0f))) {
+      return FinishTemporalUpscale(command_list, output_resource, input_width, input_height,
+                                   output_width, output_height, frame_index);
+    }
+    dlss_failed_ = true;
+    DestroyDlss();
+    REXLOG_WARN("D3D12Presenter: DLSS isn't available; using FidelityFX instead");
+    if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
+      return false;
+    }
+  } else if (use_xess) {
     if (DispatchXess(command_list, output_resource, input_width, input_height, output_width,
                      output_height, jitter_x, jitter_y, !has_history)) {
       return FinishTemporalUpscale(command_list, output_resource, input_width, input_height,

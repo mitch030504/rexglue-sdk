@@ -22,7 +22,11 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter.h>
+#include "ui/dlss_runtime.h"
 #include "ui/xess_runtime.h"
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+#include <nvsdk_ngx_vk.h>
+#endif
 
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
@@ -188,6 +192,25 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
       }
     } else {
       REXLOG_WARN("XeSS: couldn't get its required Vulkan instance extensions");
+    }
+  }
+#endif
+
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+  // So does DLSS (NGX).
+  std::deque<bool> dlss_extensions_enabled;
+  if (dlss::Selected()) {
+    unsigned int instance_count = 0, device_count = 0;
+    const char** instance_extensions = nullptr;
+    const char** device_extensions = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_RequiredExtensions(&instance_count, &instance_extensions,
+                                                              &device_count, &device_extensions))) {
+      for (unsigned int i = 0; i < instance_count; ++i) {
+        requested_extensions.emplace(instance_extensions[i],
+                                     &dlss_extensions_enabled.emplace_back());
+      }
+    } else {
+      REXLOG_WARN("DLSS: couldn't get NGX's required Vulkan instance extensions");
     }
   }
 #endif

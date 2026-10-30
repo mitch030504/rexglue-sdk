@@ -22,7 +22,11 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include "ui/dlss_runtime.h"
 #include "ui/xess_runtime.h"
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+#include <nvsdk_ngx_vk.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -251,6 +255,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
+
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+  // DLSS (NGX) needs its device extensions at device creation.
+  std::deque<bool> dlss_extensions_enabled;
+  if (dlss::Selected()) {
+    unsigned int instance_count = 0, device_count = 0;
+    const char** instance_extensions = nullptr;
+    const char** device_extensions = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_RequiredExtensions(&instance_count, &instance_extensions,
+                                                              &device_count, &device_extensions))) {
+      for (unsigned int i = 0; i < device_count; ++i) {
+        requested_extensions.emplace(device_extensions[i], &dlss_extensions_enabled.emplace_back());
+      }
+    } else {
+      REXLOG_WARN("DLSS: couldn't get NGX's required Vulkan device extensions");
+    }
+  }
+#endif
 
 #if defined(REX_HAS_XESS) && REX_HAS_XESS
   // XeSS on Vulkan needs its device extensions and features enabled at device creation.

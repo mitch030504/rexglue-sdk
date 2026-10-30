@@ -41,11 +41,15 @@ REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
 // Shared by the D3D12 and Vulkan presenters' temporal upscalers.
 REXCVAR_DEFINE_STRING(temporal_upscaler, "fsr", "GPU",
                       "Temporal upscaler for present_effect = fsr3: fsr (FSR 4 where the GPU and "
-                      "driver support it, else FSR 3.1), or xess (Intel XeSS, Windows build)")
+                      "driver support it, else FSR 3.1), xess (Intel XeSS, Windows build) or dlss "
+                      "(NVIDIA DLSS, RTX GPUs)")
     .allowed({
         "fsr",
 #if defined(REX_HAS_XESS) && REX_HAS_XESS
         "xess",
+#endif
+#if defined(REX_HAS_DLSS) && REX_HAS_DLSS
+        "dlss",
 #endif
     })
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

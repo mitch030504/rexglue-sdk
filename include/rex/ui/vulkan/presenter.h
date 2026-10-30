@@ -460,6 +460,12 @@ class VulkanPresenter final : public Presenter {
                     uint32_t input_width, uint32_t input_height, uint32_t output_width,
                     uint32_t output_height, float jitter_x, float jitter_y, bool reset);
   void DestroyXessContext();
+  // temporal_upscaler = dlss: the same with NVIDIA DLSS (NGX); false without an RTX GPU.
+  bool DispatchDlss(VkCommandBuffer command_buffer, VkImage output_image, VkImageView output_view,
+                    uint32_t input_width, uint32_t input_height, uint32_t output_width,
+                    uint32_t output_height, float jitter_x, float jitter_y, bool reset,
+                    float frame_time_ms);
+  void DestroyDlss();
 #endif
 
   const VulkanDevice* vulkan_device_;
@@ -518,6 +524,15 @@ class VulkanPresenter final : public Presenter {
   uint32_t xess_output_width_ = 0;
   uint32_t xess_output_height_ = 0;
   bool xess_failed_ = false;
+  // NVSDK_NGX_Parameter* and NVSDK_NGX_Handle*, opaque here.
+  void* dlss_parameters_ = nullptr;
+  void* dlss_feature_ = nullptr;
+  bool dlss_initialized_ = false;
+  bool dlss_failed_ = false;
+  uint32_t dlss_input_width_ = 0;
+  uint32_t dlss_input_height_ = 0;
+  uint32_t dlss_output_width_ = 0;
+  uint32_t dlss_output_height_ = 0;
   struct {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

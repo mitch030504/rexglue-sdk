@@ -174,6 +174,22 @@ function(rexglue_configure_target target_name)
         endif()
     endif()
 
+    # The DLSS model, which the NVIDIA driver loads from next to the executable, and its licence.
+    foreach(_dlss IN LISTS REXGLUE_DLSS_FILES)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dlss}"
+                $<TARGET_FILE_DIR:${target_name}>
+            VERBATIM
+        )
+    endforeach()
+    if(REXGLUE_DLSS_LICENSE)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${REXGLUE_DLSS_LICENSE}"
+                $<TARGET_FILE_DIR:${target_name}>/dlss_license.txt
+            VERBATIM
+        )
+    endif()
+
     # Stage requested GPU emulation plugins next to the executable. Plugins
     # are runtime-loaded (never linked), so TARGET_RUNTIME_DLLS misses them.
     # A POST_BUILD copy only ran when the executable relinked, which a plugin-only change doesn't

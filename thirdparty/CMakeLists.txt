@@ -230,6 +230,11 @@ include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_xess.cmake)
 
 #=============================================================================
+# DLSS (optional, NGX, fetched on demand)
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss.cmake)
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")

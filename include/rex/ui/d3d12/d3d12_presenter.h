@@ -289,6 +289,12 @@ class D3D12Presenter final : public Presenter {
                     uint32_t input_width, uint32_t input_height, uint32_t output_width,
                     uint32_t output_height, float jitter_x, float jitter_y, bool reset);
   void DestroyXessContext();
+  // temporal_upscaler = dlss: the same with NVIDIA DLSS (NGX); false without an RTX GPU.
+  bool DispatchDlss(ID3D12GraphicsCommandList* command_list, ID3D12Resource* output_resource,
+                    uint32_t input_width, uint32_t input_height, uint32_t output_width,
+                    uint32_t output_height, float jitter_x, float jitter_y, bool reset,
+                    float frame_time_ms);
+  void DestroyDlss();
   // Bookkeeping and the optional dump after either upscaler produced output_resource.
   bool FinishTemporalUpscale(ID3D12GraphicsCommandList* command_list,
                              ID3D12Resource* output_resource, uint32_t input_width,
@@ -355,6 +361,15 @@ class D3D12Presenter final : public Presenter {
   uint32_t xess_output_width_ = 0;
   uint32_t xess_output_height_ = 0;
   bool xess_failed_ = false;
+  // NVSDK_NGX_Parameter* and NVSDK_NGX_Handle*, opaque here.
+  void* dlss_parameters_ = nullptr;
+  void* dlss_feature_ = nullptr;
+  bool dlss_initialized_ = false;
+  bool dlss_failed_ = false;
+  uint32_t dlss_input_width_ = 0;
+  uint32_t dlss_input_height_ = 0;
+  uint32_t dlss_output_width_ = 0;
+  uint32_t dlss_output_height_ = 0;
   struct {
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
     UINT64 submission = 0;
