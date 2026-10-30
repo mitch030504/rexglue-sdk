@@ -24,8 +24,13 @@
 
 namespace rex::ui {
 
-SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
-    : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
+SettingsDialog::SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
+                               const std::unordered_map<std::string, std::string>* restart_baseline,
+                               std::function<void()> on_restart)
+    : ImGuiDialog(imgui_drawer),
+      config_path_(std::move(config_path)),
+      restart_baseline_(restart_baseline),
+      on_restart_(std::move(on_restart)) {}
 
 SettingsDialog::~SettingsDialog() {}
 
@@ -507,6 +512,30 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+
+  // Restart-only settings that differ from what this run started with.
+  if (restart_baseline_ && on_restart_) {
+    bool restart_pending = false;
+    for (auto& entry : rex::cvar::GetRegistry()) {
+      if (entry.lifecycle != rex::cvar::Lifecycle::kRequiresRestart) {
+        continue;
+      }
+      auto it = restart_baseline_->find(entry.name);
+      if (it != restart_baseline_->end() && it->second != entry.getter()) {
+        restart_pending = true;
+        break;
+      }
+    }
+    if (restart_pending) {
+      ImGui::SameLine();
+      ImGui::TextColored(imgui_drawer()->style().settings.lifecycle_restart, "Restart to apply");
+      ImGui::SameLine();
+      if (ImGui::Button("Restart now")) {
+        rex::cvar::SaveConfig(config_path_);
+        on_restart_();
+      }
+    }
+  }
 
   ImGui::End();
 }

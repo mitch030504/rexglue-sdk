@@ -11,7 +11,9 @@
  */
 #pragma once
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <unordered_map>
 #include <rex/ui/imgui_dialog.h>
 
 namespace rex::ui {
@@ -19,7 +21,11 @@ namespace rex::ui {
 class SettingsDialog : public ImGuiDialog {
  public:
   // config_path: where "Save to config" writes (e.g. exe_dir / "app.toml")
-  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path);
+  // restart_baseline: the values restart-only settings started with, so the dialog can tell when
+  // a change needs a restart; on_restart relaunches the app. Both are optional.
+  SettingsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path,
+                 const std::unordered_map<std::string, std::string>* restart_baseline = nullptr,
+                 std::function<void()> on_restart = {});
   ~SettingsDialog();
 
  protected:
@@ -27,6 +33,8 @@ class SettingsDialog : public ImGuiDialog {
 
  private:
   std::filesystem::path config_path_;
+  const std::unordered_map<std::string, std::string>* restart_baseline_;
+  std::function<void()> on_restart_;
   char search_buf_[128] = {};
   std::string selected_category_;
   std::string capturing_bind_name_;

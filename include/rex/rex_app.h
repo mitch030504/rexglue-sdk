@@ -17,8 +17,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 #include <rex/image_info.h>
 #include <rex/runtime.h>
@@ -306,6 +308,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+  // Restart-only cvar values at startup, so the settings overlay can offer a restart.
+  std::unordered_map<std::string, std::string> restart_baseline_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;

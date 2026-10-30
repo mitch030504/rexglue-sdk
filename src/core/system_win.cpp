@@ -11,6 +11,9 @@
 #endif
 #include <windows.h>
 
+#include <iterator>
+#include <string>
+
 #include <rex/string.h>
 #include <rex/system.h>
 
@@ -32,6 +35,26 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
   }
   auto wide = rex::string::to_utf16(message);
   ::MessageBoxW(nullptr, reinterpret_cast<const wchar_t*>(wide.c_str()), title, flags);
+}
+
+bool LaunchCopyOfSelf() {
+  wchar_t exe[MAX_PATH * 4];
+  DWORD len = ::GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+  if (len == 0 || len >= std::size(exe)) {
+    return false;
+  }
+  // CreateProcessW may modify the command-line buffer, so pass a copy.
+  std::wstring command_line = ::GetCommandLineW();
+  STARTUPINFOW startup_info = {};
+  startup_info.cb = sizeof(startup_info);
+  PROCESS_INFORMATION process_info = {};
+  if (!::CreateProcessW(exe, command_line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                        &startup_info, &process_info)) {
+    return false;
+  }
+  ::CloseHandle(process_info.hThread);
+  ::CloseHandle(process_info.hProcess);
+  return true;
 }
 
 }  // namespace rex

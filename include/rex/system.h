@@ -37,4 +37,8 @@ enum class SimpleMessageBoxType {
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
 
+// Starts a new instance of this executable with the same command-line arguments, for settings that
+// only apply after a restart. The caller exits afterwards. Returns false if it couldn't start.
+bool LaunchCopyOfSelf();
+
 }  // namespace rex

@@ -45,11 +45,53 @@
 #include <algorithm>
 #include <filesystem>
 #include <string_view>
+#include <vector>
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_STRING(gpu_backend, "auto", "GPU",
+                      "Graphics API: auto, or one compiled into this build (d3d12, vulkan). If it "
+                      "can't start, the other one is tried")
+    .allowed({
+        "auto",
+#if REX_HAS_D3D12
+        "d3d12",
+#endif
+#if REX_HAS_VULKAN
+        "vulkan",
+#endif
+    })
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+
+// The order to try graphics backends in: the chosen one first, then every other one compiled in.
+std::vector<std::string> GpuBackendCandidates(std::string_view chosen) {
+  std::vector<std::string> compiled;
+#if REX_HAS_D3D12
+  compiled.emplace_back("d3d12");
+#endif
+#if REX_HAS_VULKAN
+  compiled.emplace_back("vulkan");
+#endif
+  std::vector<std::string> order;
+  if (std::find(compiled.begin(), compiled.end(), chosen) != compiled.end()) {
+    order.emplace_back(chosen);
+  } else if (chosen != "auto") {
+    REXLOG_WARN("gpu_backend '{}' isn't compiled into this build; using auto", chosen);
+  }
+  for (const auto& backend : compiled) {
+    if (std::find(order.begin(), order.end(), backend) == order.end()) {
+      order.push_back(backend);
+    }
+  }
+  return order;
+}
+
+}  // namespace
 
 namespace rex {
 
@@ -306,6 +348,12 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 }
 
 bool ReXApp::SetupPresentation() {
+  for (auto& entry : rex::cvar::GetRegistry()) {
+    if (entry.lifecycle == rex::cvar::Lifecycle::kRequiresRestart) {
+      restart_baseline_[entry.name] = entry.getter();
+    }
+  }
+
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
@@ -314,7 +362,22 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    // Try the chosen backend first; if it can't load or start (no driver for that API), fall back
+    // to the other compiled backends before giving up.
+    for (const auto& backend : GpuBackendCandidates(REXCVAR_GET(gpu_backend))) {
+      auto graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, backend);
+      if (!graphics) {
+        continue;
+      }
+      X_STATUS status = graphics->SetupPresentation(&app_context());
+      if (XFAILED(status)) {
+        REXLOG_ERROR("Graphics backend '{}' failed to start: {:08X}", backend, status);
+        continue;
+      }
+      REXLOG_INFO("Graphics backend: {}", backend);
+      config_.graphics = std::move(graphics);
+      break;
+    }
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =
@@ -323,9 +386,7 @@ bool ReXApp::SetupPresentation() {
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;
     }
-  }
-
-  if (config_.graphics) {
+  } else if (config_.graphics) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
     if (XFAILED(status)) {
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
@@ -413,7 +474,20 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
-      settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
+      settings_overlay_ = std::make_unique<ui::SettingsDialog>(
+          imgui_drawer_.get(), config_path_, &restart_baseline_, [this] {
+            if (!rex::LaunchCopyOfSelf()) {
+              REXLOG_ERROR("Couldn't start a new instance; restart the game by hand");
+              return;
+            }
+            REXLOG_INFO("Restarting to apply settings");
+            // Close after this frame's ImGui draw, which is still on the stack.
+            app_context().CallInUIThreadDeferred([this] {
+              if (window_) {
+                window_->RequestClose();
+              }
+            });
+          });
     }
   });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
