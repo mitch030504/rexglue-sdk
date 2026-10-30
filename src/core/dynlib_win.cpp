@@ -31,6 +31,17 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution /*
   return handle_ != nullptr;
 }
 
+bool DynamicLibrary::AttachIfLoaded(const std::filesystem::path& path) {
+  Close();
+  // Without GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT this takes a reference, which Close's
+  // FreeLibrary releases, the same as after Load.
+  HMODULE module = nullptr;
+  if (GetModuleHandleExW(0, path.c_str(), &module)) {
+    handle_ = static_cast<void*>(module);
+  }
+  return handle_ != nullptr;
+}
+
 void DynamicLibrary::Close() {
   if (handle_) {
     FreeLibrary(static_cast<HMODULE>(handle_));

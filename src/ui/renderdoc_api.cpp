@@ -25,10 +25,10 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
 
   pRENDERDOC_GetAPI get_api = nullptr;
 
-  // Try to load the RenderDoc library. If RenderDoc is attached, the library
-  // should already be loaded into the process and this will increment the
-  // reference count. If not attached, the load will fail and we return nullptr.
-  if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+  // Only pick up RenderDoc if it's already injected. Loading it here would attach it to every run
+  // where it's installed, and RenderDoc hides VK_KHR_wayland_surface, so on Wayland the presenter
+  // got no surface and the window stayed blank.
+  if (!renderdoc_api->library_.AttachIfLoaded(platform::lib_names::kRenderDoc)) {
     return nullptr;
   }
   get_api = renderdoc_api->library_.GetSymbol<pRENDERDOC_GetAPI>("RENDERDOC_GetAPI");

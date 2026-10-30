@@ -31,6 +31,9 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Like Load, but only succeeds if something else already loaded the library into the process;
+  // never loads it. For tools that inject themselves, such as RenderDoc.
+  bool AttachIfLoaded(const std::filesystem::path& path);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 
