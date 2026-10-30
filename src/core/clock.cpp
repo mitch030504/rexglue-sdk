@@ -15,12 +15,25 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
 REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
+
+REXCVAR_DEFINE_BOOL(clock_frame_locked, false, "Clock",
+                    "Deterministic guest time for netplay and replays: guest time advances by "
+                    "exactly 1/clock_frame_locked_hz per guest frame (VdSwap) and stands still "
+                    "in between, and the guest date starts at a fixed 2013-01-01. Before the "
+                    "first frame and during stalls without frames (loading), it follows the host "
+                    "clock instead, so timeouts still fire.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(clock_frame_locked_hz, 60, "Clock",
+                     "Guest frames per second of guest time under clock_frame_locked.")
+    .range(1, 240)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::chrono {
 
@@ -41,6 +54,28 @@ uint64_t last_guest_tick_count_ = 0;
 uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
 std::mutex tick_mutex_;
+
+// clock_frame_locked state, guarded by tick_mutex_.
+// Host tick count of the last guest frame, 0 before the first one.
+uint64_t frame_locked_last_frame_host_tick_ = 0;
+// Guest time at the last guest frame.
+uint64_t frame_locked_frame_guest_tick_ = 0;
+// Virtual frames added during the current stall, reported at the next frame.
+uint64_t frame_locked_stall_frames_ = 0;
+// Guest time at the first frame. Boot takes a varying amount of host time, so the first frame
+// starts at this fixed point instead (unless boot ran longer, which breaks determinism and warns).
+constexpr uint64_t kFrameLockedFirstFrameSeconds = 10;
+// No frame for this long counts as a stall (loading). The game polls guest time during some loads
+// (waiting out ~1 s at boot), so a stall can't freeze time; it then advances in whole virtual
+// frames, one per frame period of host time. A deadline-bound wait ends on the same virtual frame
+// every run; a load bound by host I/O doesn't. Hitches shorter than this leak nothing.
+constexpr uint64_t kFrameLockedStallMillis = 250;
+// 2013-01-01 00:00 UTC as FILETIME: a fixed guest date, so date-derived state matches across runs.
+constexpr uint64_t kFrameLockedSystemTimeBase = 130014720000000000ull;
+
+bool FrameLocked() {
+  return REXCVAR_GET(clock_frame_locked) && !REXCVAR_GET(clock_no_scaling);
+}
 
 void RecomputeGuestTickScalar() {
   // Create a rational number with numerator (first) and denominator (second)
@@ -69,6 +104,37 @@ uint64_t UpdateGuestClock() {
   if (REXCVAR_GET(clock_no_scaling)) {
     // Nothing to update, calculate on the fly
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
+  }
+
+  if (FrameLocked()) {
+    // Guest frames advance the time (Clock::OnGuestFrame). Before the first frame it follows the
+    // host clock, and during stalls it advances in virtual frames.
+    std::lock_guard<std::mutex> lock(tick_mutex_);
+    uint64_t host_tick_delta =
+        host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
+    last_host_tick_count_ = host_tick_count;
+    if (!frame_locked_last_frame_host_tick_) {
+      last_guest_tick_count_ +=
+          host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
+      return last_guest_tick_count_;
+    }
+    const uint64_t hz = uint64_t(REXCVAR_GET(clock_frame_locked_hz));
+    const uint64_t host_frequency = Clock::QueryHostTickFrequency();
+    const uint64_t stall_host_ticks = host_frequency * kFrameLockedStallMillis / 1000;
+    // host_tick_count was sampled before the lock, so a frame may have arrived after it.
+    const uint64_t since_frame = host_tick_count > frame_locked_last_frame_host_tick_
+                                     ? host_tick_count - frame_locked_last_frame_host_tick_
+                                     : 0;
+    if (since_frame > stall_host_ticks) {
+      const uint64_t virtual_frames = 1 + (since_frame - stall_host_ticks) * hz / host_frequency;
+      const uint64_t target =
+          frame_locked_frame_guest_tick_ + virtual_frames * (guest_tick_frequency_ / hz);
+      if (target > last_guest_tick_count_) {
+        last_guest_tick_count_ = target;
+        frame_locked_stall_frames_ = virtual_frames;
+      }
+    }
+    return last_guest_tick_count_;
   }
 
   std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
@@ -166,7 +232,37 @@ uint64_t Clock::QueryGuestSystemTime() {
   }
 
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
-  return guest_system_time_base_ + guest_system_time_offset;
+  return (FrameLocked() ? kFrameLockedSystemTimeBase : guest_system_time_base_) +
+         guest_system_time_offset;
+}
+
+void Clock::OnGuestFrame() {
+  if (!FrameLocked()) {
+    return;
+  }
+  const uint64_t host_tick_count = QueryHostTickCount();
+  std::lock_guard<std::mutex> lock(tick_mutex_);
+  if (!frame_locked_last_frame_host_tick_) {
+    const uint64_t first_frame_ticks = guest_tick_frequency_ * kFrameLockedFirstFrameSeconds;
+    if (last_guest_tick_count_ > first_frame_ticks) {
+      REXLOG_WARN("clock_frame_locked: boot took over {} s of guest time; runs won't match",
+                  kFrameLockedFirstFrameSeconds);
+    } else {
+      last_guest_tick_count_ = first_frame_ticks;
+    }
+  } else {
+    if (frame_locked_stall_frames_) {
+      REXLOG_INFO(
+          "clock_frame_locked: {} ms without a guest frame, {} virtual frames",
+          (host_tick_count - frame_locked_last_frame_host_tick_) * 1000 / QueryHostTickFrequency(),
+          frame_locked_stall_frames_);
+      frame_locked_stall_frames_ = 0;
+    }
+    last_guest_tick_count_ += guest_tick_frequency_ / uint64_t(REXCVAR_GET(clock_frame_locked_hz));
+  }
+  frame_locked_last_frame_host_tick_ = std::max<uint64_t>(host_tick_count, 1);
+  frame_locked_frame_guest_tick_ = last_guest_tick_count_;
+  last_host_tick_count_ = host_tick_count;
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {

@@ -79,6 +79,10 @@ class Clock {
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);
 
+  // With clock_frame_locked, advances guest time by exactly one frame period. Called once per
+  // guest VdSwap; does nothing otherwise.
+  static void OnGuestFrame();
+
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.

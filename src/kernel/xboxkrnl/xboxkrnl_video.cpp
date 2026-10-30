@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/register_file.h>
@@ -653,6 +654,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   }
   // One swap packet per call: the temporal upscaler's jitter is keyed by this count.
   rex::ui::temporal::OnGuestSwap();
+  // Under clock_frame_locked, guest time advances here, once per guest frame.
+  rex::chrono::Clock::OnGuestFrame();
 
   // See the frame_rate_limit comment near the top of this file: this reproduces the implicit
   // vblank-wait real Present() had, since nothing else in the guest's synchronous
