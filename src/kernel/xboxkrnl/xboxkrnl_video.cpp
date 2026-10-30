@@ -82,8 +82,10 @@ constexpr uint32_t kDisplayGammaType = 2;
 constexpr double kDisplayGammaPower = 2.22222233;
 
 uint32_t GetConfiguredVideoModeWidth() {
+  // 0 (the default) follows the window, so any explicit value is honoured, 720p included.
   int32_t configured_width = REXCVAR_GET(video_mode_width);
-  if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
+  if (configured_width <= 0) {
+    configured_width = 1280;
     if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
       configured_width = REXCVAR_GET(window_width);
     } else {
@@ -99,8 +101,10 @@ uint32_t GetConfiguredVideoModeWidth() {
 }
 
 uint32_t GetConfiguredVideoModeHeight() {
+  // 0 (the default) follows the window, so any explicit value is honoured, 720p included.
   int32_t configured_height = REXCVAR_GET(video_mode_height);
-  if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
+  if (configured_height <= 0) {
+    configured_height = 720;
     if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
       configured_height = REXCVAR_GET(window_height);
     } else {

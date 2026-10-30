@@ -47,12 +47,16 @@ REXCVAR_DEFINE_STRING(video_driver, "", "UI/Window",
                       "SDL's default for the session")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(video_mode_width, 1280, "Display", "Guest video mode width in pixels")
-    .range(640, 0x0FFF)
+REXCVAR_DEFINE_INT32(video_mode_width, 0, "Display",
+                     "Guest video mode width in pixels, snapped to 640, 1280 or 1920. 0 follows "
+                     "the window/resolution. Lower than the window to render smaller and upscale.")
+    .range(0, 0x0FFF)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(video_mode_height, 720, "Display", "Guest video mode height in pixels")
-    .range(480, 0x0FFF)
+REXCVAR_DEFINE_INT32(video_mode_height, 0, "Display",
+                     "Guest video mode height in pixels, snapped to 480, 720 or 1080. 0 follows "
+                     "the window/resolution.")
+    .range(0, 0x0FFF)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(resolution, "", "Graphics",

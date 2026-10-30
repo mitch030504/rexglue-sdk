@@ -49,14 +49,15 @@ uint32_t ResolveWindowWidth(uint32_t requested_width) {
     return uint32_t(REXCVAR_GET(window_width));
   }
   if (!rex::cvar::HasNonDefaultValue("window_width")) {
-    if (rex::cvar::HasNonDefaultValue("video_mode_width") && REXCVAR_GET(video_mode_width) > 0) {
-      return uint32_t(std::clamp(REXCVAR_GET(video_mode_width), 1, 8192));
-    }
+    // resolution is the window; video_mode_* may be smaller to render less and upscale.
     int32_t preset_width = 0;
     int32_t preset_height = 0;
     if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
                                                                        preset_height)) {
       return uint32_t(std::clamp(preset_width, 1, 8192));
+    }
+    if (REXCVAR_GET(video_mode_width) > 0) {
+      return uint32_t(std::clamp(REXCVAR_GET(video_mode_width), 1, 8192));
     }
   }
   return requested_width;
@@ -67,14 +68,15 @@ uint32_t ResolveWindowHeight(uint32_t requested_height) {
     return uint32_t(REXCVAR_GET(window_height));
   }
   if (!rex::cvar::HasNonDefaultValue("window_height")) {
-    if (rex::cvar::HasNonDefaultValue("video_mode_height") && REXCVAR_GET(video_mode_height) > 0) {
-      return uint32_t(std::clamp(REXCVAR_GET(video_mode_height), 1, 8192));
-    }
+    // resolution is the window; video_mode_* may be smaller to render less and upscale.
     int32_t preset_width = 0;
     int32_t preset_height = 0;
     if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
                                                                        preset_height)) {
       return uint32_t(std::clamp(preset_height, 1, 8192));
+    }
+    if (REXCVAR_GET(video_mode_height) > 0) {
+      return uint32_t(std::clamp(REXCVAR_GET(video_mode_height), 1, 8192));
     }
   }
   return requested_height;
