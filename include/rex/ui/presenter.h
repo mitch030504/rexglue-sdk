@@ -229,7 +229,8 @@ class Presenter {
 #endif
     };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
+    // Not conditional on REX_HAS_FIDELITYFX_SDK: that's only defined for rexui, and anything else
+    // including this header (the GPU plugin, the app) must agree on the class layout.
     enum class FsrQualityMode {
       // Keep current behavior and use the guest output size as-is.
       kAuto,
@@ -261,7 +262,6 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -274,7 +274,6 @@ class Presenter {
     Effect GetEffect() const { return effect_; }
     void SetEffect(Effect new_effect) { effect_ = new_effect; }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float GetCasAdditionalSharpness() const { return cas_additional_sharpness_; }
     void SetCasAdditionalSharpness(float new_cas_additional_sharpness) {
       cas_additional_sharpness_ =
@@ -300,7 +299,6 @@ class Presenter {
     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
       fsr_quality_mode_ = new_fsr_quality_mode;
     }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // Very tiny effect, but highly noticeable, for instance, on the sky in the
     // 4D5307E6 main menu (prominently in Custom Games, especially with FSR -
@@ -315,12 +313,10 @@ class Presenter {
     // original front buffer as possible.
     bool allow_overscan_cutoff_ = false;
     Effect effect_ = Effect::kBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
-#endif
     bool dither_ = false;
   };
 
