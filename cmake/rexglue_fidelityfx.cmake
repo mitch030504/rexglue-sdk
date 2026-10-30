@@ -60,8 +60,9 @@ endif()
 
 # Ninja runs custom commands through /bin/sh, which is bash on Arch-based distros, and bash
 # brace-expands the shader compiler's "-DX={0,1}" permutation lists into "-DX=0 -DX=1" (glslang:
-# "Macro redefined"). Escape the brace so every shell passes it through literally.
-if(NOT WIN32)
+# "Macro redefined"). Escape the brace so every shell passes it through literally. This depends on
+# the build host's shell, so it also applies when cross-compiling for Windows on Linux.
+if(NOT CMAKE_HOST_WIN32)
     set(_rexglue_ffx_sc_file
         "${fidelityfx_SOURCE_DIR}/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt")
     file(READ "${_rexglue_ffx_sc_file}" _rexglue_ffx_sc_text)
@@ -73,7 +74,7 @@ if(NOT WIN32)
             message(FATAL_ERROR "FidelityFX shader compile script changed; update the brace-escape patch")
         endif()
         string(REPLACE "${_rexglue_ffx_sc_anchor}"
-            "${_rexglue_ffx_sc_anchor}\t\t# Keep {0,1} permutation lists away from shell brace expansion.\n\t\tif (NOT WIN32)\n\t\t\tstring(REPLACE \"{\" \"\\\\{\" SC_ARGS \"\${SC_ARGS}\")\n\t\tendif()\n"
+            "${_rexglue_ffx_sc_anchor}\t\t# Keep {0,1} permutation lists away from shell brace expansion.\n\t\tif (NOT CMAKE_HOST_WIN32)\n\t\t\tstring(REPLACE \"{\" \"\\\\{\" SC_ARGS \"\${SC_ARGS}\")\n\t\tendif()\n"
             _rexglue_ffx_sc_text "${_rexglue_ffx_sc_text}")
         file(WRITE "${_rexglue_ffx_sc_file}" "${_rexglue_ffx_sc_text}")
     endif()
@@ -104,6 +105,32 @@ if(_rexglue_ffx_vk_done EQUAL -1)
         "FFX_ALIGN_UP(sizeof(BackendContext_VK) + 16 + extensionPropArraySize"
         _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
     file(WRITE "${_rexglue_ffx_vk_file}" "${_rexglue_ffx_vk_text}")
+endif()
+
+# The SDK runs FidelityFX_SC.exe through Wine on Linux, but tests UNIX, which is false when
+# cross-compiling for Windows. Test the build host instead.
+set(_rexglue_ffx_sdk_file "${fidelityfx_SOURCE_DIR}/sdk/CMakeLists.txt")
+file(READ "${_rexglue_ffx_sdk_file}" _rexglue_ffx_sdk_text)
+if(_rexglue_ffx_sdk_text MATCHES "if \\(UNIX\\)\n\tfind_program\\(FFX_WINE_EXECUTABLE")
+    string(REPLACE "if (UNIX)\n\tfind_program(FFX_WINE_EXECUTABLE"
+        "if (CMAKE_HOST_UNIX)\n\tfind_program(FFX_WINE_EXECUTABLE"
+        _rexglue_ffx_sdk_text "${_rexglue_ffx_sdk_text}")
+    # DXC under Wine needs Windows-style paths; ffx_sc_wine.sh converts them.
+    if(WIN32)
+        string(REPLACE "set(FFX_SC_EXECUTABLE \${FFX_WINE_EXECUTABLE};"
+            "set(FFX_SC_EXECUTABLE ${CMAKE_CURRENT_LIST_DIR}/ffx_sc_wine.sh;\${FFX_WINE_EXECUTABLE};"
+            _rexglue_ffx_sdk_text "${_rexglue_ffx_sdk_text}")
+    endif()
+    file(WRITE "${_rexglue_ffx_sdk_file}" "${_rexglue_ffx_sdk_text}")
+endif()
+
+# The DX12 backend includes ffx_FrameInterpolation.h, but the file is ffx_frameinterpolation.h;
+# that only works on case-insensitive file systems.
+set(_rexglue_ffx_fi_dir "${fidelityfx_SOURCE_DIR}/sdk/include/FidelityFX/host")
+if(CMAKE_HOST_UNIX AND EXISTS "${_rexglue_ffx_fi_dir}/ffx_frameinterpolation.h" AND
+   NOT EXISTS "${_rexglue_ffx_fi_dir}/ffx_FrameInterpolation.h")
+    file(CREATE_LINK "ffx_frameinterpolation.h" "${_rexglue_ffx_fi_dir}/ffx_FrameInterpolation.h"
+        SYMBOLIC)
 endif()
 
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL

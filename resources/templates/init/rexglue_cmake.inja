@@ -114,10 +114,28 @@ endmacro()
 # codegen, including one a project assembles itself rather than taking the
 # library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
 # names it.
+# A cross build (e.g. Windows on Linux) can't run the rexglue it builds, so codegen uses one that
+# runs on the build host: by default the SDK tree's native Linux build, else rexglue on PATH.
+if(CMAKE_CROSSCOMPILING)
+    if(REXSDK_DIR AND EXISTS "{{ cmake_var("REXSDK_DIR") }}/out/linux-amd64/rexglue")
+        set(_rexglue_host_default "{{ cmake_var("REXSDK_DIR") }}/out/linux-amd64/rexglue")
+    else()
+        find_program(_rexglue_host_default rexglue)
+    endif()
+    set(REXGLUE_HOST_TOOL "{{ cmake_var("_rexglue_host_default") }}" CACHE FILEPATH
+        "rexglue executable that runs on the build host, for codegen in a cross build")
+    if(NOT EXISTS "{{ cmake_var("REXGLUE_HOST_TOOL") }}")
+        message(WARNING "Cross build: no host rexglue for codegen. Build the native preset first, "
+            "or set REXGLUE_HOST_TOOL.")
+    endif()
+    set(_rexglue_codegen_tool "{{ cmake_var("REXGLUE_HOST_TOOL") }}")
+else()
+    set(_rexglue_codegen_tool $<TARGET_FILE:rex::rexglue>)
+endif()
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    COMMAND {{ cmake_var("_rexglue_codegen_tool") }} codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"
