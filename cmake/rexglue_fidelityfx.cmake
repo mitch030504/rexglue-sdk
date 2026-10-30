@@ -79,6 +79,33 @@ if(NOT WIN32)
     endif()
 endif()
 
+# The Vulkan backend carves its scratch buffer into arrays aligned to only 4 bytes, but clang
+# vectorizes stores into them with aligned SSE moves; the resulting fault is swallowed by the
+# runtime's guest-memory signal handler and retried forever, freezing presentation the first time
+# the temporal upscaler is created. Align the arrays (and their start) to 16 bytes.
+set(_rexglue_ffx_vk_file "${fidelityfx_SOURCE_DIR}/sdk/src/backends/vk/ffx_vk.cpp")
+file(READ "${_rexglue_ffx_vk_file}" _rexglue_ffx_vk_text)
+string(FIND "${_rexglue_ffx_vk_text}" "FFX_ALIGN_UP((uintptr_t)(backendContext + 1), 16)"
+    _rexglue_ffx_vk_done)
+if(_rexglue_ffx_vk_done EQUAL -1)
+    set(_rexglue_ffx_vk_start "(uint8_t*)((BackendContext_VK*)(backendContext + 1));")
+    set(_rexglue_ffx_vk_size "FFX_ALIGN_UP(sizeof(BackendContext_VK) + extensionPropArraySize")
+    string(FIND "${_rexglue_ffx_vk_text}" "${_rexglue_ffx_vk_start}" _rexglue_ffx_vk_pos1)
+    string(FIND "${_rexglue_ffx_vk_text}" "${_rexglue_ffx_vk_size}" _rexglue_ffx_vk_pos2)
+    if(_rexglue_ffx_vk_pos1 EQUAL -1 OR _rexglue_ffx_vk_pos2 EQUAL -1)
+        message(FATAL_ERROR "FidelityFX ffx_vk.cpp changed; update the scratch alignment patch")
+    endif()
+    string(REGEX REPLACE "(ArraySize *= FFX_ALIGN_UP\\([^\n]*), sizeof\\(uint32_t\\)\\);"
+        "\\1, 16);" _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    string(REPLACE "${_rexglue_ffx_vk_start}"
+        "(uint8_t*)FFX_ALIGN_UP((uintptr_t)(backendContext + 1), 16);"
+        _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    string(REPLACE "${_rexglue_ffx_vk_size}"
+        "FFX_ALIGN_UP(sizeof(BackendContext_VK) + 16 + extensionPropArraySize"
+        _rexglue_ffx_vk_text "${_rexglue_ffx_vk_text}")
+    file(WRITE "${_rexglue_ffx_vk_file}" "${_rexglue_ffx_vk_text}")
+endif()
+
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
