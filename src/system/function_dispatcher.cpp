@@ -147,9 +147,9 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
 
   // Hold the global lock during interrupt dispatch.
   auto global_lock = global_critical_region_.Acquire();
-  // Under sched_deterministic, the interrupt keeps the run token until it returns: a thread that
-  // got it would block on the global lock held here.
-  rex::system::GuestScheduler::NoSwitchScope no_switch;
+  // Under sched_deterministic, the interrupt keeps the run token until it returns (a thread that
+  // got it would block on the global lock held here), except where its guest code spins.
+  rex::system::GuestScheduler::NoSwitchScope no_switch(&global_lock);
 
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);

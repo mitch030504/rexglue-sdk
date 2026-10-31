@@ -55,16 +55,23 @@ constexpr uint32_t kMaxIdleFramesInARow = 600;
 constexpr uint64_t kLoopBackedgesPerVirtualFrame = uint64_t(1) << 22;
 // NoSwitchScope nesting on this thread.
 thread_local int no_switch_depth = 0;
+// The global lock of the interrupt running on this thread, if any (NoSwitchScope).
+thread_local std::unique_lock<std::recursive_mutex>* interrupt_lock = nullptr;
 // The current loop quantum of this thread (see kLoopQuantum).
 thread_local uint32_t loop_quantum = kLoopQuantum;
 }  // namespace
 
-GuestScheduler::NoSwitchScope::NoSwitchScope() {
+GuestScheduler::NoSwitchScope::NoSwitchScope(std::unique_lock<std::recursive_mutex>* lock)
+    : outer_interrupt_lock_(interrupt_lock) {
   ++no_switch_depth;
+  if (lock) {
+    interrupt_lock = lock;
+  }
 }
 
 GuestScheduler::NoSwitchScope::~NoSwitchScope() {
   --no_switch_depth;
+  interrupt_lock = outer_interrupt_lock_;
 }
 
 GuestScheduler* GuestScheduler::Get() {
@@ -152,9 +159,9 @@ std::string GuestScheduler::DescribeStates() {
     }
     // lr: the guest return address of the kernel call the thread is in.
     states += fmt::format(
-        " {}:{}{}@{:08X}", other->thread->thread_id(), kStateNames[size_t(other->state)],
+        " {}:{}{}@{:08X}/pcr{:08X}", other->thread->thread_id(), kStateNames[size_t(other->state)],
         other->state == State::kBlocked && other->ready && (*other->ready)() ? "(ready)" : "",
-        uint32_t(other->thread->thread_state()->context()->lr));
+        uint32_t(other->thread->thread_state()->context()->lr), other->thread->pcr_ptr());
   }
   return states;
 }
@@ -429,8 +436,15 @@ uint32_t GuestScheduler::OnLoopBudgetSpent(bool in_global_lock) {
   if (!scheduler) {
     return UINT32_MAX;
   }
-  if (in_global_lock || no_switch_depth) {
+  if (in_global_lock) {
     return kLoopRetry;
+  }
+  if (no_switch_depth) {
+    if (!XThread::IsInThread() || !scheduler->YieldInterrupt(XThread::GetCurrentThread())) {
+      return kLoopRetry;
+    }
+    scheduler->CountLoopQuantum(kLoopQuantum);
+    return kLoopQuantum;
   }
   if (XThread::IsInThread()) {
     XThread* thread = XThread::GetCurrentThread();
@@ -441,6 +455,30 @@ uint32_t GuestScheduler::OnLoopBudgetSpent(bool in_global_lock) {
     }
   }
   return loop_quantum;
+}
+
+bool GuestScheduler::YieldInterrupt(XThread* thread) {
+  // Only an interrupt holding nothing but its own global lock: it spins on something the
+  // interrupted thread must do (release a spinlock), which can't happen while the interrupt keeps
+  // the token and that lock.
+  if (no_switch_depth != 1 || !interrupt_lock || !interrupt_lock->owns_lock() || !Holds(thread)) {
+    return false;
+  }
+  std::unique_lock<std::recursive_mutex>* lock = interrupt_lock;
+  lock->unlock();
+  no_switch_depth = 0;
+  YieldTurn(thread);
+  no_switch_depth = 1;
+  lock->lock();
+  return true;
+}
+
+void GuestScheduler::YieldSpinning(XThread* thread) {
+  if (!no_switch_depth) {
+    Yield(thread);
+  } else {
+    YieldInterrupt(thread);
+  }
 }
 
 void GuestScheduler::TickCurrentThread() {

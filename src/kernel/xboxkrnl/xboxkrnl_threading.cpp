@@ -974,10 +974,16 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
   assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  uint64_t spins = 0;
   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
-    // Under sched_deterministic the owner can only release it once we hand over the token.
+    if (++spins == 100000) {
+      REXKRNL_WARN("KfAcquireSpinLock: pcr {:08X} spun 100000 times on a lock owned by pcr {:08X}",
+                   pcr_addr, rex::byte_swap(lock->prcb_of_owner.value));
+    }
+    // Under sched_deterministic the owner can only release it once we hand over the token, even
+    // from an interrupt.
     if (auto* scheduler = system::GuestScheduler::ForCurrentThread()) {
-      scheduler->Yield(XThread::GetCurrentThread());
+      scheduler->YieldSpinning(XThread::GetCurrentThread());
     } else {
       rex::thread::MaybeYield();
     }

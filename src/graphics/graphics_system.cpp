@@ -186,13 +186,19 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         auto* scheduler = system::GuestScheduler::Get();
         if (scheduler) {
           system::XThread* self = system::XThread::GetCurrentThread();
+          // Guest time restarts from zero when the scheduler starts, possibly after
+          // last_frame_time was read above: a time before it means that, not a huge interval.
           scheduler->SetDue(self, [&]() {
-            return !vsync_worker_running_ ||
-                   chrono::Clock::QueryGuestTickCount() - last_frame_time >= vsync_interval_ticks;
+            const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+            return !vsync_worker_running_ || current_time < last_frame_time ||
+                   current_time - last_frame_time >= vsync_interval_ticks;
           });
           while (vsync_worker_running_) {
             scheduler->Enter(self);
             const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+            if (current_time < last_frame_time) {
+              last_frame_time = current_time;
+            }
             while (vsync_worker_running_ && current_time - last_frame_time >= vsync_interval_ticks) {
               MarkVblank();
               last_frame_time += vsync_interval_ticks;

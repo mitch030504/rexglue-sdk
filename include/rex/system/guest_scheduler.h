@@ -70,6 +70,9 @@ class GuestScheduler {
              const std::function<bool()>& attempt);
   /// Lets every other runnable thread go first.
   void Yield(XThread* thread);
+  /// Yield for a thread spinning on guest memory another thread must change (a spinlock): also
+  /// works inside an interrupt (see NoSwitchScope).
+  void YieldSpinning(XThread* thread);
   /// Counts a sync operation (a wait that succeeded, a release) by the token holder and yields
   /// every kQuantum of them. Guest code that polls a flag under a lock never blocks, so without
   /// this the thread that would set the flag never runs. Counting guest operations instead of
@@ -86,13 +89,18 @@ class GuestScheduler {
 
   /// While one exists on a thread, it doesn't give up the token voluntarily (Tick, Yield, loop
   /// budgets): it holds a lock every other guest thread may need, such as the global lock of an
-  /// interrupt.
+  /// interrupt. With `interrupt_lock` (an interrupt holding the global lock), a loop budget running
+  /// out in guest code still yields, with that lock released meanwhile: the handler spins on
+  /// something the interrupted thread has to do first.
   class NoSwitchScope {
    public:
-    NoSwitchScope();
+    explicit NoSwitchScope(std::unique_lock<std::recursive_mutex>* interrupt_lock = nullptr);
     ~NoSwitchScope();
     NoSwitchScope(const NoSwitchScope&) = delete;
     NoSwitchScope& operator=(const NoSwitchScope&) = delete;
+
+   private:
+    std::unique_lock<std::recursive_mutex>* outer_interrupt_lock_;
   };
 
  private:
@@ -126,6 +134,9 @@ class GuestScheduler {
   void CountLoopQuantum(uint32_t backedges);
   // Yield; true if another thread got a turn.
   bool YieldTurn(XThread* thread);
+  // Yield from an interrupt's guest code with the interrupt's global lock released meanwhile;
+  // false (and nothing happens) if that isn't safe here.
+  bool YieldInterrupt(XThread* thread);
 
   std::mutex mutex_;
   std::map<uint64_t, std::unique_ptr<Entry>> entries_;  // by order
