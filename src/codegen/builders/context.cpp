@@ -285,9 +285,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
   switch (kind) {
     case TargetKind::InternalLabel:
-      // Target is within this function - local goto
-      println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
-              target);
+      // Target is within this function - local goto. A backward one closes a loop, which may be
+      // a busy-wait: count it for the deterministic scheduler (REX_LOOP_BACKEDGE).
+      if (target <= base) {
+        println("\tif ({}{}.{}) {{ REX_LOOP_BACKEDGE(); goto loc_{:08X}; }}", not_ ? "!" : "",
+                cr(insn.operands[0]), cond, target);
+      } else {
+        println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
+                target);
+      }
       break;
 
     case TargetKind::Function:

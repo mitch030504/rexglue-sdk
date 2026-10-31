@@ -36,6 +36,7 @@
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/guest_scheduler.h>
 
 #include <atomic>
 #include <cassert>
@@ -332,4 +333,23 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
     auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
+  } while (0)
+
+//=============================================================================
+// Deterministic scheduling (sched_deterministic)
+//=============================================================================
+
+// Under sched_deterministic one guest thread runs at a time, switching where the guest blocks.
+// A guest busy-wait never blocks, so every backward branch spends one unit of a per-thread
+// budget and the scheduler may switch threads when it runs out. The count only depends on guest
+// execution, so the switch points repeat between runs. Not inside an interrupt-disabled section:
+// the next thread would block on the global lock while holding the token.
+inline thread_local u32 rex_loop_budget_ = 1;
+
+#define REX_LOOP_BACKEDGE()                                                    \
+  do {                                                                         \
+    if (--rex_loop_budget_ == 0) [[unlikely]] {                                \
+      rex_loop_budget_ = rex::system::GuestScheduler::OnLoopBudgetSpent(       \
+          ppc_global_lock_count_().load(std::memory_order_relaxed) != 0);      \
+    }                                                                          \
   } while (0)

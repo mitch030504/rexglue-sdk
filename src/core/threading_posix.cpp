@@ -287,6 +287,11 @@ class PosixConditionBase {
   virtual ~PosixConditionBase() = default;
   virtual bool Signal() = 0;
 
+  bool Peek() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return signaled();
+  }
+
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
@@ -1153,6 +1158,11 @@ PosixConditionHandle<Event>::PosixConditionHandle(bool manual_reset, bool initia
 
 template <>
 PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread) : handle_(thread) {}
+
+bool IsSignaled(WaitHandle* wait_handle) {
+  auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
+  return !posix_wait_handle || posix_wait_handle->condition().Peek();
+}
 
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
   auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);

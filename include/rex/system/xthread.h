@@ -350,6 +350,7 @@ class XThread : public XObject {
   void LeaveCriticalRegion();
 
   void DeliverAPCs();
+  bool HasPendingApcs();
   void LockApc();
   void UnlockApc(bool queue_delivery);
   void EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint32_t arg1, uint32_t arg2);

@@ -33,7 +33,11 @@ bool build_b(BuilderContext& ctx) {
 
   switch (kind) {
     case TargetKind::InternalLabel:
-      // Target is within this function and not another function's entry point
+      // Target is within this function and not another function's entry point. A backward one
+      // closes a loop (see REX_LOOP_BACKEDGE).
+      if (target <= ctx.base) {
+        ctx.println("\tREX_LOOP_BACKEDGE();");
+      }
       ctx.println("\tgoto loc_{:X};", target);
       break;
 
@@ -47,6 +51,9 @@ bool build_b(BuilderContext& ctx) {
     case TargetKind::Unknown:
       // Unknown target - fall back to range check
       if (target >= ctx.fn.base() && target < ctx.fn.end()) {
+        if (target <= ctx.base) {
+          ctx.println("\tREX_LOOP_BACKEDGE();");
+        }
         ctx.println("\tgoto loc_{:X};", target);
       } else {
         REXCODEGEN_WARN("Unresolved b target 0x{:08X} from 0x{:08X}", target, ctx.base);

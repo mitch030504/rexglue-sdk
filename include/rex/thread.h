@@ -213,6 +213,11 @@ class WaitHandle {
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
                 std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
 
+// Whether waiting on the handle would succeed right now, without consuming anything (a semaphore
+// keeps its count, an auto-reset event stays set). A hint for schedulers: true where the platform
+// can't tell, so callers must still wait to find out.
+bool IsSignaled(WaitHandle* wait_handle);
+
 // Signals one object and waits on another object as a single operation.
 // Waits until the wait handle is in the signaled state, an alert triggers and
 // a user callback is queued to the thread, or the timeout interval elapses.

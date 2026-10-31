@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdio>
 #include <mutex>
 #include <utility>
@@ -18,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/ui/temporal_jitter.h>
 #include <rex/stream.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
 #include <rex/system/xobject.h>
@@ -249,9 +251,41 @@ bool IsTimeout(const std::pair<rex::thread::WaitResult, size_t>& result) {
   return IsTimeout(result.first);
 }
 
-template <typename WaitFn>
+// Under sched_deterministic (GuestScheduler) the calling thread holds the run token. A wait
+// that can't succeed right away gives the token up until its objects are signalled (`signalled`
+// peeks without consuming), its guest deadline passes or an APC arrives, and then retries.
+template <typename WaitFn, typename SignalledFn>
 auto WaitUntilGuestDeadline(const uint64_t* opt_timeout, std::chrono::milliseconds host_timeout,
-                            WaitFn wait) {
+                            bool alertable, WaitFn wait, SignalledFn signalled) {
+  if (auto* scheduler = GuestScheduler::ForCurrentThread()) {
+    auto result = wait(std::chrono::milliseconds(0));
+    if (!IsTimeout(result)) {
+      scheduler->Tick(XThread::GetCurrentThread());
+      return result;
+    }
+    if (opt_timeout && !*opt_timeout) {
+      // A poll that fails: whoever would signal the object needs the token to do it, so let
+      // every other thread that can run go first (guest code that polls in a loop spins forever
+      // otherwise).
+      scheduler->Yield(XThread::GetCurrentThread());
+      return result;
+    }
+    const bool has_deadline = opt_timeout != nullptr;
+    const uint64_t deadline =
+        has_deadline ? chrono::Clock::GuestDeadline(int64_t(*opt_timeout)) : 0;
+    XThread* thread = XThread::GetCurrentThread();
+    const auto passed = [&]() {
+      return has_deadline && chrono::Clock::GuestDeadlinePassed(deadline);
+    };
+    scheduler->Block(
+        thread,
+        [&]() { return signalled() || passed() || (alertable && thread->HasPendingApcs()); },
+        [&]() {
+          result = wait(std::chrono::milliseconds(0));
+          return !IsTimeout(result) || passed();
+        });
+    return result;
+  }
   if (!opt_timeout || !*opt_timeout || !chrono::Clock::GuestTimedWaits()) {
     return wait(host_timeout);
   }
@@ -296,9 +330,10 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                     : std::chrono::milliseconds::max();
 
     XThread::CheckTitleTermination();
-    auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
-      return rex::thread::Wait(wait_handle, alertable ? true : false, slice);
-    });
+    auto result = WaitUntilGuestDeadline(
+        opt_timeout, timeout_ms, alertable,
+        [&](auto slice) { return rex::thread::Wait(wait_handle, alertable ? true : false, slice); },
+        [&]() { return rex::thread::IsSignaled(wait_handle); });
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
@@ -336,14 +371,17 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
 
     // Signal once; later slices of a guest-time timeout only wait.
     bool signalled = false;
-    auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
-      if (std::exchange(signalled, true)) {
-        return rex::thread::Wait(wait_object->GetWaitHandle(), alertable ? true : false, slice);
-      }
-      return rex::thread::SignalAndWait(signal_object->GetWaitHandle(),
-                                        wait_object->GetWaitHandle(), alertable ? true : false,
-                                        slice);
-    });
+    auto result = WaitUntilGuestDeadline(
+        opt_timeout, timeout_ms, alertable,
+        [&](auto slice) {
+          if (std::exchange(signalled, true)) {
+            return rex::thread::Wait(wait_object->GetWaitHandle(), alertable ? true : false, slice);
+          }
+          return rex::thread::SignalAndWait(signal_object->GetWaitHandle(),
+                                            wait_object->GetWaitHandle(), alertable ? true : false,
+                                            slice);
+        },
+        [&]() { return rex::thread::IsSignaled(wait_object->GetWaitHandle()); });
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
         wait_object->WaitCallback();
@@ -386,10 +424,16 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
 
     XThread::CheckTitleTermination();
     if (wait_type) {
-      auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
-        return rex::thread::WaitAny(wait_handles.data(), wait_handles.size(),
-                                    alertable ? true : false, slice);
-      });
+      auto result = WaitUntilGuestDeadline(
+          opt_timeout, timeout_ms, alertable,
+          [&](auto slice) {
+            return rex::thread::WaitAny(wait_handles.data(), wait_handles.size(),
+                                        alertable ? true : false, slice);
+          },
+          [&]() {
+            return std::any_of(wait_handles.begin(), wait_handles.end(),
+                               [](auto* handle) { return rex::thread::IsSignaled(handle); });
+          });
       XThread::CheckTitleTermination();
       switch (result.first) {
         case rex::thread::WaitResult::kSuccess:
@@ -409,10 +453,16 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
           return X_STATUS_UNSUCCESSFUL;
       }
     } else {
-      auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
-        return rex::thread::WaitAll(wait_handles.data(), wait_handles.size(),
-                                    alertable ? true : false, slice);
-      });
+      auto result = WaitUntilGuestDeadline(
+          opt_timeout, timeout_ms, alertable,
+          [&](auto slice) {
+            return rex::thread::WaitAll(wait_handles.data(), wait_handles.size(),
+                                        alertable ? true : false, slice);
+          },
+          [&]() {
+            return std::all_of(wait_handles.begin(), wait_handles.end(),
+                               [](auto* handle) { return rex::thread::IsSignaled(handle); });
+          });
       XThread::CheckTitleTermination();
       switch (result) {
         case rex::thread::WaitResult::kSuccess:

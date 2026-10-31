@@ -33,6 +33,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/vec128.h>
@@ -429,6 +430,11 @@ X_STATUS XThread::Create() {
   // Always retain when starting - the thread owns itself until exited.
   RetainHandle();
 
+  if (auto* scheduler = GuestScheduler::Get()) {
+    // Registered here, by the creating thread, so guest threads are ordered by guest code.
+    scheduler->OnCreate(this, is_guest_thread());
+  }
+
   rex::thread::Thread::CreationParameters params;
   params.stack_size = 16_MiB;  // Allocate a big host stack.
   params.create_suspended = true;
@@ -448,6 +454,9 @@ X_STATUS XThread::Create() {
     // Execute user code.
     current_xthread_tls_ = this;
     running_ = true;
+    if (auto* scheduler = GuestScheduler::Get(); scheduler && is_guest_thread()) {
+      scheduler->Begin(this);
+    }
     Execute();
     running_ = false;
     current_xthread_tls_ = nullptr;
@@ -536,6 +545,10 @@ X_STATUS XThread::Exit(int exit_code) {
   running_ = false;
   ReleaseHandle();
 
+  if (auto* scheduler = GuestScheduler::Get()) {
+    scheduler->End(this);
+  }
+
   // NOTE: this does not return!
   rex::thread::Thread::Exit(exit_code);
   return X_STATUS_SUCCESS;
@@ -552,6 +565,9 @@ X_STATUS XThread::Terminate(int exit_code) {
   // TODO(tomc): do we need thread notifications (related to processor thread management)?
 
   running_ = false;
+  if (auto* scheduler = GuestScheduler::Get()) {
+    scheduler->End(this);
+  }
   if (XThread::IsInThread(this)) {
     // Same lifetime rule as Exit(): don't allow ReleaseHandle() to destroy
     // the thread object before Thread::Exit() reaches pthread_exit().
@@ -684,6 +700,12 @@ void XThread::UnlockApc(bool queue_delivery) {
     // User APC execution happens on alertable wait return paths.
     thread_->QueueUserCallback([]() {});
   }
+}
+
+bool XThread::HasPendingApcs() {
+  auto kthread = guest_object<X_KTHREAD>();
+  auto mem = memory();
+  return !kthread->apc_lists[0].empty(mem) || !kthread->apc_lists[1].empty(mem);
 }
 
 void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint32_t arg1,
@@ -989,6 +1011,17 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 uint32_t XThread::SelfSuspend() {
   auto guest_thread = guest_object<X_KTHREAD>();
+  if (auto* scheduler = GuestScheduler::ForCurrentThread()) {
+    // Suspended threads can't take the token, so give it up until a Resume brings the count to 0.
+    uint32_t previous;
+    {
+      std::lock_guard<std::mutex> lock(suspend_mutex_);
+      previous = guest_thread->suspend_count++;
+    }
+    const auto resumed = [guest_thread]() { return guest_thread->suspend_count == 0; };
+    scheduler->Block(this, resumed, resumed);
+    return previous;
+  }
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
   guest_thread->suspend_count++;
@@ -999,6 +1032,29 @@ uint32_t XThread::SelfSuspend() {
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
   const X_STATUS status = [&]() -> X_STATUS {
+    if (auto* scheduler = GuestScheduler::ForCurrentThread()) {
+      // One guest thread at a time: sleeping gives the token up until the guest deadline.
+      if (!interval) {
+        scheduler->Yield(this);
+        return X_STATUS_SUCCESS;
+      }
+      const uint64_t deadline = chrono::Clock::GuestDeadline(int64_t(interval));
+      const auto apc = [&]() { return alertable && HasPendingApcs(); };
+      if (chrono::Clock::GuestDeadlinePassed(deadline) && !apc()) {
+        return X_STATUS_SUCCESS;
+      }
+      X_STATUS result = X_STATUS_SUCCESS;
+      scheduler->Block(
+          this, [&]() { return chrono::Clock::GuestDeadlinePassed(deadline) || apc(); },
+          [&]() {
+            if (apc()) {
+              result = X_STATUS_USER_APC;
+              return true;
+            }
+            return chrono::Clock::GuestDeadlinePassed(deadline);
+          });
+      return result;
+    }
     if (interval && chrono::Clock::GuestTimedWaits()) {
       // Sleep until guest time passes the deadline, like a guest wait timeout (see
       // WaitUntilGuestDeadline in xobject.cpp): a 1 ms sleep ends at the next guest frame.

@@ -25,6 +25,7 @@
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
@@ -390,6 +391,10 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 }
 
 u32 NtYieldExecution_entry() {
+  if (auto* scheduler = system::GuestScheduler::ForCurrentThread()) {
+    scheduler->Yield(XThread::GetCurrentThread());
+    return X_STATUS_SUCCESS;
+  }
   rex::thread::MaybeYield();
   return X_STATUS_SUCCESS;
 }
@@ -970,7 +975,12 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   const uint32_t self = rex::byte_swap(pcr_addr);
   assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
-    rex::thread::MaybeYield();
+    // Under sched_deterministic the owner can only release it once we hand over the token.
+    if (auto* scheduler = system::GuestScheduler::ForCurrentThread()) {
+      scheduler->Yield(XThread::GetCurrentThread());
+    } else {
+      rex::thread::MaybeYield();
+    }
   }
   return old_irql;
 }

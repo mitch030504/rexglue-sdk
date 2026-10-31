@@ -332,6 +332,10 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   //          interrupt_callback_, source, cpu);
 
   uint64_t args[] = {source, interrupt_callback_data_};
+  // Not under the sched_deterministic run token: the guest busy-waits on memory the command
+  // processor writes after an interrupt (D3D's wait for the ring buffer read pointer), so making
+  // this thread wait for the token would deadlock. Interrupts arrive on host time either way;
+  // delivering them at fixed guest points is the next determinism step.
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
 }

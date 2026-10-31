@@ -20,6 +20,7 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/string/buffer.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
@@ -153,8 +154,16 @@ void AudioSystem::WorkerThreadMain() {
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        // Guest code: under sched_deterministic it runs only while holding the run token.
+        auto* scheduler = system::GuestScheduler::Get();
+        if (scheduler) {
+          scheduler->Enter(worker_thread_.get());
+        }
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        if (scheduler) {
+          scheduler->Leave(worker_thread_.get());
+        }
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }

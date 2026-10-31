@@ -12,6 +12,7 @@
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 
@@ -46,6 +47,7 @@ X_STATUS XMutant::ReleaseMutant(uint32_t priority_increment, bool abandon, bool 
   // TODO(benvanik): abandoning.
   assert_false(abandon);
   if (mutant_->Release()) {
+    GuestScheduler::TickCurrentThread();
     return X_STATUS_SUCCESS;
   } else {
     return X_STATUS_MUTANT_NOT_OWNED;

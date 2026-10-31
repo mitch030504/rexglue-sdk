@@ -11,6 +11,7 @@
 
 #include <rex/logging.h>
 #include <rex/stream.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/xevent.h>
 
 namespace rex::system {
@@ -75,11 +76,13 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   event_->Set();
+  GuestScheduler::TickCurrentThread();
   return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
   event_->Pulse();
+  GuestScheduler::TickCurrentThread();
   return 1;
 }
 

@@ -139,6 +139,12 @@ class Win32Handle : public T {
   HANDLE handle_ = nullptr;
 };
 
+bool IsSignaled(WaitHandle* wait_handle) {
+  // Win32 can't look at a semaphore or auto-reset event without taking it.
+  (void)wait_handle;
+  return true;
+}
+
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
   HANDLE handle = wait_handle->native_handle();
   DWORD result = WaitForSingleObjectEx(handle, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
