@@ -34,12 +34,47 @@
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
 
+#include <cstring>
+#include <rex/ppc/function.h>
+
 REXCVAR_DEFINE_STRING(sync_trace_log, "", "Kernel",
                       "Determinism debugging: write every guest wait (thread, guest frame, "
                       "object, timeout, result) to this file. Slow; off when empty.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(debug_guest_watch, "", "Kernel",
+                      "Determinism debugging: hex guest address of a word to compare around every "
+                      "kernel export call; each change is logged with the caller's guest address "
+                      "(and in sync_trace_log as an M line). Off when empty.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace rex::ppc {
+
+uint32_t g_debug_guest_watch = 0;
+
+void ReportGuestWatchChange(uint8_t* base, uint32_t caller_lr, uint32_t before) {
+  uint32_t after;
+  std::memcpy(&after, base + g_debug_guest_watch, sizeof(after));
+  const std::string detail =
+      fmt::format("{:08X} {:08X}->{:08X} lr {:08X}", g_debug_guest_watch,
+                  rex::byte_swap(before), rex::byte_swap(after), caller_lr);
+  REXSYS_INFO("debug_guest_watch: {}", detail);
+  if (system::XObject::SyncTraceEnabled()) {
+    system::XObject::TraceSync("M", detail, 0);
+  }
+}
+
+}  // namespace rex::ppc
+
 namespace rex::system {
+
+void XObject::InitDebugGuestWatch() {
+  const std::string watch = REXCVAR_GET(debug_guest_watch);
+  if (!watch.empty()) {
+    ppc::g_debug_guest_watch = uint32_t(std::stoul(watch, nullptr, 16)) & ~uint32_t(3);
+    REXSYS_INFO("debug_guest_watch: watching {:08X}", ppc::g_debug_guest_watch);
+  }
+}
 
 bool XObject::SyncTraceEnabled() {
   return !REXCVAR_GET(sync_trace_log).empty();

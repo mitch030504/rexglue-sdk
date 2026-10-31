@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/debug_monitor.h>
 #include <rex/kernel/xboxkrnl/module.h>
 #include <rex/system/guest_scheduler.h>
+#include <rex/system/xobject.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
@@ -187,6 +188,7 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // We setup a system timer here to do that.
   // Created now if enabled: it resets guest time before the bundle below is first written.
   auto* scheduler = system::GuestScheduler::Get();
+  system::XObject::InitDebugGuestWatch();
   uint32_t pKeTimeStampBundle = memory_->SystemHeapAlloc(24);
   auto lpKeTimeStampBundle = memory_->TranslateVirtual(pKeTimeStampBundle);
   export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x00AD, pKeTimeStampBundle);

@@ -402,9 +402,34 @@ void _translate_args_to_guest(PPCContext& ctx, uint8_t* base, std::tuple<TArgs..
 //=============================================================================
 // Calls a native C++ function with arguments extracted from PPC context
 
+// debug_guest_watch: the guest address whose word is compared around every kernel export call
+// (0: off), and the report when one changed it.
+extern uint32_t g_debug_guest_watch;
+void ReportGuestWatchChange(uint8_t* base, uint32_t caller_lr, uint32_t before);
+
 template <auto Func>
 __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
   using ret_t = decltype(std::apply(Func, function_args(Func)));
+
+  const uint32_t watch = g_debug_guest_watch;
+  const uint32_t caller_lr = static_cast<uint32_t>(ctx.lr);
+  uint32_t watch_before = 0;
+  if (watch) [[unlikely]] {
+    std::memcpy(&watch_before, base + watch, sizeof(watch_before));
+  }
+  struct WatchCheck {
+    uint32_t watch, caller_lr, before;
+    uint8_t* base;
+    ~WatchCheck() {
+      if (watch) [[unlikely]] {
+        uint32_t after;
+        std::memcpy(&after, base + watch, sizeof(after));
+        if (after != before) {
+          ReportGuestWatchChange(base, caller_lr, before);
+        }
+      }
+    }
+  } watch_check{watch, caller_lr, watch_before, base};
 
   auto args = function_args(Func);
   _translate_args_to_host<Func>(ctx, base, args);

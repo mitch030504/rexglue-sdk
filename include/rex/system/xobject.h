@@ -199,6 +199,7 @@ class XObject {
 
   // With sync_trace_log set, appends one line per guest wait (thread, guest frame, what it
   // waited on, result) so two replays can be compared wait by wait. Does nothing otherwise.
+  static void InitDebugGuestWatch();
   static bool SyncTraceEnabled();
   static void TraceSync(std::string_view op, std::string_view detail, uint32_t result);
   std::string SyncTraceName() const;
