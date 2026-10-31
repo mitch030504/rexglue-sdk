@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <functional>
 #include <mutex>
 
 #include <rex/chrono/clock.h>
@@ -128,8 +129,12 @@ uint64_t UpdateGuestClock() {
         host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
     last_host_tick_count_ = host_tick_count;
     if (!frame_locked_last_frame_host_tick_) {
-      last_guest_tick_count_ +=
-          host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
+      // Without the stall fallback (sched_deterministic) boot is guest-timed too: only virtual
+      // frames move time before the first frame.
+      if (frame_locked_stall_fallback_) {
+        last_guest_tick_count_ +=
+            host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
+      }
       return last_guest_tick_count_;
     }
     const uint64_t hz = uint64_t(REXCVAR_GET(clock_frame_locked_hz));
@@ -251,15 +256,15 @@ uint64_t Clock::QueryGuestSystemTime() {
          guest_system_time_offset;
 }
 
-void Clock::OnGuestFrame() {
+static void OnGuestFrameImpl() {
   if (!FrameLocked()) {
     return;
   }
-  const uint64_t host_tick_count = QueryHostTickCount();
+  const uint64_t host_tick_count = Clock::QueryHostTickCount();
   std::lock_guard<std::mutex> lock(tick_mutex_);
   if (!frame_locked_last_frame_host_tick_) {
     const uint64_t first_frame_ticks = guest_tick_frequency_ * kFrameLockedFirstFrameSeconds;
-    if (last_guest_tick_count_ > first_frame_ticks) {
+    if (last_guest_tick_count_ > first_frame_ticks && frame_locked_stall_fallback_) {
       REXLOG_WARN("clock_frame_locked: boot took over {} s of guest time; runs won't match",
                   kFrameLockedFirstFrameSeconds);
     } else {
@@ -269,7 +274,7 @@ void Clock::OnGuestFrame() {
     if (frame_locked_stall_frames_) {
       REXLOG_INFO(
           "clock_frame_locked: {} ms without a guest frame, {} virtual frames",
-          (host_tick_count - frame_locked_last_frame_host_tick_) * 1000 / QueryHostTickFrequency(),
+          (host_tick_count - frame_locked_last_frame_host_tick_) * 1000 / Clock::QueryHostTickFrequency(),
           frame_locked_stall_frames_);
       frame_locked_stall_frames_ = 0;
     }
@@ -280,14 +285,21 @@ void Clock::OnGuestFrame() {
   last_host_tick_count_ = host_tick_count;
 }
 
-bool Clock::AdvanceVirtualFrame() {
+static bool AdvanceVirtualFrameImpl() {
   if (!FrameLocked()) {
     return false;
   }
-  const uint64_t host_tick_count = QueryHostTickCount();
+  const uint64_t host_tick_count = Clock::QueryHostTickCount();
   std::lock_guard<std::mutex> lock(tick_mutex_);
   if (!frame_locked_last_frame_host_tick_) {
-    return false;  // Before the first frame guest time follows the host clock anyway.
+    if (frame_locked_stall_fallback_) {
+      return false;  // Before the first frame guest time follows the host clock anyway.
+    }
+    // Boot under the deterministic scheduler: OnGuestFrame still sees the first frame as such.
+    last_guest_tick_count_ +=
+        guest_tick_frequency_ / uint64_t(REXCVAR_GET(clock_frame_locked_hz));
+    last_host_tick_count_ = host_tick_count;
+    return true;
   }
   last_guest_tick_count_ += guest_tick_frequency_ / uint64_t(REXCVAR_GET(clock_frame_locked_hz));
   frame_locked_frame_guest_tick_ = last_guest_tick_count_;
@@ -297,9 +309,37 @@ bool Clock::AdvanceVirtualFrame() {
   return true;
 }
 
+// Called after guest time moved under clock_frame_locked (see SetFrameLockedTimeCallback).
+std::function<void()> frame_locked_time_callback_;
+
+void Clock::OnGuestFrame() {
+  OnGuestFrameImpl();
+  if (FrameLocked() && frame_locked_time_callback_) {
+    frame_locked_time_callback_();
+  }
+}
+
+bool Clock::AdvanceVirtualFrame() {
+  if (!AdvanceVirtualFrameImpl()) {
+    return false;
+  }
+  if (frame_locked_time_callback_) {
+    frame_locked_time_callback_();
+  }
+  return true;
+}
+
+void Clock::SetFrameLockedTimeCallback(std::function<void()> callback) {
+  frame_locked_time_callback_ = std::move(callback);
+}
+
 void Clock::SetFrameLockedStallFallback(bool enabled) {
   std::lock_guard<std::mutex> lock(tick_mutex_);
   frame_locked_stall_fallback_ = enabled;
+  if (!enabled && FrameLocked() && !frame_locked_last_frame_host_tick_) {
+    // Host start-up so far took a varying amount of host time; guest time starts from zero.
+    last_guest_tick_count_ = 0;
+  }
 }
 
 bool Clock::GuestTimedWaits() {

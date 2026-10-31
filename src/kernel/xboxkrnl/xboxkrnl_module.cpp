@@ -24,6 +24,7 @@
 #include <rex/kernel/xboxkrnl/cert_monitor.h>
 #include <rex/kernel/xboxkrnl/debug_monitor.h>
 #include <rex/kernel/xboxkrnl/module.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
@@ -184,6 +185,8 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   // KeTimeStampBundle (24b)
   // This must be updated during execution, at 1ms intevals.
   // We setup a system timer here to do that.
+  // Created now if enabled: it resets guest time before the bundle below is first written.
+  auto* scheduler = system::GuestScheduler::Get();
   uint32_t pKeTimeStampBundle = memory_->SystemHeapAlloc(24);
   auto lpKeTimeStampBundle = memory_->TranslateVirtual(pKeTimeStampBundle);
   export_resolver_->SetVariableMapping("xboxkrnl.exe", 0x00AD, pKeTimeStampBundle);
@@ -192,11 +195,19 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
                                    chrono::Clock::QueryGuestUptimeMillis());
   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
-  timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
-      std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
-        memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
-                                         chrono::Clock::QueryGuestUptimeMillis());
-      });
+  const auto update_uptime = [lpKeTimeStampBundle]() {
+    memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
+                                     chrono::Clock::QueryGuestUptimeMillis());
+  };
+  if (scheduler) {
+    // Under sched_deterministic guest time only moves at guest and virtual frames: update the
+    // tick count there, so guest code reads the same value at the same point in every run (a
+    // host timer would update it a varying moment later).
+    chrono::Clock::SetFrameLockedTimeCallback(update_uptime);
+  } else {
+    timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
+        std::chrono::milliseconds(1), update_uptime);
+  }
 
   // Wire kernel object type variables to KernelGuestGlobals.
   // KernelGuestGlobals is allocated in KernelState ctor, which runs before this.

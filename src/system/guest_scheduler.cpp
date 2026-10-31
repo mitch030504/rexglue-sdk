@@ -52,7 +52,7 @@ constexpr uint32_t kLoopRetry = 64;
 constexpr uint32_t kMaxIdleFramesInARow = 600;
 // Backward branches without a guest frame that count as one frame of guest work (a virtual
 // frame), for guest code that spins on the clock without ever blocking.
-constexpr uint64_t kLoopBackedgesPerVirtualFrame = uint64_t(1) << 26;
+constexpr uint64_t kLoopBackedgesPerVirtualFrame = uint64_t(1) << 22;
 // NoSwitchScope nesting on this thread.
 thread_local int no_switch_depth = 0;
 // The current loop quantum of this thread (see kLoopQuantum).
@@ -208,8 +208,8 @@ void GuestScheduler::WaitForToken(Entry* entry, std::unique_lock<std::mutex>& lo
       }
       // Nobody can run, and every host thread with work to do has a fixed turn (SetDue), so only
       // guest time can wake anyone: a timeout, or vblank. Advance it now, at a point fixed by
-      // guest state, instead of waiting for host time to pass. (Before the first guest frame
-      // time follows the host clock and this does nothing.)
+      // guest state, instead of waiting for host time to pass. Boot included: the clock stands
+      // still before the first frame too (Clock::SetFrameLockedStallFallback).
       if (!holder_ && idle_frames_in_a_row_ < kMaxIdleFramesInARow &&
           chrono::Clock::AdvanceVirtualFrame()) {
         loop_backedges_since_frame_ = 0;

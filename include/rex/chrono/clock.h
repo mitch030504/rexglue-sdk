@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 
 #include <rex/cvar.h>
 #include <rex/platform.h>
@@ -87,8 +88,12 @@ class Clock {
   // False (and nothing changes) before the first guest frame, when time follows the host clock.
   static bool AdvanceVirtualFrame();
   // Turns the host-timed stall fallback of clock_frame_locked (virtual frames after
-  // clock_frame_locked_stall_ms without a guest frame) on or off.
+  // clock_frame_locked_stall_ms without a guest frame) on or off. Off, boot is guest-timed too:
+  // before the first frame time starts at zero and moves only by AdvanceVirtualFrame.
   static void SetFrameLockedStallFallback(bool enabled);
+  // Called (on the thread that moved it) whenever OnGuestFrame or AdvanceVirtualFrame moves guest
+  // time, so guest-visible copies of the time can follow at the same guest point.
+  static void SetFrameLockedTimeCallback(std::function<void()> callback);
 
   // True when guest waits and sleeps with a timeout should end by guest time
   // (clock_frame_locked and clock_frame_locked_waits).
