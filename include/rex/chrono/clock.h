@@ -82,6 +82,13 @@ class Clock {
   // With clock_frame_locked, advances guest time by exactly one frame period. Called once per
   // guest VdSwap; does nothing otherwise.
   static void OnGuestFrame();
+  // With clock_frame_locked, advances guest time by one frame period without a guest frame: a
+  // virtual frame. The deterministic scheduler calls it where only time can make progress.
+  // False (and nothing changes) before the first guest frame, when time follows the host clock.
+  static bool AdvanceVirtualFrame();
+  // Turns the host-timed stall fallback of clock_frame_locked (virtual frames after
+  // clock_frame_locked_stall_ms without a guest frame) on or off.
+  static void SetFrameLockedStallFallback(bool enabled);
 
   // True when guest waits and sleeps with a timeout should end by guest time
   // (clock_frame_locked and clock_frame_locked_waits).

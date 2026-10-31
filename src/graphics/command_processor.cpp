@@ -32,6 +32,7 @@
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
@@ -209,11 +210,44 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+  // Under sched_deterministic the command stream runs while holding the run token, at a turn
+  // fixed by guest state (the guest wrote commands), so the read pointer writeback, interrupts and
+  // fences the guest polls appear at the same guest instruction in every run.
+  auto* scheduler = system::GuestScheduler::Get();
+  const auto has_commands = [this]() {
+    const uint32_t write_ptr_index = write_ptr_index_.load();
+    return write_ptr_index != 0xBAADF00D && read_ptr_index_ != write_ptr_index;
+  };
+  if (scheduler) {
+    scheduler->SetDue(worker_thread_.get(),
+                      [this, has_commands]() { return !worker_running_ || has_commands(); });
+  }
+
   while (worker_running_) {
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
       fn();
+    }
+
+    if (scheduler) {
+      if (!has_commands()) {
+        // UpdateWritePointer sets the event, so this wakes as the guest writes commands; the
+        // timeout keeps pending_fns_ moving.
+        rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(1));
+        continue;
+      }
+      scheduler->Enter(worker_thread_.get());
+      const uint32_t write_ptr_index = write_ptr_index_.load();
+      if (worker_running_ && write_ptr_index != 0xBAADF00D && read_ptr_index_ != write_ptr_index) {
+        read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+        if (read_ptr_writeback_ptr_) {
+          memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                           read_ptr_index_);
+        }
+      }
+      scheduler->Leave(worker_thread_.get());
+      continue;
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
@@ -1033,46 +1067,56 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
-  bool matched = false;
-  do {
+  // `coherent` is false for the scheduler's readiness check, which runs on another thread:
+  // MakeCoherent belongs to this one, so a COHER_STATUS_HOST poll then just reports ready.
+  const auto poll = [&](bool coherent) {
     uint32_t value = 0;
     if (is_memory) {
       value =
           *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
-      value = ReadRegisterValue(poll_reg_addr);
       if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
+        if (!coherent) {
+          return true;
+        }
         MakeCoherent();
-        value = ReadRegisterValue(poll_reg_addr);
       }
+      value = ReadRegisterValue(poll_reg_addr);
     }
     switch (wait_info & 0x7) {
       case 0x0:  // Never.
-        matched = false;
-        break;
+        return false;
       case 0x1:  // Less than reference.
-        matched = (value & mask) < ref;
-        break;
+        return (value & mask) < ref;
       case 0x2:  // Less than or equal to reference.
-        matched = (value & mask) <= ref;
-        break;
+        return (value & mask) <= ref;
       case 0x3:  // Equal to reference.
-        matched = (value & mask) == ref;
-        break;
+        return (value & mask) == ref;
       case 0x4:  // Not equal to reference.
-        matched = (value & mask) != ref;
-        break;
+        return (value & mask) != ref;
       case 0x5:  // Greater than or equal to reference.
-        matched = (value & mask) >= ref;
-        break;
+        return (value & mask) >= ref;
       case 0x6:  // Greater than reference.
-        matched = (value & mask) > ref;
-        break;
-      case 0x7:  // Always
-        matched = true;
-        break;
+        return (value & mask) > ref;
+      default:  // 0x7: Always.
+        return true;
     }
+  };
+
+  if (auto* scheduler = system::GuestScheduler::ForCurrentThread()) {
+    // Holding the run token: what this waits for is written by guest code, which needs the token.
+    if (!poll(true)) {
+      scheduler->Block(
+          system::XThread::GetCurrentThread(), [&]() { return !worker_running_ || poll(false); },
+          [&]() { return !worker_running_ || poll(true); });
+    }
+    return worker_running_;
+  }
+
+  bool matched = false;
+  do {
+    matched = poll(true);
     if (!matched) {
       // Wait.
       if (wait >= 0x100) {

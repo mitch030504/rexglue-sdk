@@ -19,6 +19,7 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/string/buffer.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 
@@ -138,7 +139,19 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  // A kick decodes inline on the guest thread (WriteRegister). Under sched_deterministic that
+  // thread holds the run token, so it is the only decode; this host thread decoding as well
+  // would write guest memory at host-timed moments.
+  const bool decode_here = !system::GuestScheduler::Get();
   while (worker_running_) {
+    if (!decode_here) {
+      if (paused_) {
+        pause_fence_.Signal();
+        resume_fence_.Wait();
+      }
+      rex::thread::Wait(work_event_.get(), false);
+      continue;
+    }
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {

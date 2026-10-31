@@ -33,6 +33,7 @@
 
 #include <rex/system/flags.h>
 #include <rex/system/guest_path.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xmodule.h>
@@ -649,6 +650,15 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
     dispatch_thread_running_ = true;
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
       auto global_lock = global_critical_region_.AcquireDeferred();
+      // Under sched_deterministic a completion runs holding the run token, at a turn fixed by
+      // when guest code queued it, instead of whenever this thread wakes up.
+      auto* scheduler = GuestScheduler::Get();
+      XThread* self = XThread::GetCurrentThread();
+      if (scheduler) {
+        scheduler->SetDue(self, [this]() {
+          return !dispatch_thread_running_ || dispatch_pending_.load() > 0;
+        });
+      }
       while (dispatch_thread_running_) {
         global_lock.lock();
         if (dispatch_queue_.empty()) {
@@ -666,12 +676,19 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
 
         // Throws out of fn leave the originating overlapped uncompleted and
         // the waiting guest thread stuck; fail visibly rather than swallow.
+        if (scheduler) {
+          scheduler->Enter(self);
+        }
         try {
           fn();
         } catch (const std::exception& e) {
           REX_FATAL("Dispatch thread: deferred completion threw '{}'", e.what());
         } catch (...) {
           REX_FATAL("Dispatch thread: deferred completion threw non-std exception");
+        }
+        --dispatch_pending_;
+        if (scheduler) {
+          scheduler->Leave(self);
         }
         REXSYS_NOISY_DEBUG("Dispatch thread completed item");
       }
@@ -1241,6 +1258,7 @@ void KernelState::CompleteOverlappedDeferredEx(
           post_callback();
         }
       });
+  ++dispatch_pending_;
   dispatch_cond_.notify_all();
 }
 

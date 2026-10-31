@@ -21,6 +21,7 @@
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/thread_state.h>
 
 namespace rex::runtime {
@@ -146,6 +147,9 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
 
   // Hold the global lock during interrupt dispatch.
   auto global_lock = global_critical_region_.Acquire();
+  // Under sched_deterministic, the interrupt keeps the run token until it returns: a thread that
+  // got it would block on the global lock held here.
+  rex::system::GuestScheduler::NoSwitchScope no_switch;
 
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);

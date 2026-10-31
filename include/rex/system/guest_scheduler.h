@@ -10,13 +10,20 @@
  * whose guest-time deadline has passed or that has an APC to run. Which thread runs next then
  * depends only on guest state, so lock and heap allocation order repeat between runs.
  *
- * Host threads that call into guest code (the audio callback, GPU interrupts) take the token
- * around the call with Enter/Leave. Host events still arrive on host time; that is the next step.
+ * Host threads that call into guest code (the audio callback, the GPU command processor and its
+ * interrupts, vblank) take the token around the call with Enter/Leave. With SetDue, their turns
+ * come at fixed points too: a host thread is picked in the round-robin as soon as its condition
+ * on guest state holds, and the token waits for it to arrive.
+ *
+ * When nobody can run, only guest time can help (every waiter is on a timeout or on vblank), so
+ * time advances by a virtual frame right away instead of after host time passes. Guest code that
+ * spins on the clock without blocking gets a virtual frame after a fixed amount of guest work.
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -48,6 +55,14 @@ class GuestScheduler {
   /// A host thread is about to call guest code: take the token (nests).
   void Enter(XThread* thread);
   void Leave(XThread* thread);
+  /// Makes a host thread's turns deterministic: from now on Enter waits until `due` (evaluated by
+  /// whichever thread picks the next holder, on guest state only) holds and the thread's turn
+  /// comes, and the token is held for the thread while it is on its way to Enter. The thread must
+  /// call Enter promptly whenever `due` holds, or the guest waits for it.
+  void SetDue(XThread* thread, std::function<bool()> due);
+
+  /// A guest frame (VdSwap) happened: restarts the count of guest work without a frame.
+  void OnGuestFrame();
 
   /// Gives up the token until `ready` (evaluated by whichever thread picks the next holder) is
   /// true and then `attempt` (run on this thread, holding the token) reports success.
@@ -69,6 +84,17 @@ class GuestScheduler {
 
   bool Holds(XThread* thread);
 
+  /// While one exists on a thread, it doesn't give up the token voluntarily (Tick, Yield, loop
+  /// budgets): it holds a lock every other guest thread may need, such as the global lock of an
+  /// interrupt.
+  class NoSwitchScope {
+   public:
+    NoSwitchScope();
+    ~NoSwitchScope();
+    NoSwitchScope(const NoSwitchScope&) = delete;
+    NoSwitchScope& operator=(const NoSwitchScope&) = delete;
+  };
+
  private:
   enum class State { kIdle, kRunnable, kBlocked, kRunning, kDead };
   struct Entry {
@@ -77,11 +103,17 @@ class GuestScheduler {
     State state = State::kIdle;
     int enter_depth = 0;
     uint32_t ticks = 0;
+    uint32_t quantum = 16;  // Sync operations per turn (see Tick).
+    std::chrono::steady_clock::duration held{};  // Token time since the last stats report.
+    uint64_t turns = 0;                            // Turns since the last stats report.
     const std::function<bool()>* ready = nullptr;
+    std::function<bool()> due;  // Host threads with fixed turns (SetDue).
     std::condition_variable cv;
   };
 
   Entry* Find(XThread* thread);
+  // Find for the calling thread's own entry, cached per host thread.
+  Entry* CachedEntry(XThread* thread);
   std::string DescribeStates();
   bool CanRun(Entry* entry);
   // Hands the token to the first thread after `from` (ending with `from` itself) that can run,
@@ -90,18 +122,34 @@ class GuestScheduler {
   // Waits until `entry` holds the token, re-running the selection while the token is free (a
   // host event or guest time may have made someone ready). Called with mutex_ held.
   void WaitForToken(Entry* entry, std::unique_lock<std::mutex>& lock);
+  // The holder spent a loop quantum of `backedges`: counts guest work toward a virtual frame.
+  void CountLoopQuantum(uint32_t backedges);
+  // Yield; true if another thread got a turn.
+  bool YieldTurn(XThread* thread);
 
   std::mutex mutex_;
   std::map<uint64_t, std::unique_ptr<Entry>> entries_;  // by order
   std::map<XThread*, Entry*> by_thread_;
-  Entry* holder_ = nullptr;
+  std::atomic<Entry*> holder_{nullptr};
   std::chrono::steady_clock::time_point token_free_since_;
   std::chrono::steady_clock::time_point holder_since_;
   bool holder_reported_ = false;
   bool idle_reported_ = false;
   Entry* last_holder_ = nullptr;
+  // Virtual frames added in a row because nobody could run (reset when someone runs).
+  uint32_t idle_frames_in_a_row_ = 0;
+  uint64_t idle_frames_total_ = 0;
+  // Backward branches (REX_LOOP_BACKEDGE) taken since the last guest or virtual frame.
+  uint64_t loop_backedges_since_frame_ = 0;
+  uint64_t busy_frames_total_ = 0;
+  // Stats for the periodic report (OnGuestFrame).
+  uint64_t frames_ = 0;
+  uint64_t handoffs_ = 0;
+  std::chrono::steady_clock::time_point report_since_;
+  std::chrono::steady_clock::duration free_time_{};
   uint64_t next_guest_order_ = 0;
-  uint64_t next_host_order_ = uint64_t(1) << 32;
+  static constexpr uint64_t next_host_order_base_ = uint64_t(1) << 32;
+  uint64_t next_host_order_ = next_host_order_base_;
 };
 
 }  // namespace rex::system

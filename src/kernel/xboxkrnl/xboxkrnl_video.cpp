@@ -35,6 +35,7 @@
 #include <rex/types.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
@@ -657,6 +658,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   rex::ui::temporal::OnGuestSwap();
   // Under clock_frame_locked, guest time advances here, once per guest frame.
   rex::chrono::Clock::OnGuestFrame();
+  if (auto* scheduler = rex::system::GuestScheduler::Get()) {
+    scheduler->OnGuestFrame();
+  }
   // Under audio_guest_paced, audio buffers are handed out here, by guest time.
   if (auto* audio_system =
           static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())) {

@@ -108,14 +108,39 @@ void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
 
+  // Under sched_deterministic the callback's turn is fixed by guest state (a buffer released at
+  // a guest frame, see OnGuestFrame) instead of by when this host thread wakes up: it waits for
+  // the token first and takes the semaphore while holding it.
+  auto* scheduler = system::GuestScheduler::Get();
+  if (scheduler) {
+    scheduler->SetDue(worker_thread_.get(), [this]() {
+      for (auto* handle : wait_handles_) {
+        if (rex::thread::IsSignaled(handle)) {
+          return true;
+        }
+      }
+      return !worker_running_;
+    });
+  }
+
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
+    if (scheduler) {
+      scheduler->Enter(worker_thread_.get());
+    }
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
     auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
-                                       std::chrono::milliseconds(500));
+                                       std::chrono::milliseconds(scheduler ? 0 : 500));
+    // Keep the token through the client callback below (its Enter/Leave nest inside this one);
+    // anything else (timeout, shutdown or pause) gives it up first.
+    const bool callback_turn = result.first == rex::thread::WaitResult::kSuccess &&
+                               result.second < kMaximumClientCount;
+    if (scheduler && !callback_turn) {
+      scheduler->Leave(worker_thread_.get());
+    }
     if (result.first == rex::thread::WaitResult::kFailed) {
       REXAPU_WARN("AudioWorker: WaitAny failed");
       continue;
@@ -155,7 +180,6 @@ void AudioSystem::WorkerThreadMain() {
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
         // Guest code: under sched_deterministic it runs only while holding the run token.
-        auto* scheduler = system::GuestScheduler::Get();
         if (scheduler) {
           scheduler->Enter(worker_thread_.get());
         }
@@ -173,13 +197,16 @@ void AudioSystem::WorkerThreadMain() {
       }
 
       pumped = true;
+      if (scheduler) {
+        scheduler->Leave(worker_thread_.get());
+      }
     }
 
     if (!worker_running_) {
       break;
     }
 
-    if (!pumped) {
+    if (!pumped && !scheduler) {
       SCOPE_profile_cpu_i("apu", "Sleep");
       rex::thread::Sleep(std::chrono::milliseconds(500));
     }

@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
+#include <rex/system/guest_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -179,6 +180,27 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        // Under sched_deterministic vblank runs holding the run token, at a turn fixed by guest
+        // time (which only moves at guest or virtual frames), instead of whenever this host
+        // thread wakes up.
+        auto* scheduler = system::GuestScheduler::Get();
+        if (scheduler) {
+          system::XThread* self = system::XThread::GetCurrentThread();
+          scheduler->SetDue(self, [&]() {
+            return !vsync_worker_running_ ||
+                   chrono::Clock::QueryGuestTickCount() - last_frame_time >= vsync_interval_ticks;
+          });
+          while (vsync_worker_running_) {
+            scheduler->Enter(self);
+            const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+            while (vsync_worker_running_ && current_time - last_frame_time >= vsync_interval_ticks) {
+              MarkVblank();
+              last_frame_time += vsync_interval_ticks;
+            }
+            scheduler->Leave(self);
+          }
+          return 0;
+        }
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks = vsync_interval_ticks;
@@ -332,10 +354,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   //          interrupt_callback_, source, cpu);
 
   uint64_t args[] = {source, interrupt_callback_data_};
-  // Not under the sched_deterministic run token: the guest busy-waits on memory the command
-  // processor writes after an interrupt (D3D's wait for the ring buffer read pointer), so making
-  // this thread wait for the token would deadlock. Interrupts arrive on host time either way;
-  // delivering them at fixed guest points is the next determinism step.
+  // Under sched_deterministic the caller (the command processor or vblank) holds the run token.
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
 }

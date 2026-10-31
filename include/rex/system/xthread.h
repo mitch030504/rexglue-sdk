@@ -336,6 +336,7 @@ class XThread : public XObject {
   uint32_t last_error();
   void set_last_error(uint32_t error_code);
   void set_name(const std::string_view name);
+  const std::string& name() const { return thread_name_; }
 
   X_STATUS Create();
   X_STATUS Exit(int exit_code);

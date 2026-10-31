@@ -73,6 +73,9 @@ uint64_t frame_locked_last_frame_host_tick_ = 0;
 uint64_t frame_locked_frame_guest_tick_ = 0;
 // Virtual frames added during the current stall, reported at the next frame.
 uint64_t frame_locked_stall_frames_ = 0;
+// Off under sched_deterministic, which adds virtual frames itself at points fixed by guest work
+// (Clock::AdvanceVirtualFrame), so host time never reaches guest time.
+bool frame_locked_stall_fallback_ = true;
 // Guest time at the first frame. Boot takes a varying amount of host time, so the first frame
 // starts at this fixed point instead (unless boot ran longer, which breaks determinism and warns).
 constexpr uint64_t kFrameLockedFirstFrameSeconds = 10;
@@ -137,7 +140,7 @@ uint64_t UpdateGuestClock() {
     const uint64_t since_frame = host_tick_count > frame_locked_last_frame_host_tick_
                                      ? host_tick_count - frame_locked_last_frame_host_tick_
                                      : 0;
-    if (since_frame > stall_host_ticks) {
+    if (frame_locked_stall_fallback_ && since_frame > stall_host_ticks) {
       const uint64_t virtual_frames = 1 + (since_frame - stall_host_ticks) * hz / host_frequency;
       const uint64_t target =
           frame_locked_frame_guest_tick_ + virtual_frames * (guest_tick_frequency_ / hz);
@@ -275,6 +278,28 @@ void Clock::OnGuestFrame() {
   frame_locked_last_frame_host_tick_ = std::max<uint64_t>(host_tick_count, 1);
   frame_locked_frame_guest_tick_ = last_guest_tick_count_;
   last_host_tick_count_ = host_tick_count;
+}
+
+bool Clock::AdvanceVirtualFrame() {
+  if (!FrameLocked()) {
+    return false;
+  }
+  const uint64_t host_tick_count = QueryHostTickCount();
+  std::lock_guard<std::mutex> lock(tick_mutex_);
+  if (!frame_locked_last_frame_host_tick_) {
+    return false;  // Before the first frame guest time follows the host clock anyway.
+  }
+  last_guest_tick_count_ += guest_tick_frequency_ / uint64_t(REXCVAR_GET(clock_frame_locked_hz));
+  frame_locked_frame_guest_tick_ = last_guest_tick_count_;
+  // Restart the stall timer so the host fallback (if on) doesn't add the same frame again.
+  frame_locked_last_frame_host_tick_ = std::max<uint64_t>(host_tick_count, 1);
+  last_host_tick_count_ = host_tick_count;
+  return true;
+}
+
+void Clock::SetFrameLockedStallFallback(bool enabled) {
+  std::lock_guard<std::mutex> lock(tick_mutex_);
+  frame_locked_stall_fallback_ = enabled;
 }
 
 bool Clock::GuestTimedWaits() {

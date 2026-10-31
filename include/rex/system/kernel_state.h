@@ -395,6 +395,9 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  // Queued or running dispatch_queue_ items, readable without the global lock (the deterministic
+  // scheduler's due check for the dispatch thread).
+  std::atomic<uint32_t> dispatch_pending_{0};
 
   friend class XObject;
 };
