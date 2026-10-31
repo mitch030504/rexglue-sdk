@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -232,6 +233,40 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
   }
 }
 
+namespace {
+
+// Under clock_frame_locked guest time only moves at guest frames, so a host-time timeout would end
+// a guest wait after a different number of guest frames each run (a 1 ms poll loop times out ~20
+// times in one frame on one run and ~25 on the next). With Clock::GuestTimedWaits the timeout is a
+// deadline in guest time instead: the wait goes on in short host slices until the object is
+// signalled or guest time has passed the deadline, so a 1 ms timeout ends at the next guest frame.
+constexpr std::chrono::milliseconds kGuestDeadlineSlice{1};
+
+bool IsTimeout(rex::thread::WaitResult result) {
+  return result == rex::thread::WaitResult::kTimeout;
+}
+bool IsTimeout(const std::pair<rex::thread::WaitResult, size_t>& result) {
+  return IsTimeout(result.first);
+}
+
+template <typename WaitFn>
+auto WaitUntilGuestDeadline(const uint64_t* opt_timeout, std::chrono::milliseconds host_timeout,
+                            WaitFn wait) {
+  if (!opt_timeout || !*opt_timeout || !chrono::Clock::GuestTimedWaits()) {
+    return wait(host_timeout);
+  }
+  const uint64_t deadline = chrono::Clock::GuestDeadline(int64_t(*opt_timeout));
+  while (true) {
+    auto result = wait(kGuestDeadlineSlice);
+    if (!IsTimeout(result) || chrono::Clock::GuestDeadlinePassed(deadline)) {
+      return result;
+    }
+    XThread::CheckTitleTermination();
+  }
+}
+
+}  // namespace
+
 uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.
@@ -261,7 +296,9 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                     : std::chrono::milliseconds::max();
 
     XThread::CheckTitleTermination();
-    auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+    auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
+      return rex::thread::Wait(wait_handle, alertable ? true : false, slice);
+    });
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
@@ -297,9 +334,16 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
                           chrono::Clock::ScaleGuestDurationMillis(TimeoutTicksToMs(*opt_timeout)))
                     : std::chrono::milliseconds::max();
 
-    auto result =
-        rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
-                                   alertable ? true : false, timeout_ms);
+    // Signal once; later slices of a guest-time timeout only wait.
+    bool signalled = false;
+    auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
+      if (std::exchange(signalled, true)) {
+        return rex::thread::Wait(wait_object->GetWaitHandle(), alertable ? true : false, slice);
+      }
+      return rex::thread::SignalAndWait(signal_object->GetWaitHandle(),
+                                        wait_object->GetWaitHandle(), alertable ? true : false,
+                                        slice);
+    });
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
         wait_object->WaitCallback();
@@ -342,8 +386,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
 
     XThread::CheckTitleTermination();
     if (wait_type) {
-      auto result =
-          rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+      auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
+        return rex::thread::WaitAny(wait_handles.data(), wait_handles.size(),
+                                    alertable ? true : false, slice);
+      });
       XThread::CheckTitleTermination();
       switch (result.first) {
         case rex::thread::WaitResult::kSuccess:
@@ -363,8 +409,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
           return X_STATUS_UNSUCCESSFUL;
       }
     } else {
-      auto result =
-          rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+      auto result = WaitUntilGuestDeadline(opt_timeout, timeout_ms, [&](auto slice) {
+        return rex::thread::WaitAll(wait_handles.data(), wait_handles.size(),
+                                    alertable ? true : false, slice);
+      });
       XThread::CheckTitleTermination();
       switch (result) {
         case rex::thread::WaitResult::kSuccess:

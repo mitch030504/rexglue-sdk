@@ -999,6 +999,25 @@ uint32_t XThread::SelfSuspend() {
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
   const X_STATUS status = [&]() -> X_STATUS {
+    if (interval && chrono::Clock::GuestTimedWaits()) {
+      // Sleep until guest time passes the deadline, like a guest wait timeout (see
+      // WaitUntilGuestDeadline in xobject.cpp): a 1 ms sleep ends at the next guest frame.
+      const uint64_t deadline = chrono::Clock::GuestDeadline(int64_t(interval));
+      CheckTitleTermination();
+      while (!chrono::Clock::GuestDeadlinePassed(deadline)) {
+        if (alertable) {
+          if (rex::thread::AlertableSleep(std::chrono::milliseconds(1)) ==
+              rex::thread::SleepResult::kAlerted) {
+            CheckTitleTermination();
+            return X_STATUS_USER_APC;
+          }
+        } else {
+          rex::thread::Sleep(std::chrono::milliseconds(1));
+        }
+        CheckTitleTermination();
+      }
+      return X_STATUS_SUCCESS;
+    }
     int64_t timeout_ticks = interval;
     uint32_t timeout_ms;
     if (timeout_ticks > 0) {

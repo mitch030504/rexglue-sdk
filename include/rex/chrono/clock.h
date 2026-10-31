@@ -83,6 +83,14 @@ class Clock {
   // guest VdSwap; does nothing otherwise.
   static void OnGuestFrame();
 
+  // True when guest waits and sleeps with a timeout should end by guest time
+  // (clock_frame_locked and clock_frame_locked_waits).
+  static bool GuestTimedWaits();
+  // A guest timeout in 100 ns ticks (negative: relative, positive: absolute FILETIME) as a
+  // deadline in guest system time.
+  static uint64_t GuestDeadline(int64_t timeout_ticks);
+  static bool GuestDeadlinePassed(uint64_t deadline) { return QueryGuestSystemTime() >= deadline; }
+
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.

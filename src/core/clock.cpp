@@ -30,6 +30,11 @@ REXCVAR_DEFINE_BOOL(clock_frame_locked, false, "Clock",
                     "first frame and during stalls without frames (loading), it follows the host "
                     "clock instead, so timeouts still fire.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(clock_frame_locked_waits, true, "Clock",
+                    "With clock_frame_locked, guest sleeps and wait timeouts end by guest time "
+                    "too, so a 1 ms sleep lasts until the next guest frame instead of 1 ms of "
+                    "host time. Off only to compare against the old behaviour.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(clock_frame_locked_hz, 60, "Clock",
                      "Guest frames per second of guest time under clock_frame_locked.")
     .range(1, 240)
@@ -263,6 +268,16 @@ void Clock::OnGuestFrame() {
   frame_locked_last_frame_host_tick_ = std::max<uint64_t>(host_tick_count, 1);
   frame_locked_frame_guest_tick_ = last_guest_tick_count_;
   last_host_tick_count_ = host_tick_count;
+}
+
+bool Clock::GuestTimedWaits() {
+  return FrameLocked() && REXCVAR_GET(clock_frame_locked_waits);
+}
+
+uint64_t Clock::GuestDeadline(int64_t timeout_ticks) {
+  // FILETIME and the relative form share the 100 ns unit.
+  return timeout_ticks > 0 ? uint64_t(timeout_ticks)
+                           : QueryGuestSystemTime() + uint64_t(-timeout_ticks);
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {
