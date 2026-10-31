@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 
+#include <rex/audio/audio_system.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -656,6 +657,11 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   rex::ui::temporal::OnGuestSwap();
   // Under clock_frame_locked, guest time advances here, once per guest frame.
   rex::chrono::Clock::OnGuestFrame();
+  // Under audio_guest_paced, audio buffers are handed out here, by guest time.
+  if (auto* audio_system =
+          static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())) {
+    audio_system->OnGuestFrame();
+  }
 
   // See the frame_rate_limit comment near the top of this file: this reproduces the implicit
   // vblank-wait real Present() had, since nothing else in the guest's synchronous

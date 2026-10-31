@@ -998,45 +998,51 @@ uint32_t XThread::SelfSuspend() {
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
-  int64_t timeout_ticks = interval;
-  uint32_t timeout_ms;
-  if (timeout_ticks > 0) {
-    // Absolute time, based on January 1, 1601.
-    // TODO(benvanik): convert time to relative time.
-    assert_always();
-    timeout_ms = 0;
-  } else if (timeout_ticks < 0) {
-    // Relative time.
-    timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
-  } else {
-    timeout_ms = 0;
-  }
-  timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
-  CheckTitleTermination();
-  if (alertable) {
-    auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
-    CheckTitleTermination();
-    switch (result) {
-      default:
-      case rex::thread::SleepResult::kSuccess:
-        return X_STATUS_SUCCESS;
-      case rex::thread::SleepResult::kAlerted:
-        return X_STATUS_USER_APC;
+  const X_STATUS status = [&]() -> X_STATUS {
+    int64_t timeout_ticks = interval;
+    uint32_t timeout_ms;
+    if (timeout_ticks > 0) {
+      // Absolute time, based on January 1, 1601.
+      // TODO(benvanik): convert time to relative time.
+      assert_always();
+      timeout_ms = 0;
+    } else if (timeout_ticks < 0) {
+      // Relative time.
+      timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
+    } else {
+      timeout_ms = 0;
     }
-  } else {
-    if (timeout_ms == 0) {
-      if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
-        rex::thread::Sleep(std::chrono::microseconds(100));
-      } else {
-        rex::thread::MaybeYield();
+    timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
+    CheckTitleTermination();
+    if (alertable) {
+      auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
+      CheckTitleTermination();
+      switch (result) {
+        default:
+        case rex::thread::SleepResult::kSuccess:
+          return X_STATUS_SUCCESS;
+        case rex::thread::SleepResult::kAlerted:
+          return X_STATUS_USER_APC;
       }
     } else {
-      rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
+      if (timeout_ms == 0) {
+        if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
+          rex::thread::Sleep(std::chrono::microseconds(100));
+        } else {
+          rex::thread::MaybeYield();
+        }
+      } else {
+        rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
+      }
+      CheckTitleTermination();
     }
-    CheckTitleTermination();
-  }
 
-  return X_STATUS_SUCCESS;
+    return X_STATUS_SUCCESS;
+  }();
+  if (XObject::SyncTraceEnabled()) {
+    XObject::TraceSync("D", fmt::format("{}", int64_t(interval)), status);
+  }
+  return status;
 }
 
 struct ThreadSavedState {

@@ -9,9 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
+#include <mutex>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
+#include <rex/ui/temporal_jitter.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -27,7 +31,49 @@
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
 
+REXCVAR_DEFINE_STRING(sync_trace_log, "", "Kernel",
+                      "Determinism debugging: write every guest wait (thread, guest frame, "
+                      "object, timeout, result) to this file. Slow; off when empty.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::system {
+
+bool XObject::SyncTraceEnabled() {
+  return !REXCVAR_GET(sync_trace_log).empty();
+}
+
+void XObject::TraceSync(std::string_view op, std::string_view detail, uint32_t result) {
+  static std::mutex mutex;
+  static FILE* file = nullptr;
+  const uint32_t thread_id = XThread::IsInThread() ? XThread::GetCurrentThread()->thread_id() : 0;
+  const auto line = fmt::format("{} {} {} {} {:X}\n", thread_id,
+                                rex::ui::temporal::GuestSwapCount(), op, detail, result);
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!file) {
+    file = std::fopen(REXCVAR_GET(sync_trace_log).c_str(), "w");
+    if (!file) {
+      return;
+    }
+  }
+  std::fwrite(line.data(), 1, line.size(), file);
+  // Flush once per guest frame: replays end by being killed.
+  static uint64_t flushed_frame = 0;
+  if (rex::ui::temporal::GuestSwapCount() != flushed_frame) {
+    flushed_frame = rex::ui::temporal::GuestSwapCount();
+    std::fflush(file);
+  }
+}
+
+std::string XObject::SyncTraceName() const {
+  // A type letter (Event, Mutant, Semaphore, Timer, ...), then native objects by guest address and
+  // handle-only objects by handle.
+  constexpr std::string_view kTypeLetters = "unEFIMXLSskyHT";
+  const size_t type_index = size_t(type_);
+  const char type = type_index < kTypeLetters.size() ? kTypeLetters[type_index] : '?';
+  return guest_object_ptr_
+             ? fmt::format("{}{:X}", type, guest_object_ptr_)
+             : fmt::format("{}h{:X}", type, handles_.empty() ? 0u : uint32_t(handles_[0]));
+}
 
 XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
   handles_.reserve(10);
@@ -202,108 +248,24 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
-  auto wait_handle = GetWaitHandle();
-  if (!wait_handle) {
-    // Object doesn't support waiting.
-    return X_STATUS_SUCCESS;
-  }
-
-  auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
-                                      TimeoutTicksToMs(*opt_timeout)))
-                                : std::chrono::milliseconds::max();
-
-  XThread::CheckTitleTermination();
-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
-  XThread::CheckTitleTermination();
-  switch (result) {
-    case rex::thread::WaitResult::kSuccess:
-      WaitCallback();
+  const X_STATUS status = [&]() -> X_STATUS {
+    auto wait_handle = GetWaitHandle();
+    if (!wait_handle) {
+      // Object doesn't support waiting.
       return X_STATUS_SUCCESS;
-    case rex::thread::WaitResult::kUserCallback:
-      // Or X_STATUS_ALERTED?
-      return X_STATUS_USER_APC;
-    case rex::thread::WaitResult::kTimeout:
-      rex::thread::MaybeYield();
-      return X_STATUS_TIMEOUT;
-    default:
-    case rex::thread::WaitResult::kAbandoned:
-    case rex::thread::WaitResult::kFailed:
-      return X_STATUS_ABANDONED_WAIT_0;
-  }
-}
-
-X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
-                                uint32_t processor_mode, uint32_t alertable,
-                                uint64_t* opt_timeout) {
-  auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
-                                      TimeoutTicksToMs(*opt_timeout)))
-                                : std::chrono::milliseconds::max();
-
-  auto result =
-      rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
-                                 alertable ? true : false, timeout_ms);
-  switch (result) {
-    case rex::thread::WaitResult::kSuccess:
-      wait_object->WaitCallback();
-      return X_STATUS_SUCCESS;
-    case rex::thread::WaitResult::kUserCallback:
-      // Or X_STATUS_ALERTED?
-      return X_STATUS_USER_APC;
-    case rex::thread::WaitResult::kTimeout:
-      rex::thread::MaybeYield();
-      return X_STATUS_TIMEOUT;
-    default:
-    case rex::thread::WaitResult::kAbandoned:
-    case rex::thread::WaitResult::kFailed:
-      return X_STATUS_ABANDONED_WAIT_0;
-  }
-}
-
-X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
-                               uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
-                               uint64_t* opt_timeout) {
-  std::vector<rex::thread::WaitHandle*> wait_handles(count);
-  for (size_t i = 0; i < count; ++i) {
-    wait_handles[i] = objects[i]->GetWaitHandle();
-    assert_not_null(wait_handles[i]);
-  }
-
-  auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
-                                      TimeoutTicksToMs(*opt_timeout)))
-                                : std::chrono::milliseconds::max();
-
-  XThread::CheckTitleTermination();
-  if (wait_type) {
-    auto result =
-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
-    XThread::CheckTitleTermination();
-    switch (result.first) {
-      case rex::thread::WaitResult::kSuccess:
-        objects[result.second]->WaitCallback();
-
-        return X_STATUS(result.second);
-      case rex::thread::WaitResult::kUserCallback:
-        // Or X_STATUS_ALERTED?
-        return X_STATUS_USER_APC;
-      case rex::thread::WaitResult::kTimeout:
-        rex::thread::MaybeYield();
-        return X_STATUS_TIMEOUT;
-      default:
-      case rex::thread::WaitResult::kAbandoned:
-        return X_STATUS(X_STATUS_ABANDONED_WAIT_0 + result.second);
-      case rex::thread::WaitResult::kFailed:
-        return X_STATUS_UNSUCCESSFUL;
     }
-  } else {
-    auto result =
-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+
+    auto timeout_ms =
+        opt_timeout ? std::chrono::milliseconds(
+                          chrono::Clock::ScaleGuestDurationMillis(TimeoutTicksToMs(*opt_timeout)))
+                    : std::chrono::milliseconds::max();
+
+    XThread::CheckTitleTermination();
+    auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
     XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
-        for (uint32_t i = 0; i < count; i++) {
-          objects[i]->WaitCallback();
-        }
-
+        WaitCallback();
         return X_STATUS_SUCCESS;
       case rex::thread::WaitResult::kUserCallback:
         // Or X_STATUS_ALERTED?
@@ -316,7 +278,125 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
       case rex::thread::WaitResult::kFailed:
         return X_STATUS_ABANDONED_WAIT_0;
     }
+  }();
+  if (SyncTraceEnabled()) {
+    TraceSync("W",
+              fmt::format("{} {}", SyncTraceName(),
+                          opt_timeout ? fmt::format("{}", int64_t(*opt_timeout)) : "-"),
+              status);
   }
+  return status;
+}
+
+X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
+                                uint32_t processor_mode, uint32_t alertable,
+                                uint64_t* opt_timeout) {
+  const X_STATUS status = [&]() -> X_STATUS {
+    auto timeout_ms =
+        opt_timeout ? std::chrono::milliseconds(
+                          chrono::Clock::ScaleGuestDurationMillis(TimeoutTicksToMs(*opt_timeout)))
+                    : std::chrono::milliseconds::max();
+
+    auto result =
+        rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                   alertable ? true : false, timeout_ms);
+    switch (result) {
+      case rex::thread::WaitResult::kSuccess:
+        wait_object->WaitCallback();
+        return X_STATUS_SUCCESS;
+      case rex::thread::WaitResult::kUserCallback:
+        // Or X_STATUS_ALERTED?
+        return X_STATUS_USER_APC;
+      case rex::thread::WaitResult::kTimeout:
+        rex::thread::MaybeYield();
+        return X_STATUS_TIMEOUT;
+      default:
+      case rex::thread::WaitResult::kAbandoned:
+      case rex::thread::WaitResult::kFailed:
+        return X_STATUS_ABANDONED_WAIT_0;
+    }
+  }();
+  if (SyncTraceEnabled()) {
+    TraceSync("S",
+              fmt::format("{} {} {}", signal_object->SyncTraceName(), wait_object->SyncTraceName(),
+                          opt_timeout ? fmt::format("{}", int64_t(*opt_timeout)) : "-"),
+              status);
+  }
+  return status;
+}
+
+X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
+                               uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                               uint64_t* opt_timeout) {
+  const X_STATUS status = [&]() -> X_STATUS {
+    std::vector<rex::thread::WaitHandle*> wait_handles(count);
+    for (size_t i = 0; i < count; ++i) {
+      wait_handles[i] = objects[i]->GetWaitHandle();
+      assert_not_null(wait_handles[i]);
+    }
+
+    auto timeout_ms =
+        opt_timeout ? std::chrono::milliseconds(
+                          chrono::Clock::ScaleGuestDurationMillis(TimeoutTicksToMs(*opt_timeout)))
+                    : std::chrono::milliseconds::max();
+
+    XThread::CheckTitleTermination();
+    if (wait_type) {
+      auto result =
+          rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+      XThread::CheckTitleTermination();
+      switch (result.first) {
+        case rex::thread::WaitResult::kSuccess:
+          objects[result.second]->WaitCallback();
+
+          return X_STATUS(result.second);
+        case rex::thread::WaitResult::kUserCallback:
+          // Or X_STATUS_ALERTED?
+          return X_STATUS_USER_APC;
+        case rex::thread::WaitResult::kTimeout:
+          rex::thread::MaybeYield();
+          return X_STATUS_TIMEOUT;
+        default:
+        case rex::thread::WaitResult::kAbandoned:
+          return X_STATUS(X_STATUS_ABANDONED_WAIT_0 + result.second);
+        case rex::thread::WaitResult::kFailed:
+          return X_STATUS_UNSUCCESSFUL;
+      }
+    } else {
+      auto result =
+          rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+      XThread::CheckTitleTermination();
+      switch (result) {
+        case rex::thread::WaitResult::kSuccess:
+          for (uint32_t i = 0; i < count; i++) {
+            objects[i]->WaitCallback();
+          }
+
+          return X_STATUS_SUCCESS;
+        case rex::thread::WaitResult::kUserCallback:
+          // Or X_STATUS_ALERTED?
+          return X_STATUS_USER_APC;
+        case rex::thread::WaitResult::kTimeout:
+          rex::thread::MaybeYield();
+          return X_STATUS_TIMEOUT;
+        default:
+        case rex::thread::WaitResult::kAbandoned:
+        case rex::thread::WaitResult::kFailed:
+          return X_STATUS_ABANDONED_WAIT_0;
+      }
+    }
+  }();
+  if (SyncTraceEnabled()) {
+    std::string names;
+    for (uint32_t i = 0; i < count; ++i) {
+      names += (i ? "," : "") + objects[i]->SyncTraceName();
+    }
+    TraceSync(
+        wait_type ? "WA" : "WL",
+        fmt::format("{} {}", names, opt_timeout ? fmt::format("{}", int64_t(*opt_timeout)) : "-"),
+        status);
+  }
+  return status;
 }
 
 uint8_t* XObject::CreateNative(uint32_t size) {

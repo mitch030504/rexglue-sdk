@@ -48,6 +48,10 @@ class AudioSystem : public system::IAudioSystem {
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, uint32_t samples_ptr);
 
+  // With audio_guest_paced, hands every client the buffers that one guest frame of guest time
+  // plays. Called once per guest VdSwap; does nothing otherwise.
+  void OnGuestFrame();
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
@@ -92,6 +96,9 @@ class AudioSystem : public system::IAudioSystem {
   // Event is always there in case we have no clients.
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
+
+  // audio_guest_paced: samples of guest time not yet handed out as a whole buffer.
+  uint32_t paced_sample_remainder_ = 0;
 
   bool paused_ = false;
   rex::thread::Fence pause_fence_;

@@ -133,6 +133,13 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
+    // Paced by guest time the game can get ahead of the sound card (a frame-locked replay runs
+    // as fast as it can); drop the oldest buffers rather than queue up latency without bound.
+    constexpr size_t kMaxGuestPacedQueuedFrames = 16;
+    while (REXCVAR_GET(audio_guest_paced) && frames_queued_.size() >= kMaxGuestPacedQueuedFrames) {
+      frames_unused_.push(frames_queued_.front());
+      frames_queued_.pop();
+    }
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
@@ -219,8 +226,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       }
       driver->frames_unused_.push(buffer);
 
-      auto ret = driver->semaphore_->Release(1, nullptr);
-      assert_true(ret);
+      // With audio_guest_paced the AudioSystem releases buffers per guest frame instead.
+      if (!REXCVAR_GET(audio_guest_paced)) {
+        auto ret = driver->semaphore_->Release(1, nullptr);
+        assert_true(ret);
+      }
       additional_amount -= len;
     }
   }

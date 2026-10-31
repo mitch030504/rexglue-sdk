@@ -44,6 +44,10 @@ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_c
   if (out_previous_count) {
     *out_previous_count = previous_count;
   }
+  if (SyncTraceEnabled()) {
+    TraceSync("R", fmt::format("{} {} {}", SyncTraceName(), release_count, previous_count),
+              success);
+  }
   return success;
 }
 

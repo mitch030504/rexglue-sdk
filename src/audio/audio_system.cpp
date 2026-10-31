@@ -27,6 +27,13 @@
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+REXCVAR_DEFINE_BOOL(audio_guest_paced, false, "Audio",
+                    "Deterministic audio for netplay and replays (with clock_frame_locked): the "
+                    "game is asked for its next audio buffer when guest time has played one, not "
+                    "when the sound card wants one. Sound may crackle when the game runs slower "
+                    "or faster than real time.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(int32_t, clock_frame_locked_hz);
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -274,6 +281,28 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   assert_true(index < kMaximumClientCount);
   assert_true(clients_[index].driver != NULL);
   (clients_[index].driver)->SubmitFrame(samples_ptr);
+}
+
+void AudioSystem::OnGuestFrame() {
+  if (!REXCVAR_GET(audio_guest_paced)) {
+    return;
+  }
+  // The guest audio callback runs guest code and allocates, so when it runs decides the heap
+  // layout and the mix state the game sees. Paced by the sound card it drifts between runs;
+  // paced here it runs a fixed number of times per guest frame (48000 / 60 / 256 = 3.125).
+  constexpr uint32_t kSampleRate = 48000;
+  constexpr uint32_t kBufferSamples = 256;
+  auto global_lock = global_critical_region_.Acquire();
+  paced_sample_remainder_ += kSampleRate / uint32_t(REXCVAR_GET(clock_frame_locked_hz));
+  while (paced_sample_remainder_ >= kBufferSamples) {
+    paced_sample_remainder_ -= kBufferSamples;
+    for (size_t i = 0; i < kMaximumClientCount; i++) {
+      if (clients_[i].in_use) {
+        // Fails when the client already has queued_frames_ buffers owed: it is behind.
+        client_semaphores_[i]->Release(1, nullptr);
+      }
+    }
+  }
 }
 
 void AudioSystem::UnregisterClient(size_t index) {

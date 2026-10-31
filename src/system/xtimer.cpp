@@ -85,6 +85,9 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
         timer_->SetRepeatingAt(due_tp, std::chrono::milliseconds(period_ms), std::move(callback));
   }
 
+  if (SyncTraceEnabled()) {
+    TraceSync("T", fmt::format("{} {} {}", SyncTraceName(), due_time, period_ms), result);
+  }
   return result ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
 }
 

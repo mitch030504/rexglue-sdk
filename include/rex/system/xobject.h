@@ -197,6 +197,12 @@ class XObject {
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout);
 
+  // With sync_trace_log set, appends one line per guest wait (thread, guest frame, what it
+  // waited on, result) so two replays can be compared wait by wait. Does nothing otherwise.
+  static bool SyncTraceEnabled();
+  static void TraceSync(std::string_view op, std::string_view detail, uint32_t result);
+  std::string SyncTraceName() const;
+
   static object_ref<XObject> GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type = -1);
   template <typename T>
