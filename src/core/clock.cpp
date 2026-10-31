@@ -35,6 +35,12 @@ REXCVAR_DEFINE_BOOL(clock_frame_locked_waits, true, "Clock",
                     "too, so a 1 ms sleep lasts until the next guest frame instead of 1 ms of "
                     "host time. Off only to compare against the old behaviour.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(clock_frame_locked_stall_ms, 250, "Clock",
+                     "With clock_frame_locked, how long without a guest frame counts as a stall "
+                     "(loading), after which guest time advances in virtual frames. Raise it for "
+                     "replay comparisons whose tooling pauses the game between frames.")
+    .range(50, 60000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(clock_frame_locked_hz, 60, "Clock",
                      "Guest frames per second of guest time under clock_frame_locked.")
     .range(1, 240)
@@ -70,11 +76,11 @@ uint64_t frame_locked_stall_frames_ = 0;
 // Guest time at the first frame. Boot takes a varying amount of host time, so the first frame
 // starts at this fixed point instead (unless boot ran longer, which breaks determinism and warns).
 constexpr uint64_t kFrameLockedFirstFrameSeconds = 10;
-// No frame for this long counts as a stall (loading). The game polls guest time during some loads
-// (waiting out ~1 s at boot), so a stall can't freeze time; it then advances in whole virtual
-// frames, one per frame period of host time. A deadline-bound wait ends on the same virtual frame
-// every run; a load bound by host I/O doesn't. Hitches shorter than this leak nothing.
-constexpr uint64_t kFrameLockedStallMillis = 250;
+// No frame for clock_frame_locked_stall_ms counts as a stall (loading). The game polls guest time
+// during some loads (waiting out ~1 s at boot), so a stall can't freeze time; it then advances in
+// whole virtual frames, one per frame period of host time. A deadline-bound wait ends on the same
+// virtual frame every run; a load bound by host I/O doesn't. Hitches shorter than this leak
+// nothing.
 // 2013-01-01 00:00 UTC as FILETIME: a fixed guest date, so date-derived state matches across runs.
 constexpr uint64_t kFrameLockedSystemTimeBase = 130014720000000000ull;
 
@@ -125,7 +131,8 @@ uint64_t UpdateGuestClock() {
     }
     const uint64_t hz = uint64_t(REXCVAR_GET(clock_frame_locked_hz));
     const uint64_t host_frequency = Clock::QueryHostTickFrequency();
-    const uint64_t stall_host_ticks = host_frequency * kFrameLockedStallMillis / 1000;
+    const uint64_t stall_host_ticks =
+        host_frequency * uint64_t(REXCVAR_GET(clock_frame_locked_stall_ms)) / 1000;
     // host_tick_count was sampled before the lock, so a frame may have arrived after it.
     const uint64_t since_frame = host_tick_count > frame_locked_last_frame_host_tick_
                                      ? host_tick_count - frame_locked_last_frame_host_tick_
