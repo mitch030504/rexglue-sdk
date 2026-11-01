@@ -101,7 +101,8 @@ TEST_CASE("to_sys converts known FILETIMEs to correct system_clock values", "[ch
 
 TEST_CASE("from_sys then to_sys round-trips for whole-second values", "[chrono]") {
   // Use values aligned to system_clock precision (whole seconds)
-  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFt2021}) {
+  constexpr uint64_t kFtYear9999 = 2650467743990000000ULL;
+  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFt2021, kFtYear9999}) {
     auto nt_tp = WinSystemClock::from_file_time(ft);
     auto sys_tp = WinSystemClock::to_sys(nt_tp);
     auto nt_tp2 = WinSystemClock::from_sys(sys_tp);
@@ -228,7 +229,7 @@ static uint64_t recompose(int y, unsigned m, unsigned d, int hour, int min, int 
   if (!ymd.ok())
     return 0;
   auto dp = static_cast<std::chrono::sys_days>(ymd);
-  std::chrono::system_clock::time_point time = dp;
+  std::chrono::sys_time<WinSystemClock::duration> time = dp;
   time += std::chrono::hours{hour};
   time += std::chrono::minutes{min};
   time += std::chrono::seconds{sec};
