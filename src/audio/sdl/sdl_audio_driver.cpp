@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "guest_audio_stretch.h"
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -101,6 +103,10 @@ bool SDLAudioDriver::Initialize() {
               device_name ? device_name : "?", obtained_spec.channels, obtained_spec.freq,
               static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_));
 
+  if (REXCVAR_GET(audio_guest_paced)) {
+    stretch_ = std::make_unique<GuestAudioStretch>(sdl_device_channels_);
+  }
+
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
     return false;
@@ -135,7 +141,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     // Paced by guest time the game can get ahead of the sound card (a frame-locked replay runs
     // as fast as it can); drop the oldest buffers rather than queue up latency without bound.
-    constexpr size_t kMaxGuestPacedQueuedFrames = 16;
+    constexpr size_t kMaxGuestPacedQueuedFrames = 64;
     while (REXCVAR_GET(audio_guest_paced) && frames_queued_.size() >= kMaxGuestPacedQueuedFrames) {
       frames_unused_.push(frames_queued_.front());
       frames_queued_.pop();
@@ -185,6 +191,34 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
+  if (driver->stretch_) {
+    // Mixing and stretching are output-only: never release guest callback semaphores here.
+    {
+      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+      while (!driver->frames_queued_.empty()) {
+        auto buffer = driver->frames_queued_.front();
+        driver->frames_queued_.pop();
+        if (driver->sdl_device_channels_ == 2) {
+          conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold, gain);
+        } else {
+          conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix, gain);
+        }
+        driver->stretch_->Push(std::span<const float>(data, sample_count));
+        driver->frames_unused_.push(buffer);
+      }
+    }
+    while (additional_amount > 0) {
+      driver->stretch_->Read(std::span<float>(data, sample_count));
+      if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
+      if (!SDL_PutAudioStreamData(stream, data, len)) {
+        REXAPU_ERROR("SDL_PutAudioStreamData() failed while stretching: {}", SDL_GetError());
+        break;
+      }
+      additional_amount -= len;
+    }
+    SDL_stack_free(data);
+    return;
+  }
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);

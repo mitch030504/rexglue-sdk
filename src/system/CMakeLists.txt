@@ -78,6 +78,11 @@ target_include_directories(rexruntime PRIVATE
     ${REXGLUE_ROOT}/thirdparty
 )
 
+# Resolve replaceable output DSP beside the runtime in portable application packages.
+if(UNIX AND NOT APPLE)
+    set_property(TARGET rexruntime APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+endif()
+
 target_link_libraries(rexruntime
     PUBLIC
         simde

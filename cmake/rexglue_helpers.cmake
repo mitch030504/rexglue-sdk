@@ -115,7 +115,7 @@ function(rexglue_configure_target target_name)
         # (paired with the @executable_path rpath above). Everything else the
         # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
         # differ between an in-tree build and an installed SDK import.
-        foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)
+        foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient rex::soundtouch rex_soundtouch)
             if(TARGET ${_rexglue_runtime_lib})
                 add_custom_command(TARGET ${target_name} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -128,9 +128,8 @@ function(rexglue_configure_target target_name)
     endif()
 
     if(WIN32)
-        # FidelityFX is linked PRIVATE by rexui (to avoid propagating DLL
-        # requirements to tool-mode targets), so copy its DLLs explicitly.
-        foreach(_fx amd_fidelityfx_vk amd_fidelityfx_dx12)
+        # Private runtime dependencies are not enumerated by TARGET_RUNTIME_DLLS.
+        foreach(_fx amd_fidelityfx_vk amd_fidelityfx_dx12 rex::soundtouch rex_soundtouch)
             if(TARGET ${_fx})
                 add_custom_command(TARGET ${target_name} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different

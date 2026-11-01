@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stack>
@@ -21,6 +22,8 @@
 #include <SDL3/SDL.h>
 
 namespace rex::audio::sdl {
+
+class GuestAudioStretch;
 
 class SDLAudioDriver : public AudioDriver {
  public:
@@ -37,6 +40,7 @@ class SDLAudioDriver : public AudioDriver {
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 
+  std::unique_ptr<GuestAudioStretch> stretch_;
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;

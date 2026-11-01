@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     test_memory.cpp
+    audio/guest_audio_stretch_test.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
     kernel/noncontroller_test.cpp
@@ -38,6 +39,7 @@ target_include_directories(unit_tests PRIVATE
 target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
+    rex_soundtouch
     xxHash::xxhash
     Catch2::Catch2WithMain
 )
