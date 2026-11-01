@@ -186,6 +186,16 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
+  if (!out_caps) return X_ERROR_DEVICE_NOT_CONNECTED;
+  X_INPUT_CAPABILITIES caps{};
+  X_RESULT result = GetDevicesCapabilities(user_index, flags, &caps);
+  if (capabilities_filter_) result = capabilities_filter_(user_index, result, &caps);
+  if (result == X_ERROR_SUCCESS && out_caps) *out_caps = caps;
+  return result;
+}
+
+X_RESULT InputSystem::GetDevicesCapabilities(uint32_t user_index, uint32_t flags,
+                                             X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -264,6 +274,12 @@ X_RESULT InputSystem::GetDevicesState(uint32_t user_index, X_INPUT_STATE* out_st
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+  if (vibration_filter_ && !vibration_filter_(user_index)) return X_ERROR_SUCCESS;
+  const X_RESULT result = SetDevicesVibration(user_index, vibration);
+  return vibration_filter_ ? X_ERROR_SUCCESS : result;
+}
+
+X_RESULT InputSystem::SetDevicesVibration(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;

@@ -93,7 +93,9 @@ class FakeDriver final : public InputDriver {
     return X_ERROR_SUCCESS;
   }
 
+  DeviceId last_vibration = DeviceId::kInvalid;
   X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION*) override {
+    last_vibration = id;
     return states_.count(id) ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -235,4 +237,34 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+TEST_CASE("Netplay vibration stays on the local player's device", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1);
+  system->SetVibrationFilter([](uint32_t& user) {
+    if (user != 1) return false;
+    user = 0;
+    return true;
+  });
+  X_INPUT_VIBRATION vibration{};
+  REQUIRE(system->SetState(0, &vibration) == X_ERROR_SUCCESS);
+  REQUIRE(driver->last_vibration == DeviceId::kInvalid);
+  REQUIRE(system->SetState(1, &vibration) == X_ERROR_SUCCESS);
+  REQUIRE(driver->last_vibration == static_cast<DeviceId>(1));
+}
+
+TEST_CASE("A netplay capability filter also covers absent physical pads", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  system->SetCapabilitiesFilter([](uint32_t user, X_RESULT, X_INPUT_CAPABILITIES* caps) {
+    *caps = {};
+    caps->sub_type = 42;
+    return user < 2 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  });
+  X_INPUT_CAPABILITIES caps{};
+  REQUIRE(system->GetCapabilities(1, 0, &caps) == X_ERROR_SUCCESS);
+  REQUIRE(caps.sub_type == 42);
+  REQUIRE(system->GetCapabilities(2, 0, &caps) == X_ERROR_DEVICE_NOT_CONNECTED);
 }
