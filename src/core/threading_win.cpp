@@ -139,9 +139,65 @@ class Win32Handle : public T {
   HANDLE handle_ = nullptr;
 };
 
+namespace {
+
+using NtQueryBasicInfo = LONG(NTAPI*)(HANDLE, ULONG, void*, ULONG, ULONG*);
+struct EventBasicInfo {
+  LONG type;
+  LONG state;
+};
+struct SemaphoreBasicInfo {
+  LONG count;
+  LONG maximum;
+};
+struct MutantBasicInfo {
+  LONG count;
+  BOOLEAN owned_by_caller;
+  BOOLEAN abandoned;
+};
+struct TimerBasicInfo {
+  LARGE_INTEGER remaining;
+  BOOLEAN state;
+};
+static_assert(sizeof(EventBasicInfo) == 8 && sizeof(SemaphoreBasicInfo) == 8 &&
+              sizeof(MutantBasicInfo) == 8 && sizeof(TimerBasicInfo) == 16);
+
+template <typename Info>
+bool QueryBasicInfo(HANDLE handle, const char* name, Info& info) {
+  // Native queries inspect state without the semaphore decrement / auto-event reset of Wait.
+  static const auto query =
+      reinterpret_cast<NtQueryBasicInfo>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), name));
+  if (query && query(handle, 0, &info, sizeof(info), nullptr) >= 0)
+    return true;
+  static std::once_flag warning;
+  std::call_once(warning,
+                 [name] { spdlog::error("{} unavailable or failed; readiness is unknown", name); });
+  return false;
+}
+
+}  // namespace
+
 bool IsSignaled(WaitHandle* wait_handle) {
-  // Win32 can't look at a semaphore or auto-reset event without taking it.
-  (void)wait_handle;
+  const auto handle = static_cast<HANDLE>(wait_handle->native_handle());
+  if (dynamic_cast<Event*>(wait_handle)) {
+    EventBasicInfo info{};
+    return !QueryBasicInfo(handle, "NtQueryEvent", info) || info.state != 0;
+  }
+  if (dynamic_cast<Semaphore*>(wait_handle)) {
+    SemaphoreBasicInfo info{};
+    return !QueryBasicInfo(handle, "NtQuerySemaphore", info) || info.count > 0;
+  }
+  if (dynamic_cast<Mutant*>(wait_handle)) {
+    MutantBasicInfo info{};
+    return !QueryBasicInfo(handle, "NtQueryMutant", info) || info.count > 0 || info.owned_by_caller;
+  }
+  if (dynamic_cast<Timer*>(wait_handle)) {
+    TimerBasicInfo info{};
+    return !QueryBasicInfo(handle, "NtQueryTimer", info) || info.state != FALSE;
+  }
+  // Waiting on a thread never changes its state; it stays signaled after termination.
+  if (dynamic_cast<Thread*>(wait_handle))
+    return WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
   return true;
 }
 
