@@ -295,7 +295,8 @@ set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
 
 # Disable dummy drivers
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
-set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+# Keep headless replay/netplay tests inaudible while retaining SDL audio callbacks.
+set(SDL_DUMMYAUDIO ON CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
