@@ -55,6 +55,11 @@ class InputSystem : public system::IInputSystem {
                                                  X_INPUT_KEYSTROKE* keystroke)>;
   void SetStateFilter(StateFilter filter) { state_filter_ = std::move(filter); }
   void SetKeystrokeFilter(KeystrokeFilter filter) { keystroke_filter_ = std::move(filter); }
+  // Additional filters applied after the one from SetStateFilter/SetKeystrokeFilter, in the
+  // order they were added. For features that must compose with the primary filter (netplay's
+  // record/replay) instead of replacing it -- e.g. an external portal menu's "hush".
+  void AddStateFilter(StateFilter filter) { state_filters_.push_back(std::move(filter)); }
+  void AddKeystrokeFilter(KeystrokeFilter filter) { keystroke_filters_.push_back(std::move(filter)); }
 
   // Remaps vibration to a local slot; false drops remote rumble. While installed, the guest
   // always sees success so local hardware failures cannot affect a synchronized simulation.
@@ -88,6 +93,8 @@ class InputSystem : public system::IInputSystem {
   CapabilitiesFilter capabilities_filter_;
   StateFilter state_filter_;
   KeystrokeFilter keystroke_filter_;
+  std::vector<StateFilter> state_filters_;
+  std::vector<KeystrokeFilter> keystroke_filters_;
   ActiveDeviceTracker active_devices_;
 
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one

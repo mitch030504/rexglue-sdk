@@ -229,6 +229,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   if (state_filter_) {
     result = state_filter_(user_index, result, &state);
   }
+  for (auto& filter : state_filters_) {
+    result = filter(user_index, result, &state);
+  }
   if (result == X_ERROR_SUCCESS && out_state) {
     *out_state = state;
   }
@@ -327,6 +330,9 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   X_RESULT result = GetDevicesKeystroke(user_index, flags, &keystroke);
   if (keystroke_filter_) {
     result = keystroke_filter_(user_index, result, &keystroke);
+  }
+  for (auto& filter : keystroke_filters_) {
+    result = filter(user_index, result, &keystroke);
   }
   if (result == X_ERROR_SUCCESS && out_keystroke) {
     *out_keystroke = keystroke;
