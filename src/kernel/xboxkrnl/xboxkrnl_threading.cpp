@@ -392,7 +392,7 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 
 u32 NtYieldExecution_entry() {
   if (auto* scheduler = system::GuestScheduler::ForCurrentThread()) {
-    scheduler->Yield(XThread::GetCurrentThread());
+    scheduler->YieldThread(XThread::GetCurrentThread());
     return X_STATUS_SUCCESS;
   }
   rex::thread::MaybeYield();

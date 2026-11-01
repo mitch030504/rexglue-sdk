@@ -399,7 +399,7 @@ void GuestScheduler::Block(XThread* thread, const std::function<bool()>& ready,
   }
 }
 
-void GuestScheduler::Yield(XThread* thread) {
+void GuestScheduler::YieldThread(XThread* thread) {
   YieldTurn(thread);
 }
 
@@ -475,7 +475,7 @@ bool GuestScheduler::YieldInterrupt(XThread* thread) {
 
 void GuestScheduler::YieldSpinning(XThread* thread) {
   if (!no_switch_depth) {
-    Yield(thread);
+    YieldThread(thread);
   } else {
     YieldInterrupt(thread);
   }

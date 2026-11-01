@@ -1035,7 +1035,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     if (auto* scheduler = GuestScheduler::ForCurrentThread()) {
       // One guest thread at a time: sleeping gives the token up until the guest deadline.
       if (!interval) {
-        scheduler->Yield(this);
+        scheduler->YieldThread(this);
         return X_STATUS_SUCCESS;
       }
       const uint64_t deadline = chrono::Clock::GuestDeadline(int64_t(interval));

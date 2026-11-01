@@ -302,7 +302,7 @@ auto WaitUntilGuestDeadline(const uint64_t* opt_timeout, std::chrono::millisecon
       // A poll that fails: whoever would signal the object needs the token to do it, so let
       // every other thread that can run go first (guest code that polls in a loop spins forever
       // otherwise).
-      scheduler->Yield(XThread::GetCurrentThread());
+      scheduler->YieldThread(XThread::GetCurrentThread());
       return result;
     }
     const bool has_deadline = opt_timeout != nullptr;

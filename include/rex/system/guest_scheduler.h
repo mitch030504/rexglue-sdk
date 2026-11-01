@@ -69,7 +69,7 @@ class GuestScheduler {
   void Block(XThread* thread, const std::function<bool()>& ready,
              const std::function<bool()>& attempt);
   /// Lets every other runnable thread go first.
-  void Yield(XThread* thread);
+  void YieldThread(XThread* thread);
   /// Yield for a thread spinning on guest memory another thread must change (a spinlock): also
   /// works inside an interrupt (see NoSwitchScope).
   void YieldSpinning(XThread* thread);
