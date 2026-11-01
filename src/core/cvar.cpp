@@ -86,7 +86,7 @@ bool Outranks(Source source, const FlagEntry& entry) {
 
 // Unvalidated apply, for the command line and environment paths.
 bool ApplyFromSource(FlagEntry& entry, std::string_view value, Source source) {
-  if (!Outranks(source, entry) || !entry.setter(value)) {
+  if ((entry.locked && entry.getter() != value) || !Outranks(source, entry) || !entry.setter(value)) {
     return false;
   }
   entry.source = source;
@@ -307,6 +307,10 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
 
   auto& entry = GetRegistryStorage()[it->second];
 
+  if (entry.locked && entry.getter() != value) {
+    REXLOG_WARN("Flag '{}' is locked for this session", name);
+    return ApplyResult::kRejected;
+  }
   if (!Outranks(source, entry)) {
     return ApplyResult::kSkipped;
   }
@@ -341,6 +345,21 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
 }
 
 }  // namespace
+
+bool LockFlag(std::string_view name) {
+  std::lock_guard lock(GetRegistryMutex());
+  const auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) return false;
+  auto& entry = GetRegistryStorage()[it->second];
+  if (entry.type == FlagType::Command) return false;
+  entry.locked = true;
+  return true;
+}
+
+bool LockFlag(std::string_view name, std::string_view value) {
+  std::lock_guard lock(GetRegistryMutex());
+  return SetFlagByName(name, value) && LockFlag(name);
+}
 
 bool SetFlagByName(std::string_view name, std::string_view value) {
   return SetFlagFromSource(name, value, Source::kRuntime) == ApplyResult::kApplied;

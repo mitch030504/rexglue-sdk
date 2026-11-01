@@ -172,6 +172,7 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+  bool locked = false;
   Source source = Source::kDefault;
 };
 
@@ -190,6 +191,11 @@ std::optional<size_t> RegisterFlag(FlagEntry entry);
 void UnregisterFlag(std::string_view name);
 
 bool SetFlagByName(std::string_view name, std::string_view value);
+// Make a session-critical setting read-only for the rest of this process.
+// Registry setters may still reapply the exact current value; typed internal storage is unchanged.
+bool LockFlag(std::string_view name);
+// Atomically apply a validated final value and lock it before another setter can intervene.
+bool LockFlag(std::string_view name, std::string_view value);
 
 // Applies a value parsed off the command line. Returns false only when the
 // value is rejected (unparseable, or outside the flag's constraints); a value

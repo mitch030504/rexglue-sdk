@@ -793,3 +793,20 @@ TEST_CASE("cvar InvokeCommand dispatches commands", "[cvar]") {
     CHECK_FALSE(rex::cvar::InvokeCommand("does_not_exist", ""));
   }
 }
+
+REXCVAR_DEFINE_INT32(test_locked_netplay_flag, 60, "Test", "Session lock fixture");
+TEST_CASE("Session-critical cvars reject changes from registry setters", "[cvar]") {
+  REQUIRE(rex::cvar::LockFlag("test_locked_netplay_flag"));
+  REQUIRE(rex::cvar::SetFlagByName("test_locked_netplay_flag", "60"));
+  REQUIRE_FALSE(rex::cvar::SetFlagByName("test_locked_netplay_flag", "120"));
+  REQUIRE_FALSE(rex::cvar::SetFlagFromCommandLine("test_locked_netplay_flag", "120"));
+  REQUIRE(REXCVAR_GET(test_locked_netplay_flag) == 60);
+  REQUIRE_FALSE(rex::cvar::LockFlag("nonexistent_netplay_flag"));
+}
+
+REXCVAR_DEFINE_INT32(test_locked_final_flag, 30, "Test", "Atomic session lock fixture");
+TEST_CASE("A final session value is validated and locked atomically", "[cvar]") {
+  REQUIRE(rex::cvar::LockFlag("test_locked_final_flag", "60"));
+  REQUIRE(REXCVAR_GET(test_locked_final_flag) == 60);
+  REQUIRE_FALSE(rex::cvar::SetFlagByName("test_locked_final_flag", "120"));
+}
