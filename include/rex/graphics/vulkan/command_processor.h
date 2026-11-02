@@ -255,6 +255,7 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
+  void OnTraceMarker(const TraceMarker& marker) override;
   void OnPrimaryBufferEnd() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,

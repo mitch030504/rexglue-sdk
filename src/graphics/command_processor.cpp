@@ -951,6 +951,7 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     std::array<uint32_t, TraceMarker::kWords> words;
     for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
     if (auto marker = TraceMarker::Parse(words)) {
+      OnTraceMarker(*marker);
       if (marker->kind == TraceMarker::kBegin &&
           (!trace_marker_active_ || trace_marker_frame_ != marker->frame)) {
         trace_marker_active_ = true;

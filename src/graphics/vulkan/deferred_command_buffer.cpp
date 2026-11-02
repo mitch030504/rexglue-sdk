@@ -47,6 +47,20 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kTraceMarker: {
+        const auto& marker = *reinterpret_cast<const TraceMarker*>(stream);
+        const auto insert_label = command_processor_.GetVulkanDevice()->vulkan_instance()
+                                      ->functions().vkCmdInsertDebugUtilsLabelEXT;
+        if (insert_label) {
+          const auto name = fmt::format("REXM frame={} kind={} node={:08X} geometry={:08X}",
+                                        marker.frame, uint32_t(marker.kind),
+                                        marker.node, marker.geometry);
+          const VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT,
+                                           nullptr, name.c_str(), {0, 1, 0, 1}};
+          insert_label(command_buffer, &label);
+        }
+      } break;
+
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);

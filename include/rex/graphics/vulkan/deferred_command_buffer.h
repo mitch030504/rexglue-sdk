@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 
+#include <rex/graphics/trace_marker.h>
 #include <rex/assert.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/api.h>
@@ -232,6 +233,10 @@ class DeferredCommandBuffer {
     args.group_count_z = group_count_z;
   }
 
+  void CmdTraceMarker(const TraceMarker& marker) {
+    std::memcpy(WriteCommand(Command::kTraceMarker, sizeof(marker)), &marker, sizeof(marker));
+  }
+
   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                  uint32_t first_instance) {
     auto& args = *reinterpret_cast<ArgsVkDraw*>(WriteCommand(Command::kVkDraw, sizeof(ArgsVkDraw)));
@@ -353,6 +358,7 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kTraceMarker,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,

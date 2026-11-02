@@ -3599,6 +3599,13 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
   }
 }
 
+void VulkanCommandProcessor::OnTraceMarker(const TraceMarker& marker) {
+  if (GetVulkanDevice()->vulkan_instance()->extensions().ext_EXT_debug_utils &&
+      BeginSubmission(true)) {
+    deferred_command_buffer().CmdTraceMarker(marker);
+  }
+}
+
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {

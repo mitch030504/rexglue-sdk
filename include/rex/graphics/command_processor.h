@@ -24,6 +24,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/trace_marker.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/system/xthread.h>
@@ -179,6 +180,7 @@ class CommandProcessor {
   virtual void ReturnFromWait();
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
+  virtual void OnTraceMarker(const TraceMarker& marker) {}
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
