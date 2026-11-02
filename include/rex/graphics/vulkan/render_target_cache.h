@@ -811,16 +811,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
-  // Development-only identity writeback probe (cvar wb_probe, off by default).
+  // Development-only writeback probe (cvar wb_probe, off by default).
   // Copies a resolved guest colour range out to a scratch buffer and back twice,
   // then compares the three snapshots on the CPU after the submission completes.
-  // Only transfer state is touched: no render target, EDRAM ownership, resolve or
-  // render pass state is modified, so a byte-exact copy must leave the frame
-  // structurally identical.
+  // In the default identity mode the scratch holds the resolved bytes, so a
+  // byte-exact copy must leave the frame structurally identical. In visible mode
+  // (wb_probe_mode=1) the scratch holds an opaque magenta pattern instead, which
+  // must show up in the final composited frame while the HUD drawn after the
+  // resolve must not.
   void MaybeRunWritebackProbe(VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
                               uint32_t address, uint32_t length, uint32_t width_div_8,
                               uint32_t height_div_8, bool is_copying_depth,
-                              bool draw_resolution_scaled);
+                              bool draw_resolution_scaled, xenos::ColorFormat copy_dest_format);
   void VerifyWritebackProbe();
   bool EnsureWritebackProbeBuffers(VkDeviceSize slice_size);
   void DestroyWritebackProbeBuffers();
@@ -888,6 +890,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Development-only identity writeback probe (cvar wb_probe).
   VkBuffer probe_scratch_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory probe_scratch_memory_ = VK_NULL_HANDLE;
+  // Host-visible pattern source for wb_probe_mode=1, uploaded once: one fill per
+  // colour, as R8G8B8A8 bytes (the first distinct address of a frame is magenta).
+  VkBuffer probe_pattern_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory probe_pattern_memory_ = VK_NULL_HANDLE;
+  void* probe_pattern_mapped_ = nullptr;
+  // One-shot reporting so a refused format or the chosen fill is visible once
+  // instead of per frame.
+  bool probe_layout_logged_ = false;
+  bool probe_visible_format_logged_ = false;
   // Host-visible buffer holding three consecutive snapshots of the same guest
   // range: before the round trip, after the first copy-back, after the second.
   VkBuffer probe_readback_buffer_ = VK_NULL_HANDLE;
@@ -904,6 +915,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t probe_pending_length_ = 0;
   uint32_t probe_last_frame_ = UINT32_MAX;
   uint32_t probe_frames_done_ = 0;
+  // Which distinct destination addresses already got a colour in this frame, and
+  // where the pending probe's colour starts in the pattern buffer.
+  uint32_t probe_color_frame_ = UINT32_MAX;
+  uint32_t probe_color_count_ = 0;
+  uint32_t probe_color_addresses_[4] = {};
+  VkDeviceSize probe_pending_pattern_offset_ = 0;
+  // Bounded per-frame diagnostic for the probe window.
+  uint32_t probe_count_frame_ = UINT32_MAX;
+  uint32_t probe_frame_resolves_ = 0;
   // Bounded reporting of colour resolves the extent filter rejected, so a filter
   // that never matches is visible instead of silent.
   uint32_t probe_skipped_extent_logs_ = 0;

@@ -42,6 +42,27 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+namespace {
+
+// Distinguishable fills for wb_probe_mode=1, written as R8G8B8A8 bytes so the
+// value does not depend on how a packed 32-bit constant would be laid out. The
+// first distinct destination address of a frame gets magenta, so the common case
+// stays the single-colour probe; the others are only used to attribute which
+// resolve the composition samples when a frame has several scene-sized resolves.
+struct WritebackProbeColor {
+  uint8_t rgba[4];
+  const char* name;
+};
+constexpr uint32_t kWritebackProbeColorCount = 4;
+constexpr WritebackProbeColor kWritebackProbeColors[kWritebackProbeColorCount] = {
+    {{0xFF, 0x00, 0xFF, 0xFF}, "magenta"},
+    {{0x00, 0xFF, 0x00, 0xFF}, "green"},
+    {{0x00, 0x00, 0xFF, 0xFF}, "blue"},
+    {{0xFF, 0xFF, 0x00, 0xFF}, "yellow"},
+};
+
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(wb_probe, false, "GPU/Vulkan",
                     "Development: identity writeback probe. After the scene colour resolve has "
                     "written guest memory, copies the same range to a scratch buffer and back "
@@ -57,6 +78,14 @@ REXCVAR_DEFINE_INT32(wb_probe_frames, 8, "GPU/Vulkan",
                      "Development: number of guest frames the writeback probe runs for before it "
                      "stops on its own, so the log cannot flood.")
     .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(wb_probe_mode, 0, "GPU/Vulkan",
+                     "Development: writeback probe mode. 0 = identity, the resolved bytes are "
+                     "written back unchanged. 1 = visible, the resolved scene is overwritten with "
+                     "opaque magenta before it is written back, deliberately corrupting the frame "
+                     "to prove a modified scene reaches the output and the HUD bypasses the "
+                     "writeback. Requires wb_probe=true.")
+    .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
@@ -1146,7 +1175,8 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
                                                      uint32_t address, uint32_t length,
                                                      uint32_t width_div_8, uint32_t height_div_8,
                                                      bool is_copying_depth,
-                                                     bool draw_resolution_scaled) {
+                                                     bool draw_resolution_scaled,
+                                                     xenos::ColorFormat copy_dest_format) {
   // Depth has no guest-memory seam: nothing resolves depth into guest RAM unless
   // the guest asks, so a depth guide needs host render target readback instead.
   if (is_copying_depth || draw_resolution_scaled || !length) {
@@ -1166,22 +1196,46 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
   }
   const int32_t first_frame = REXCVAR_GET(wb_probe_frame);
   const uint32_t frame = uint32_t(command_processor_.GetCurrentFrame());
+  // Bounded diagnostic: how many resolves hit this extent in one frame, and at
+  // which address, so a second resolve overwriting the probe (or a different
+  // address than the one the composition samples) is visible instead of inferred.
+  if (first_frame >= 0 && frame >= uint32_t(first_frame) &&
+      frame < uint32_t(first_frame) + 16u) {
+    if (probe_count_frame_ != frame) {
+      probe_count_frame_ = frame;
+      probe_frame_resolves_ = 0;
+    }
+    REXGPU_INFO("wb_probe resolve frame={} seq={} addr={:08X} bytes={} extent={}x{}", frame,
+                probe_frame_resolves_, address, length, width_div_8 * 8u, height_div_8 * 8u);
+    ++probe_frame_resolves_;
+  }
   if (first_frame >= 0 && frame < uint32_t(first_frame)) {
     return;
   }
   if (probe_frames_done_ >= uint32_t(REXCVAR_GET(wb_probe_frames))) {
     return;
   }
-  // One probe per frame, and none while the previous result is still waiting for
-  // its CPU-side comparison - the readback buffer has three snapshots in it until
-  // then.
-  if (probe_pending_ || probe_last_frame_ == frame) {
-    return;
-  }
   if ((address & 3u) || (length & 3u)) {
     if (probe_skipped_unaligned_logs_ < 4) {
       ++probe_skipped_unaligned_logs_;
       REXGPU_INFO("wb_probe skip unaligned addr={:08X} bytes={}", address, length);
+    }
+    return;
+  }
+
+  // The visible pattern is only written when the destination really is 4 bytes
+  // per pixel in R8G8B8A8 byte order. The resolve reports its own destination
+  // format: only the 8_8_8_8 family is a 32-bit RGBA copy (the fast 32bpp path
+  // is bitwise-equivalent, so the bytes are R,G,B,A in guest memory). Anything
+  // else is refused rather than filled with a pattern blind.
+  const bool visible = REXCVAR_GET(wb_probe_mode) == 1;
+  if (visible && copy_dest_format != xenos::ColorFormat::k_8_8_8_8 &&
+      copy_dest_format != xenos::ColorFormat::k_8_8_8_8_A &&
+      copy_dest_format != xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16) {
+    if (!probe_visible_format_logged_) {
+      probe_visible_format_logged_ = true;
+      REXGPU_INFO("wb_probe skip visible_format dest_format={} bytes={} (expected r8g8b8a8)",
+                  uint32_t(copy_dest_format), length);
     }
     return;
   }
@@ -1199,6 +1253,63 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
   VkBufferCopy region = {};
   region.size = length;
 
+  uint32_t color_index = 0;
+  if (visible) {
+    if (!probe_layout_logged_) {
+      probe_layout_logged_ = true;
+      // The guest destination is a tiled 32x32 texture (the extent is the whole
+      // tile-aligned resource: 1024x608 for the 1000x600 scene), so this does not
+      // assume linear rows - a uniform 4-byte fill reaches every pixel under any
+      // tiling. Never written outside the resolve extent that the identity probe
+      // already rewrote.
+      REXGPU_INFO(
+          "wb_probe mode=visible format=r8g8b8a8 dest_format={} bytes={} pixels={} extent={}x{} "
+          "pattern=ff00ffff(RGBA)",
+          uint32_t(copy_dest_format), length, length / 4u, width_div_8 * 8u, height_div_8 * 8u);
+    }
+    // Colour per distinct destination address in this frame: the first-seen one
+    // stays magenta, later ones get their own colour, so the final image says
+    // which resolve the composition samples instead of all of them looking alike.
+    if (probe_color_frame_ != frame) {
+      probe_color_frame_ = frame;
+      probe_color_count_ = 0;
+    }
+    color_index = UINT32_MAX;
+    for (uint32_t i = 0; i < probe_color_count_; ++i) {
+      if (probe_color_addresses_[i] == address) {
+        color_index = i;
+        break;
+      }
+    }
+    if (color_index == UINT32_MAX) {
+      color_index = probe_color_count_ < kWritebackProbeColorCount ? probe_color_count_ : 0;
+      if (probe_color_count_ < kWritebackProbeColorCount) {
+        probe_color_addresses_[probe_color_count_++] = address;
+      }
+    }
+    REXGPU_INFO("wb_probe mode=visible paint frame={} seq={} addr={:08X} bytes={} color={}",
+                frame, probe_frame_resolves_ ? probe_frame_resolves_ - 1u : 0u, address, length,
+                kWritebackProbeColors[color_index].name);
+  }
+
+  // One verified probe per frame: the readback buffer holds three snapshots until
+  // the CPU has compared them, so it cannot be reused within the same frame. In
+  // visible mode the remaining frame resolves are still painted - otherwise only
+  // whichever resolve happened to come first would be visible.
+  if (probe_pending_ || probe_last_frame_ == frame) {
+    if (!visible) {
+      return;
+    }
+    shared_memory.Use(VulkanSharedMemory::Usage::kTransferDestination,
+                      std::pair<uint32_t, uint32_t>(address, length));
+    command_processor_.SubmitBarriers(true);
+    region.srcOffset = VkDeviceSize(color_index) * slice;
+    region.dstOffset = address;
+    command_buffer.CmdVkCopyBuffer(probe_pattern_buffer_, shared_memory.buffer(), 1, &region);
+    texture_cache.MarkRangeAsResolved(address, length);
+    return;
+  }
+
   // Every transition goes through the shared memory usage helper - the resolve
   // left the range as a compute write, so this is the same read transition the
   // readback resolve path uses.
@@ -1208,8 +1319,16 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
   region.srcOffset = address;
   region.dstOffset = 0;
   command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_readback_buffer_, 1, &region);
-  // Keep the copy-back source.
-  command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_scratch_buffer_, 1, &region);
+  region.srcOffset = VkDeviceSize(color_index) * slice;
+  if (visible) {
+    // Visible mode: the copy-back source is the pattern, not the resolved bytes,
+    // so the writeback changes the scene instead of preserving it.
+    command_buffer.CmdVkCopyBuffer(probe_pattern_buffer_, probe_scratch_buffer_, 1, &region);
+  } else {
+    region.srcOffset = 0;
+    // Keep the copy-back source.
+    command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_scratch_buffer_, 1, &region);
+  }
 
   // First copy-back.
   shared_memory.Use(VulkanSharedMemory::Usage::kTransferDestination,
@@ -1255,6 +1374,7 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
   probe_pending_frame_ = frame;
   probe_pending_address_ = address;
   probe_pending_length_ = length;
+  probe_pending_pattern_offset_ = VkDeviceSize(color_index) * slice;
   probe_last_frame_ = frame;
   ++probe_frames_done_;
 }
@@ -1285,19 +1405,41 @@ void VulkanRenderTargetCache::VerifyWritebackProbe() {
   const uint8_t* const after_second = bytes + slice * 2;
   const int memcmp_first = std::memcmp(before, after_first, length);
   const int memcmp_second = std::memcmp(before, after_second, length);
-  REXGPU_INFO("wb_probe frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X} "
-              "addr={:08X}",
-              probe_pending_frame_, probe_pending_length_, memcmp_first,
-              XXH3_64bits(before, length), XXH3_64bits(after_first, length),
-              probe_pending_address_);
-  REXGPU_INFO("wb_probe2 frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X}",
-              probe_pending_frame_, probe_pending_length_, memcmp_second,
-              XXH3_64bits(after_first, length), XXH3_64bits(after_second, length));
+  if (REXCVAR_GET(wb_probe_mode) == 1) {
+    // Visible mode is expected to differ from the resolved bytes: that difference
+    // is the thing being measured, so a non-zero memcmp here is the success case.
+    const uint64_t hash_written =
+        probe_pattern_mapped_ != nullptr
+            ? XXH3_64bits(reinterpret_cast<const uint8_t*>(probe_pattern_mapped_) +
+                              probe_pending_pattern_offset_,
+                          length)
+            : 0;
+    REXGPU_INFO("wb_probe mode=visible frame={} bytes={} memcmp={} hash_before={:016X} "
+                "hash_after={:016X} hash_written={:016X} addr={:08X}",
+                probe_pending_frame_, probe_pending_length_, memcmp_first,
+                XXH3_64bits(before, length), XXH3_64bits(after_first, length), hash_written,
+                probe_pending_address_);
+    REXGPU_INFO("wb_probe2 mode=visible frame={} bytes={} memcmp={} hash_before={:016X} "
+                "hash_after={:016X} hash_written={:016X}",
+                probe_pending_frame_, probe_pending_length_, memcmp_second,
+                XXH3_64bits(after_first, length), XXH3_64bits(after_second, length), hash_written);
+  } else {
+    REXGPU_INFO("wb_probe frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X} "
+                "addr={:08X}",
+                probe_pending_frame_, probe_pending_length_, memcmp_first,
+                XXH3_64bits(before, length), XXH3_64bits(after_first, length),
+                probe_pending_address_);
+    REXGPU_INFO("wb_probe2 frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X}",
+                probe_pending_frame_, probe_pending_length_, memcmp_second,
+                XXH3_64bits(after_first, length), XXH3_64bits(after_second, length));
+  }
 }
 
 bool VulkanRenderTargetCache::EnsureWritebackProbeBuffers(VkDeviceSize slice_size) {
+  const bool visible = REXCVAR_GET(wb_probe_mode) == 1;
   if (probe_scratch_buffer_ != VK_NULL_HANDLE && probe_readback_buffer_ != VK_NULL_HANDLE &&
-      probe_readback_mapped_ != nullptr && probe_slice_size_ >= slice_size) {
+      probe_readback_mapped_ != nullptr && probe_slice_size_ >= slice_size &&
+      (!visible || probe_pattern_buffer_ != VK_NULL_HANDLE)) {
     return true;
   }
   if (probe_pending_) {
@@ -1340,11 +1482,59 @@ bool VulkanRenderTargetCache::EnsureWritebackProbeBuffers(VkDeviceSize slice_siz
     dfn.vkFreeMemory(device, readback_memory, nullptr);
     return false;
   }
+  // Visible mode only: the pattern source, filled and flushed once, holding one
+  // copy of the fill per colour (a separate pattern per distinct address). The
+  // guest destination is tiled, so a uniform 4-byte fill is used instead of
+  // computing tile offsets - it cannot be wrong about row order or tile
+  // swizzling.
+  VkBuffer pattern_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory pattern_memory = VK_NULL_HANDLE;
+  void* pattern_mapped = nullptr;
+  if (visible) {
+    const VkDeviceSize pattern_size = slice_size * kWritebackProbeColorCount;
+    uint32_t pattern_memory_type = UINT32_MAX;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, pattern_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, pattern_buffer, pattern_memory,
+            &pattern_memory_type)) {
+      REXGPU_ERROR("VulkanRenderTargetCache: failed to create the writeback probe pattern buffer");
+      dfn.vkDestroyBuffer(device, scratch_buffer, nullptr);
+      dfn.vkFreeMemory(device, scratch_memory, nullptr);
+      dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+      dfn.vkFreeMemory(device, readback_memory, nullptr);
+      return false;
+    }
+    if (dfn.vkMapMemory(device, pattern_memory, 0, VK_WHOLE_SIZE, 0, &pattern_mapped) !=
+        VK_SUCCESS) {
+      REXGPU_ERROR("VulkanRenderTargetCache: failed to map the writeback probe pattern buffer");
+      dfn.vkDestroyBuffer(device, pattern_buffer, nullptr);
+      dfn.vkFreeMemory(device, pattern_memory, nullptr);
+      dfn.vkDestroyBuffer(device, scratch_buffer, nullptr);
+      dfn.vkFreeMemory(device, scratch_memory, nullptr);
+      dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+      dfn.vkFreeMemory(device, readback_memory, nullptr);
+      return false;
+    }
+    uint8_t* const pattern_bytes = reinterpret_cast<uint8_t*>(pattern_mapped);
+    for (uint32_t color = 0; color < kWritebackProbeColorCount; ++color) {
+      const uint8_t* const rgba = kWritebackProbeColors[color].rgba;
+      const VkDeviceSize base = VkDeviceSize(color) * slice_size;
+      for (VkDeviceSize offset = 0; offset + 4 <= slice_size; offset += 4) {
+        std::memcpy(pattern_bytes + base + offset, rgba, 4);
+      }
+    }
+    // Host writes must be visible to the device before the first copy reads it.
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, pattern_memory, pattern_memory_type, 0,
+                                             VK_WHOLE_SIZE, pattern_size);
+  }
   probe_scratch_buffer_ = scratch_buffer;
   probe_scratch_memory_ = scratch_memory;
   probe_readback_buffer_ = readback_buffer;
   probe_readback_memory_ = readback_memory;
   probe_readback_mapped_ = mapped;
+  probe_pattern_buffer_ = pattern_buffer;
+  probe_pattern_memory_ = pattern_memory;
+  probe_pattern_mapped_ = pattern_mapped;
   probe_readback_size_ = slice_size * 3;
   probe_slice_size_ = slice_size;
   return true;
@@ -1358,10 +1548,16 @@ void VulkanRenderTargetCache::DestroyWritebackProbeBuffers() {
     dfn.vkUnmapMemory(device, probe_readback_memory_);
   }
   probe_readback_mapped_ = nullptr;
+  if (probe_pattern_memory_ != VK_NULL_HANDLE && probe_pattern_mapped_ != nullptr) {
+    dfn.vkUnmapMemory(device, probe_pattern_memory_);
+  }
+  probe_pattern_mapped_ = nullptr;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_readback_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, probe_readback_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_scratch_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, probe_scratch_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_pattern_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, probe_pattern_memory_);
   probe_readback_size_ = 0;
   probe_slice_size_ = 0;
   probe_pending_ = false;
@@ -1548,7 +1744,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                    resolve_info.copy_dest_extent_length,
                                    resolve_info.coordinate_info.width_div_8,
                                    resolve_info.height_div_8, resolve_info.IsCopyingDepth(),
-                                   draw_resolution_scaled);
+                                   draw_resolution_scaled,
+                                   resolve_info.copy_dest_info.copy_dest_format);
           }
         }
       }
