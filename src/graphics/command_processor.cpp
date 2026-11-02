@@ -951,7 +951,8 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     std::array<uint32_t, TraceMarker::kWords> words;
     for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
     if (auto marker = TraceMarker::Parse(words)) {
-      if (marker->kind == TraceMarker::kBegin) {
+      if (marker->kind == TraceMarker::kBegin &&
+          (!trace_marker_active_ || trace_marker_frame_ != marker->frame)) {
         trace_marker_active_ = true;
         trace_marker_frame_ = marker->frame;
         trace_marker_draw_ = 0;
@@ -959,9 +960,6 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
       REXGPU_INFO("engine_trace frame={} kind={} node={:08X} geometry={:08X} draw={}",
                   marker->frame, uint32_t(marker->kind), marker->node,
                   marker->geometry, trace_marker_draw_);
-      if (marker->kind == TraceMarker::kEnd && marker->frame == trace_marker_frame_) {
-        trace_marker_active_ = false;
-      }
     }
   } else {
     reader->AdvanceRead(count * sizeof(uint32_t));
@@ -988,7 +986,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   if (trace_marker_active_) {
-    REXGPU_WARN("engine_trace frame={} missing end marker; stopping at swap", trace_marker_frame_);
+    REXGPU_INFO("engine_trace frame={} swap draws={}", trace_marker_frame_, trace_marker_draw_);
     trace_marker_active_ = false;
   }
   SCOPE_profile_cpu_f("gpu");
