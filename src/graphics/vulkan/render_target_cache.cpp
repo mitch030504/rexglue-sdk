@@ -46,19 +46,34 @@ namespace {
 
 // Distinguishable fills for wb_probe_mode=1, written as R8G8B8A8 bytes so the
 // value does not depend on how a packed 32-bit constant would be laid out. The
-// first distinct destination address of a frame gets magenta, so the common case
-// stays the single-colour probe; the others are only used to attribute which
-// resolve the composition samples when a frame has several scene-sized resolves.
+// index is address_slot * kWritebackProbeAddressSequences + resolve_sequence, so
+// every (destination address, resolve sequence) pair in a frame paints its own
+// colour: addressing the question of which resolve of which address the
+// composition actually samples, not just which address. All twelve entries are
+// fully saturated or half-saturated primaries with a pairwise Chebyshev distance
+// of at least 64, so a PPM can separate them exactly and with tolerance for the
+// vignette dimming of the final image. The order within a slot is magenta/green/
+// blue, cyan/red/orange, violet/spring/azure, lime/rose/jade so neighbouring
+// slots cannot be confused with each other either.
 struct WritebackProbeColor {
   uint8_t rgba[4];
+  uint32_t rgb;  // 0xRRGGBB for the paint log and the PPM analysis.
   const char* name;
 };
-constexpr uint32_t kWritebackProbeColorCount = 4;
+constexpr uint32_t kWritebackProbeColorCount = 12;
 constexpr WritebackProbeColor kWritebackProbeColors[kWritebackProbeColorCount] = {
-    {{0xFF, 0x00, 0xFF, 0xFF}, "magenta"},
-    {{0x00, 0xFF, 0x00, 0xFF}, "green"},
-    {{0x00, 0x00, 0xFF, 0xFF}, "blue"},
-    {{0xFF, 0xFF, 0x00, 0xFF}, "yellow"},
+    {{0xFF, 0x00, 0xFF, 0xFF}, 0xFF00FF, "magenta"},
+    {{0x00, 0xFF, 0x00, 0xFF}, 0x00FF00, "green"},
+    {{0x00, 0x00, 0xFF, 0xFF}, 0x0000FF, "blue"},
+    {{0x00, 0xFF, 0xFF, 0xFF}, 0x00FFFF, "cyan"},
+    {{0xFF, 0x00, 0x00, 0xFF}, 0xFF0000, "red"},
+    {{0xFF, 0x80, 0x00, 0xFF}, 0xFF8000, "orange"},
+    {{0x80, 0x00, 0xFF, 0xFF}, 0x8000FF, "violet"},
+    {{0x00, 0xFF, 0x80, 0xFF}, 0x00FF80, "spring"},
+    {{0x00, 0x80, 0xFF, 0xFF}, 0x0080FF, "azure"},
+    {{0x80, 0xFF, 0x00, 0xFF}, 0x80FF00, "lime"},
+    {{0xFF, 0x00, 0x80, 0xFF}, 0xFF0080, "rose"},
+    {{0x40, 0xFF, 0x40, 0xFF}, 0x40FF40, "jade"},
 };
 
 }  // namespace
@@ -81,10 +96,10 @@ REXCVAR_DEFINE_INT32(wb_probe_frames, 8, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(wb_probe_mode, 0, "GPU/Vulkan",
                      "Development: writeback probe mode. 0 = identity, the resolved bytes are "
-                     "written back unchanged. 1 = visible, the resolved scene is overwritten with "
-                     "opaque magenta before it is written back, deliberately corrupting the frame "
-                     "to prove a modified scene reaches the output and the HUD bypasses the "
-                     "writeback. Requires wb_probe=true.")
+                     "written back unchanged. 1 = visible, every colour resolve is overwritten "
+                     "with an opaque colour, one per (destination address, resolve sequence) of "
+                     "the frame, so the final image shows which resolve of which address the "
+                     "composition samples. Deliberately corrupts the frame. Requires wb_probe=true.")
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
@@ -1182,6 +1197,10 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
   if (is_copying_depth || draw_resolution_scaled || !length) {
     return;
   }
+  // The palette must cover every (address slot, resolve sequence) pair.
+  static_assert(kWritebackProbeColorCount >=
+                VulkanRenderTargetCache::kWritebackProbeAddressSlots *
+                    VulkanRenderTargetCache::kWritebackProbeAddressSequences);
   // The scene resolve is 1000x600 guest pixels; both extents are in units of 8.
   // The setup phase resolves nothing (it only clears) and the effects phase comes
   // after the scene phase, so the first colour resolve of a frame at this extent
@@ -1264,32 +1283,55 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
       // already rewrote.
       REXGPU_INFO(
           "wb_probe mode=visible format=r8g8b8a8 dest_format={} bytes={} pixels={} extent={}x{} "
-          "pattern=ff00ffff(RGBA)",
-          uint32_t(copy_dest_format), length, length / 4u, width_div_8 * 8u, height_div_8 * 8u);
+          "pattern=per-(address,sequence) palette={} colours",
+          uint32_t(copy_dest_format), length, length / 4u, width_div_8 * 8u, height_div_8 * 8u,
+          kWritebackProbeColorCount);
     }
-    // Colour per distinct destination address in this frame: the first-seen one
-    // stays magenta, later ones get their own colour, so the final image says
-    // which resolve the composition samples instead of all of them looking alike.
+    // Colour per (destination address, resolve sequence) in this frame. The slot
+    // is assigned in order of first appearance, so the colour of a given resolve
+    // of a given address is stable across frames as long as the resolve order is;
+    // every paint line states its own rgb, so the mapping never has to be inferred.
     if (probe_color_frame_ != frame) {
       probe_color_frame_ = frame;
-      probe_color_count_ = 0;
+      probe_color_address_count_ = 0;
     }
-    color_index = UINT32_MAX;
-    for (uint32_t i = 0; i < probe_color_count_; ++i) {
+    uint32_t address_slot = UINT32_MAX;
+    for (uint32_t i = 0; i < probe_color_address_count_; ++i) {
       if (probe_color_addresses_[i] == address) {
-        color_index = i;
+        address_slot = i;
         break;
       }
     }
-    if (color_index == UINT32_MAX) {
-      color_index = probe_color_count_ < kWritebackProbeColorCount ? probe_color_count_ : 0;
-      if (probe_color_count_ < kWritebackProbeColorCount) {
-        probe_color_addresses_[probe_color_count_++] = address;
+    bool palette_overflow = false;
+    if (address_slot == UINT32_MAX) {
+      // A fifth address in a frame would have no slot of its own; reuse slot 0 and
+      // report it rather than silently giving two addresses the same colours.
+      if (probe_color_address_count_ < kWritebackProbeAddressSlots) {
+        address_slot = probe_color_address_count_;
+        probe_color_addresses_[probe_color_address_count_] = address;
+        probe_color_address_sequences_[probe_color_address_count_] = 0;
+        ++probe_color_address_count_;
+      } else {
+        address_slot = 0;
+        palette_overflow = true;
       }
     }
-    REXGPU_INFO("wb_probe mode=visible paint frame={} seq={} addr={:08X} bytes={} color={}",
-                frame, probe_frame_resolves_ ? probe_frame_resolves_ - 1u : 0u, address, length,
-                kWritebackProbeColors[color_index].name);
+    const uint32_t address_sequence = probe_color_address_sequences_[address_slot];
+    if (address_sequence != UINT32_MAX) {
+      ++probe_color_address_sequences_[address_slot];
+    }
+    // A fourth resolve of one address would borrow the next slot's first colour, so
+    // it is reported as well as the impossible case of running off the palette.
+    palette_overflow |= address_sequence >= kWritebackProbeAddressSequences;
+    color_index = address_slot * kWritebackProbeAddressSequences + address_sequence;
+    if (color_index >= kWritebackProbeColorCount) {
+      palette_overflow = true;
+      color_index %= kWritebackProbeColorCount;
+    }
+    REXGPU_INFO("wb_probe paint frame={} addr={:08X} seq={} rgb={:06X} bytes={} slot={} color={}{}",
+                frame, address, address_sequence, kWritebackProbeColors[color_index].rgb, length,
+                address_slot, kWritebackProbeColors[color_index].name,
+                palette_overflow ? " palette_overflow=1" : "");
   }
 
   // One verified probe per frame: the readback buffer holds three snapshots until
@@ -1483,10 +1525,10 @@ bool VulkanRenderTargetCache::EnsureWritebackProbeBuffers(VkDeviceSize slice_siz
     return false;
   }
   // Visible mode only: the pattern source, filled and flushed once, holding one
-  // copy of the fill per colour (a separate pattern per distinct address). The
-  // guest destination is tiled, so a uniform 4-byte fill is used instead of
-  // computing tile offsets - it cannot be wrong about row order or tile
-  // swizzling.
+  // copy of the fill per palette entry (one per destination address slot and
+  // resolve sequence). The guest destination is tiled, so a uniform 4-byte fill is
+  // used instead of computing tile offsets - it cannot be wrong about row order or
+  // tile swizzling.
   VkBuffer pattern_buffer = VK_NULL_HANDLE;
   VkDeviceMemory pattern_memory = VK_NULL_HANDLE;
   void* pattern_mapped = nullptr;

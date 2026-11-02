@@ -816,9 +816,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // then compares the three snapshots on the CPU after the submission completes.
   // In the default identity mode the scratch holds the resolved bytes, so a
   // byte-exact copy must leave the frame structurally identical. In visible mode
-  // (wb_probe_mode=1) the scratch holds an opaque magenta pattern instead, which
-  // must show up in the final composited frame while the HUD drawn after the
-  // resolve must not.
+  // (wb_probe_mode=1) the scratch holds an opaque pattern instead, one colour per
+  // (destination address, resolve sequence) of the frame, which must show up in
+  // the final composited frame while the HUD drawn after the resolve must not.
   void MaybeRunWritebackProbe(VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
                               uint32_t address, uint32_t length, uint32_t width_div_8,
                               uint32_t height_div_8, bool is_copying_depth,
@@ -891,7 +891,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkBuffer probe_scratch_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory probe_scratch_memory_ = VK_NULL_HANDLE;
   // Host-visible pattern source for wb_probe_mode=1, uploaded once: one fill per
-  // colour, as R8G8B8A8 bytes (the first distinct address of a frame is magenta).
+  // palette entry (one per address slot and resolve sequence), as R8G8B8A8 bytes.
   VkBuffer probe_pattern_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory probe_pattern_memory_ = VK_NULL_HANDLE;
   void* probe_pattern_mapped_ = nullptr;
@@ -915,11 +915,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t probe_pending_length_ = 0;
   uint32_t probe_last_frame_ = UINT32_MAX;
   uint32_t probe_frames_done_ = 0;
-  // Which distinct destination addresses already got a colour in this frame, and
-  // where the pending probe's colour starts in the pattern buffer.
+  // Visible mode paints one colour per (destination address, resolve sequence).
+  // Four addresses and at most three resolves of each is the observed frame shape
+  // (10 resolves, 4 addresses, 3/1/3/3), so the palette holds 12 entries and a
+  // colour is address_slot * kWritebackProbeAddressSequences + sequence.
+  static constexpr uint32_t kWritebackProbeAddressSlots = 4;
+  static constexpr uint32_t kWritebackProbeAddressSequences = 3;
+  // Destination address slots and their per-frame resolve sequence counters, used
+  // to give every paint its own colour, plus where the pending probe's colour
+  // starts in the pattern buffer.
   uint32_t probe_color_frame_ = UINT32_MAX;
-  uint32_t probe_color_count_ = 0;
-  uint32_t probe_color_addresses_[4] = {};
+  uint32_t probe_color_address_count_ = 0;
+  uint32_t probe_color_addresses_[kWritebackProbeAddressSlots] = {};
+  uint32_t probe_color_address_sequences_[kWritebackProbeAddressSlots] = {};
   VkDeviceSize probe_pending_pattern_offset_ = 0;
   // Bounded per-frame diagnostic for the probe window.
   uint32_t probe_count_frame_ = UINT32_MAX;
