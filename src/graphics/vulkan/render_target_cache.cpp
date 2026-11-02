@@ -33,12 +33,30 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(wb_probe, false, "GPU/Vulkan",
+                    "Development: identity writeback probe. After the scene colour resolve has "
+                    "written guest memory, copies the same range to a scratch buffer and back "
+                    "twice, then compares the bytes on the CPU. Proves the pre-HUD writeback seam "
+                    "is byte-exact. Does not enable neural rendering.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(wb_probe_frame, -1, "GPU/Vulkan",
+                     "Development: first guest frame for the writeback probe; -1 probes any "
+                     "frame. Stop is bounded by wb_probe_frames.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(wb_probe_frames, 8, "GPU/Vulkan",
+                     "Development: number of guest frames the writeback probe runs for before it "
+                     "stops on its own, so the log cannot flood.")
+    .range(1, 120)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
@@ -980,6 +998,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   // already too late.
   DestroyAllRenderTargets(true);
 
+  DestroyWritebackProbeBuffers();
+
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          resolve_fsi_clear_64bpp_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -1113,9 +1133,238 @@ void VulkanRenderTargetCache::ClearCache() {
 }
 
 void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+  // The GPU has finished with every snapshot of a recorded probe at this point,
+  // so the CPU comparison is both safe and meaningful here and nowhere earlier.
+  VerifyWritebackProbe();
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
+}
+
+void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_memory,
+                                                     VulkanTextureCache& texture_cache,
+                                                     uint32_t address, uint32_t length,
+                                                     uint32_t width_div_8, uint32_t height_div_8,
+                                                     bool is_copying_depth,
+                                                     bool draw_resolution_scaled) {
+  // Depth has no guest-memory seam: nothing resolves depth into guest RAM unless
+  // the guest asks, so a depth guide needs host render target readback instead.
+  if (is_copying_depth || draw_resolution_scaled || !length) {
+    return;
+  }
+  // The scene resolve is 1000x600 guest pixels; both extents are in units of 8.
+  // The setup phase resolves nothing (it only clears) and the effects phase comes
+  // after the scene phase, so the first colour resolve of a frame at this extent
+  // is the finished scene.
+  if (width_div_8 != (1000u / 8u) || height_div_8 != (600u / 8u)) {
+    if (probe_skipped_extent_logs_ < 4) {
+      ++probe_skipped_extent_logs_;
+      REXGPU_INFO("wb_probe skip extent={}x{} bytes={} expected={}x{}", width_div_8 * 8u,
+                  height_div_8 * 8u, length, 1000, 600);
+    }
+    return;
+  }
+  const int32_t first_frame = REXCVAR_GET(wb_probe_frame);
+  const uint32_t frame = uint32_t(command_processor_.GetCurrentFrame());
+  if (first_frame >= 0 && frame < uint32_t(first_frame)) {
+    return;
+  }
+  if (probe_frames_done_ >= uint32_t(REXCVAR_GET(wb_probe_frames))) {
+    return;
+  }
+  // One probe per frame, and none while the previous result is still waiting for
+  // its CPU-side comparison - the readback buffer has three snapshots in it until
+  // then.
+  if (probe_pending_ || probe_last_frame_ == frame) {
+    return;
+  }
+  if ((address & 3u) || (length & 3u)) {
+    if (probe_skipped_unaligned_logs_ < 4) {
+      ++probe_skipped_unaligned_logs_;
+      REXGPU_INFO("wb_probe skip unaligned addr={:08X} bytes={}", address, length);
+    }
+    return;
+  }
+
+  const VkDeviceSize slice = rex::align(VkDeviceSize(length), VkDeviceSize(4));
+  if (!EnsureWritebackProbeBuffers(slice)) {
+    if (!probe_alloc_failed_logged_) {
+      probe_alloc_failed_logged_ = true;
+      REXGPU_ERROR("VulkanRenderTargetCache: writeback probe disabled, buffers unavailable");
+    }
+    return;
+  }
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  VkBufferCopy region = {};
+  region.size = length;
+
+  // Every transition goes through the shared memory usage helper - the resolve
+  // left the range as a compute write, so this is the same read transition the
+  // readback resolve path uses.
+  shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  // Snapshot 0: the bytes exactly as the resolve left them.
+  region.srcOffset = address;
+  region.dstOffset = 0;
+  command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_readback_buffer_, 1, &region);
+  // Keep the copy-back source.
+  command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_scratch_buffer_, 1, &region);
+
+  // First copy-back.
+  shared_memory.Use(VulkanSharedMemory::Usage::kTransferDestination,
+                    std::pair<uint32_t, uint32_t>(address, length));
+  command_processor_.SubmitBarriers(true);
+  region.srcOffset = 0;
+  region.dstOffset = address;
+  command_buffer.CmdVkCopyBuffer(probe_scratch_buffer_, shared_memory.buffer(), 1, &region);
+
+  // Snapshot 1: guest memory after one round trip.
+  shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  region.srcOffset = address;
+  region.dstOffset = slice;
+  command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_readback_buffer_, 1, &region);
+
+  // Second copy-back: idempotence, and it catches a copy whose source and
+  // destination overlap incorrectly.
+  shared_memory.Use(VulkanSharedMemory::Usage::kTransferDestination,
+                    std::pair<uint32_t, uint32_t>(address, length));
+  command_processor_.SubmitBarriers(true);
+  region.srcOffset = 0;
+  region.dstOffset = address;
+  command_buffer.CmdVkCopyBuffer(probe_scratch_buffer_, shared_memory.buffer(), 1, &region);
+
+  // Snapshot 2: guest memory after two round trips.
+  shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  region.srcOffset = address;
+  region.dstOffset = slice * 2;
+  command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_readback_buffer_, 1, &region);
+
+  // The write happened after the resolve invalidated the range, so invalidate it
+  // again the same way - bookkeeping must not depend on the bytes being equal.
+  texture_cache.MarkRangeAsResolved(address, length);
+
+  // Host visibility for the comparison in CompletedSubmissionUpdated.
+  command_processor_.PushBufferMemoryBarrier(
+      probe_readback_buffer_, 0, slice * 3, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+
+  probe_pending_ = true;
+  probe_pending_frame_ = frame;
+  probe_pending_address_ = address;
+  probe_pending_length_ = length;
+  probe_last_frame_ = frame;
+  ++probe_frames_done_;
+}
+
+void VulkanRenderTargetCache::VerifyWritebackProbe() {
+  if (!probe_pending_) {
+    return;
+  }
+  probe_pending_ = false;
+  if (probe_readback_buffer_ == VK_NULL_HANDLE || probe_readback_mapped_ == nullptr) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkMappedMemoryRange mapped_range = {};
+  mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  mapped_range.memory = probe_readback_memory_;
+  mapped_range.offset = 0;
+  mapped_range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+
+  const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(probe_readback_mapped_);
+  const size_t length = size_t(probe_pending_length_);
+  const size_t slice = size_t(probe_slice_size_);
+  const uint8_t* const before = bytes;
+  const uint8_t* const after_first = bytes + slice;
+  const uint8_t* const after_second = bytes + slice * 2;
+  const int memcmp_first = std::memcmp(before, after_first, length);
+  const int memcmp_second = std::memcmp(before, after_second, length);
+  REXGPU_INFO("wb_probe frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X} "
+              "addr={:08X}",
+              probe_pending_frame_, probe_pending_length_, memcmp_first,
+              XXH3_64bits(before, length), XXH3_64bits(after_first, length),
+              probe_pending_address_);
+  REXGPU_INFO("wb_probe2 frame={} bytes={} memcmp={} hash_before={:016X} hash_after={:016X}",
+              probe_pending_frame_, probe_pending_length_, memcmp_second,
+              XXH3_64bits(after_first, length), XXH3_64bits(after_second, length));
+}
+
+bool VulkanRenderTargetCache::EnsureWritebackProbeBuffers(VkDeviceSize slice_size) {
+  if (probe_scratch_buffer_ != VK_NULL_HANDLE && probe_readback_buffer_ != VK_NULL_HANDLE &&
+      probe_readback_mapped_ != nullptr && probe_slice_size_ >= slice_size) {
+    return true;
+  }
+  if (probe_pending_) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // The buffers are created once, for the first range probed. A later, larger
+  // range is refused rather than resized: this path runs inside an open
+  // submission, where the queue cannot be drained to replace a buffer safely.
+  if (probe_scratch_buffer_ != VK_NULL_HANDLE || probe_readback_buffer_ != VK_NULL_HANDLE) {
+    return false;
+  }
+  VkBuffer scratch_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory scratch_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, slice_size,
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, scratch_buffer, scratch_memory)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the writeback probe scratch buffer");
+    return false;
+  }
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, slice_size * 3, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the writeback probe readback buffer");
+    dfn.vkDestroyBuffer(device, scratch_buffer, nullptr);
+    dfn.vkFreeMemory(device, scratch_memory, nullptr);
+    return false;
+  }
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to map the writeback probe readback buffer");
+    dfn.vkDestroyBuffer(device, scratch_buffer, nullptr);
+    dfn.vkFreeMemory(device, scratch_memory, nullptr);
+    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+    dfn.vkFreeMemory(device, readback_memory, nullptr);
+    return false;
+  }
+  probe_scratch_buffer_ = scratch_buffer;
+  probe_scratch_memory_ = scratch_memory;
+  probe_readback_buffer_ = readback_buffer;
+  probe_readback_memory_ = readback_memory;
+  probe_readback_mapped_ = mapped;
+  probe_readback_size_ = slice_size * 3;
+  probe_slice_size_ = slice_size;
+  return true;
+}
+
+void VulkanRenderTargetCache::DestroyWritebackProbeBuffers() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (probe_readback_memory_ != VK_NULL_HANDLE && probe_readback_mapped_ != nullptr) {
+    dfn.vkUnmapMemory(device, probe_readback_memory_);
+  }
+  probe_readback_mapped_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, probe_readback_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, probe_scratch_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, probe_scratch_memory_);
+  probe_readback_size_ = 0;
+  probe_slice_size_ = 0;
+  probe_pending_ = false;
 }
 
 void VulkanRenderTargetCache::EndSubmission() {
@@ -1291,6 +1540,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          if (REXCVAR_GET(wb_probe)) {
+            // Deliberately last: the resolved bytes are in guest memory and the
+            // texture cache has already been invalidated.
+            MaybeRunWritebackProbe(shared_memory, texture_cache,
+                                   resolve_info.copy_dest_extent_start,
+                                   resolve_info.copy_dest_extent_length,
+                                   resolve_info.coordinate_info.width_div_8,
+                                   resolve_info.height_div_8, resolve_info.IsCopyingDepth(),
+                                   draw_resolution_scaled);
+          }
         }
       }
     }

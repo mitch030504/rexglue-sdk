@@ -811,6 +811,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
+  // Development-only identity writeback probe (cvar wb_probe, off by default).
+  // Copies a resolved guest colour range out to a scratch buffer and back twice,
+  // then compares the three snapshots on the CPU after the submission completes.
+  // Only transfer state is touched: no render target, EDRAM ownership, resolve or
+  // render pass state is modified, so a byte-exact copy must leave the frame
+  // structurally identical.
+  void MaybeRunWritebackProbe(VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
+                              uint32_t address, uint32_t length, uint32_t width_div_8,
+                              uint32_t height_div_8, bool is_copying_depth,
+                              bool draw_resolution_scaled);
+  void VerifyWritebackProbe();
+  bool EnsureWritebackProbeBuffers(VkDeviceSize slice_size);
+  void DestroyWritebackProbeBuffers();
+
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
@@ -870,6 +884,31 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // Development-only identity writeback probe (cvar wb_probe).
+  VkBuffer probe_scratch_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory probe_scratch_memory_ = VK_NULL_HANDLE;
+  // Host-visible buffer holding three consecutive snapshots of the same guest
+  // range: before the round trip, after the first copy-back, after the second.
+  VkBuffer probe_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory probe_readback_memory_ = VK_NULL_HANDLE;
+  void* probe_readback_mapped_ = nullptr;
+  VkDeviceSize probe_readback_size_ = 0;
+  VkDeviceSize probe_slice_size_ = 0;
+  // One probe per guest frame, and none while a recorded probe still needs its
+  // CPU-side comparison, so the single readback buffer is never overwritten
+  // before the GPU has finished writing a previous snapshot into it.
+  bool probe_pending_ = false;
+  uint32_t probe_pending_frame_ = 0;
+  uint32_t probe_pending_address_ = 0;
+  uint32_t probe_pending_length_ = 0;
+  uint32_t probe_last_frame_ = UINT32_MAX;
+  uint32_t probe_frames_done_ = 0;
+  // Bounded reporting of colour resolves the extent filter rejected, so a filter
+  // that never matches is visible instead of silent.
+  uint32_t probe_skipped_extent_logs_ = 0;
+  uint32_t probe_skipped_unaligned_logs_ = 0;
+  bool probe_alloc_failed_logged_ = false;
 
   // For pixel (fragment) shader interlock.
 
