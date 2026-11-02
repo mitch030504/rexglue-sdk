@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -23,8 +24,10 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/trace_marker.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -944,9 +947,25 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
-  // skip N 32-bit words to get to the next packet
-  // No-op, ignore some data.
-  reader->AdvanceRead(count * sizeof(uint32_t));
+  if (count == TraceMarker::kWords) {
+    std::array<uint32_t, TraceMarker::kWords> words;
+    for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
+    if (auto marker = TraceMarker::Parse(words)) {
+      if (marker->kind == TraceMarker::kBegin) {
+        trace_marker_active_ = true;
+        trace_marker_frame_ = marker->frame;
+        trace_marker_draw_ = 0;
+      }
+      REXGPU_INFO("engine_trace frame={} kind={} node={:08X} geometry={:08X} draw={}",
+                  marker->frame, uint32_t(marker->kind), marker->node,
+                  marker->geometry, trace_marker_draw_);
+      if (marker->kind == TraceMarker::kEnd && marker->frame == trace_marker_frame_) {
+        trace_marker_active_ = false;
+      }
+    }
+  } else {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+  }
   return true;
 }
 
@@ -968,6 +987,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  if (trace_marker_active_) {
+    REXGPU_WARN("engine_trace frame={} missing end marker; stopping at swap", trace_marker_frame_);
+    trace_marker_active_ = false;
+  }
   SCOPE_profile_cpu_f("gpu");
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -1455,6 +1478,23 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // Skip to the next command, for example, if there are immediate indexes that
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
+
+  if (trace_marker_active_) {
+    REXGPU_INFO("engine_trace frame={} draw={} indices={} vs={:016X} ps={:016X} "
+                "color={:08X} depth={:08X} surface={:08X} depth_control={:08X} "
+                "viewport={:08X},{:08X},{:08X},{:08X}",
+                trace_marker_frame_, trace_marker_draw_++, uint32_t(vgt_draw_initiator.num_indices),
+                active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
+                active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0,
+                register_file_->values[XE_GPU_REG_RB_COLOR_INFO],
+                register_file_->values[XE_GPU_REG_RB_DEPTH_INFO],
+                register_file_->values[XE_GPU_REG_RB_SURFACE_INFO],
+                register_file_->values[XE_GPU_REG_RB_DEPTHCONTROL],
+                register_file_->values[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+                register_file_->values[XE_GPU_REG_PA_CL_VPORT_XOFFSET],
+                register_file_->values[XE_GPU_REG_PA_CL_VPORT_YSCALE],
+                register_file_->values[XE_GPU_REG_PA_CL_VPORT_YOFFSET]);
+  }
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();

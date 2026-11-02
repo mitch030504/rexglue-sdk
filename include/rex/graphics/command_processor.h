@@ -279,6 +279,10 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
 
+  bool trace_marker_active_ = false;
+  uint32_t trace_marker_frame_ = 0;
+  uint32_t trace_marker_draw_ = 0;
+
   bool paused_ = false;
 
   // By default (such as for tools), post-processing is disabled.
