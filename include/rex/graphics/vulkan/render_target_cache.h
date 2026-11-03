@@ -827,6 +827,36 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool EnsureWritebackProbeBuffers(VkDeviceSize slice_size);
   void DestroyWritebackProbeBuffers();
 
+  // Development-only scene depth capture probe (cvar depth_probe, off by default).
+  // depth_probe_source selects the surface; both sources produce the same
+  // 1000x600 float32 layout, so the statistics, the hash and the dump file are
+  // identical in format.
+  // - 0 (default): the guest's own 1000x600 kD24S8 depth resolve. At the depth
+  //   resolve the resolved range is copied out of guest memory into a device
+  //   local staging buffer and then into a host-visible readback buffer, and the
+  //   tiled 32-bit words are detiled and decoded on the CPU. This is the only
+  //   seam that carries scene depth in gameplay: measured, the widest host depth
+  //   render target in a Chapter 1 gameplay frame is 520 px.
+  // - 1: the host depth render target at the colour resolve, read with a compute
+  //   shader (one MSAA sample). Works only where a 1000-pixel-wide depth surface
+  //   exists, such as the hub.
+  // Copy-out only for both: neither source writes the depth image, guest memory
+  // or the EDRAM buffer; the host source restores its usage triple exactly.
+  void MaybeRunDepthProbe(VulkanSharedMemory& shared_memory,
+                          const draw_util::ResolveInfo& resolve_info,
+                          bool draw_resolution_scaled);
+  void VerifyDepthProbe();
+  bool EnsureDepthProbeResources();
+  // Guest source only. Lazily created from the first resolved range and refused
+  // rather than resized if a later range is larger - this runs inside an open
+  // submission, where the queue cannot be drained to replace a buffer safely.
+  bool EnsureDepthProbeGuestBuffers(VkDeviceSize size);
+  void DestroyDepthProbeResources();
+  // host_sample_count_log2 is uint32_t(xenos::MsaaSamples) except for 2x emulated
+  // as 4x, which is 2. Depth cannot be resolved, so sample count is part of the
+  // pipeline key (a non-multisampled image has no sample operand to fetch from).
+  VkPipeline GetDepthProbePipeline(uint32_t host_sample_count_log2);
+
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
@@ -937,6 +967,84 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t probe_skipped_extent_logs_ = 0;
   uint32_t probe_skipped_unaligned_logs_ = 0;
   bool probe_alloc_failed_logged_ = false;
+
+  // Development-only scene depth capture probe (cvar depth_probe).
+  // The depth render target the current frame last drew into. Remembered from
+  // Update() because at the resolve the most recent draw may have had no depth
+  // attachment at all, so the framebuffer's depth pointer says nothing about
+  // which depth image still holds the scene. Nulled whenever render targets are
+  // destroyed - a dangling pointer here would read freed memory.
+  RenderTarget* depth_probe_target_ = nullptr;
+  // Guest frame `depth_probe_target_` was adopted on, so only the first depth
+  // target of a frame is taken. Measured: adopting every update picks up a
+  // later effect pass and reads a cleared surface instead of the scene.
+  uint64_t depth_probe_target_frame_ = UINT64_MAX;
+  // Bounded reporting of every distinct candidate adopted for a frame, so a run
+  // shows how many depth targets a frame really has instead of guessing.
+  uint32_t depth_probe_target_logs_ = 0;
+  // RenderTargetKey::key values already reported, so the inventory is one line per
+  // distinct depth target rather than one per draw.
+  struct DepthProbeCandidateKey {
+    uint32_t key;
+  };
+  DepthProbeCandidateKey depth_probe_candidates_[32] = {};
+  uint32_t depth_probe_candidate_count_ = 0;
+  // Linear float32 scene depth, row stride exactly the width: a pure copy-out of
+  // one MSAA sample, never normalised, never written back. NaN payloads survive
+  // because the shader bitcasts float to uint and the buffer is uint-typed.
+  VkBuffer depth_probe_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory depth_probe_memory_ = VK_NULL_HANDLE;
+  VkBuffer depth_probe_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory depth_probe_readback_memory_ = VK_NULL_HANDLE;
+  void* depth_probe_readback_mapped_ = nullptr;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> depth_probe_descriptor_set_pool_;
+  VkDescriptorSet depth_probe_descriptor_set_ = VK_NULL_HANDLE;
+  // Set 0 - depth destination storage buffer, set 1 - sampled depth image
+  // (the stencil binding of the shared layout is declared but unused),
+  // DepthProbePushConstants passed via push constants.
+  VkPipelineLayout depth_probe_pipeline_layout_ = VK_NULL_HANDLE;
+  std::unordered_map<uint32_t, VkPipeline> depth_probe_pipelines_;
+  // Guest-seam source (depth_probe_source=0): the resolved guest range copied
+  // into a device-local staging buffer and then into a host-visible readback
+  // buffer of the same size, from which the tiled k_24_8 words are detiled.
+  VkBuffer depth_probe_staging_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory depth_probe_staging_memory_ = VK_NULL_HANDLE;
+  VkBuffer depth_probe_guest_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory depth_probe_guest_readback_memory_ = VK_NULL_HANDLE;
+  void* depth_probe_guest_readback_mapped_ = nullptr;
+  VkDeviceSize depth_probe_guest_size_ = 0;
+  // Decoded guest scene depth, in exactly the layout the host source writes, so
+  // the statistics, the hash and the dump file do not depend on the source.
+  std::vector<float> depth_probe_guest_linear_;
+  // Whether the pending capture came from guest memory, and the destination
+  // geometry and endianness needed to detile and decode it.
+  bool depth_probe_pending_guest_ = false;
+  uint32_t depth_probe_pending_pitch_ = 0;
+  uint32_t depth_probe_pending_height_ = 0;
+  uint32_t depth_probe_pending_origin_x_ = 0;
+  uint32_t depth_probe_pending_origin_y_ = 0;
+  uint32_t depth_probe_pending_endian_ = 0;
+  // One-shot reporting of the guest range geometry and of the first decoded raw
+  // words, so a refused range and the actual bit layout are both visible from a
+  // run instead of being silent or assumed.
+  bool depth_probe_guest_range_logged_ = false;
+  bool depth_probe_guest_layout_logged_ = false;
+  // One probe per guest frame, and none while a recorded probe still needs its
+  // CPU-side statistics, so the single readback buffer is never overwritten
+  // before the GPU has finished writing a previous capture into it.
+  bool depth_probe_pending_ = false;
+  uint32_t depth_probe_pending_frame_ = 0;
+  uint32_t depth_probe_last_frame_ = UINT32_MAX;
+  uint32_t depth_probe_frames_done_ = 0;
+  // One-shot reporting so the guessed depth format and each refusal reason are
+  // visible once instead of per frame, and so a probe that never fires is not
+  // silent.
+  bool depth_format_logged_ = false;
+  uint32_t depth_probe_skipped_logs_ = 0;
+  bool depth_probe_alloc_failed_logged_ = false;
+  // Bounded inventory of guest depth resolves, so "depth has no guest-memory
+  // seam" becomes a measured statement rather than an inference.
+  uint32_t depth_resolve_logs_ = 0;
 
   // For pixel (fragment) shader interlock.
 

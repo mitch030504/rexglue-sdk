@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <tuple>
@@ -27,6 +28,7 @@
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -76,6 +78,26 @@ constexpr WritebackProbeColor kWritebackProbeColors[kWritebackProbeColorCount] =
     {{0x40, 0xFF, 0x40, 0xFF}, 0x40FF40, "jade"},
 };
 
+// The scene resolve, in guest pixels. The depth probe always reads exactly this
+// rectangle: the host depth attachment is 1040x1264 and its unused area holds
+// other EDRAM data, so the scene is a crop of the attachment, never a scale, and
+// the output row stride is the scene width so the buffer is trivially readable.
+constexpr uint32_t kDepthProbeWidth = 1000;
+constexpr uint32_t kDepthProbeHeight = 600;
+constexpr uint32_t kDepthProbeRowStride = kDepthProbeWidth;
+constexpr VkDeviceSize kDepthProbeBytes =
+    VkDeviceSize(kDepthProbeWidth) * VkDeviceSize(kDepthProbeHeight) * sizeof(float);
+
+// Matches the push constant block built into the depth probe compute shader.
+struct DepthProbePushConstants {
+  uint32_t width;
+  uint32_t height;
+  uint32_t row_stride;
+  // Host sample index, already converted from the guest index; unused by the
+  // non-multisampled pipeline, which fetches with an explicit LOD 0 instead.
+  uint32_t host_sample_index;
+};
+
 }  // namespace
 
 REXCVAR_DEFINE_BOOL(wb_probe, false, "GPU/Vulkan",
@@ -101,6 +123,44 @@ REXCVAR_DEFINE_INT32(wb_probe_mode, 0, "GPU/Vulkan",
                      "the frame, so the final image shows which resolve of which address the "
                      "composition samples. Deliberately corrupts the frame. Requires wb_probe=true.")
     .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(depth_probe, false, "GPU/Vulkan",
+                    "Development: scene depth capture probe. Reads the 1000x600 scene depth "
+                    "into a linear float32 buffer, copies it to the host and logs statistics, "
+                    "either from the guest's own depth resolve (depth_probe_source=0) or from "
+                    "the host depth render target at the colour resolve (depth_probe_source=1). "
+                    "Proves whether scene depth is readable at a pre-HUD seam. Does not enable "
+                    "neural rendering.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(depth_probe_frame, -1, "GPU/Vulkan",
+                     "Development: first guest frame for the scene depth probe; -1 probes any "
+                     "frame. Stop is bounded by depth_probe_frames.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(depth_probe_frames, 8, "GPU/Vulkan",
+                     "Development: number of guest frames the scene depth probe runs for before "
+                     "it stops on its own, so the log cannot flood.")
+    .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(depth_probe_sample, 0, "GPU/Vulkan",
+                     "Development: guest 2x MSAA sample index the scene depth probe reads (0 or "
+                     "1), converted to the host sample index with the same mapping guest depth "
+                     "copies use. Ignored for 1x depth, where there is only one sample.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(depth_probe_source, 0, "GPU/Vulkan",
+                     "Development: which surface the scene depth probe reads. 0 = the guest's own "
+                     "1000x600 kD24S8 depth resolve, copied out of guest memory at the depth "
+                     "resolve and detiled on the CPU - the only seam that carries scene depth in "
+                     "gameplay, where no 1000-pixel-wide host depth surface exists. 1 = the host "
+                     "depth render target at the colour resolve, which is empty outside frames "
+                     "that have a 1000-pixel-wide depth attachment.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(depth_probe_dump, "", "GPU/Vulkan",
+                      "Development: if non-empty, the scene depth probe writes the raw 1000x600 "
+                      "float32 buffer to <prefix><frame>.bin.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // DEFINE_string(
@@ -1043,6 +1103,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   DestroyAllRenderTargets(true);
 
   DestroyWritebackProbeBuffers();
+  DestroyDepthProbeResources();
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          resolve_fsi_clear_64bpp_pipeline_);
@@ -1173,6 +1234,11 @@ void VulkanRenderTargetCache::ClearCache() {
   }
   render_passes_.clear();
 
+  // The remembered depth target may be deleted by the common ClearCache below, so
+  // forget it before that can happen rather than leave a dangling pointer.
+  depth_probe_target_ = nullptr;
+  depth_probe_target_frame_ = UINT64_MAX;
+
   RenderTargetCache::ClearCache();
 }
 
@@ -1180,6 +1246,7 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
   // The GPU has finished with every snapshot of a recorded probe at this point,
   // so the CPU comparison is both safe and meaningful here and nowhere earlier.
   VerifyWritebackProbe();
+  VerifyDepthProbe();
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -1605,6 +1672,939 @@ void VulkanRenderTargetCache::DestroyWritebackProbeBuffers() {
   probe_pending_ = false;
 }
 
+void VulkanRenderTargetCache::MaybeRunDepthProbe(VulkanSharedMemory& shared_memory,
+                                                const draw_util::ResolveInfo& resolve_info,
+                                                bool draw_resolution_scaled) {
+  const uint32_t frame = uint32_t(command_processor_.GetCurrentFrame());
+  // Bounded, reason-tagged refusal log: a probe that never fires must be
+  // explainable from the log instead of silent. Normal lifecycle stops (frame
+  // window, the per-frame dedupe, the pending readback) are deliberately not
+  // logged - they are the probe working as designed, and logging them would
+  // exhaust the budget before a configuration refusal could be reported.
+  auto skip = [this, frame](const char* reason) {
+    if (depth_probe_skipped_logs_ < 8) {
+      ++depth_probe_skipped_logs_;
+      REXGPU_INFO("depth_probe skip frame={} reason={}", frame, reason);
+    }
+  };
+
+  const int32_t first_frame = REXCVAR_GET(depth_probe_frame);
+
+  if (REXCVAR_GET(depth_probe_source) == 0) {
+    // Guest source: the guest's own depth resolve. Measured in Chapter 1
+    // gameplay, it fires every frame at exactly 1000x600 in kD24S8, and it is
+    // the only surface that carries the scene depth there - the host depth
+    // render targets in the same frames are at most 520 px wide, so the host
+    // path can never see the scene in gameplay.
+    if (!resolve_info.IsCopyingDepth()) {
+      // The normal case for this source: most resolves are colour. Not logged -
+      // the bounded depth_resolve inventory in Resolve already answers whether
+      // the guest issues depth resolves at all.
+      return;
+    }
+    if (draw_resolution_scaled) {
+      // The guest resolves at a scaled extent then, and the detile below is for
+      // an unscaled 1000x600 destination.
+      skip("resolution_scaled");
+      return;
+    }
+    // The scene depth resolve extent, in units of 8 guest pixels - the same
+    // extent the host path filters the colour resolve on.
+    if (resolve_info.coordinate_info.width_div_8 != (kDepthProbeWidth / 8u) ||
+        resolve_info.height_div_8 != (kDepthProbeHeight / 8u)) {
+      skip("extent");
+      return;
+    }
+    // kD24FS8 stores 20e4 at half scale in the same 24 bits, so decoding it as
+    // unorm24 would be silently wrong. Refused until it can be decoded properly,
+    // and the reason names the format so a run says which one was seen.
+    if (xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format) !=
+        xenos::DepthRenderTargetFormat::kD24S8) {
+      skip("depth_format_d24fs8");
+      return;
+    }
+    if (first_frame >= 0) {
+      if (frame < uint32_t(first_frame)) {
+        // Before the requested window - expected, not a refusal.
+        return;
+      }
+      if (frame > uint32_t(first_frame) + 16u) {
+        skip("window_passed");
+        return;
+      }
+    }
+    // One probe per guest frame: the first 1000x600 depth resolve of the frame is
+    // the scene. Later ones are not expected, and a second capture would need a
+    // second range in the staging buffers.
+    if (depth_probe_last_frame_ == frame) {
+      return;
+    }
+    if (depth_probe_frames_done_ >= uint32_t(REXCVAR_GET(depth_probe_frames))) {
+      return;
+    }
+    if (depth_probe_pending_) {
+      // The readback buffer has not been read on the CPU yet; recording another
+      // capture would overwrite it before the GPU finished with it.
+      return;
+    }
+
+    // The destination geometry. The copied range starts at the 32x32 macro tile
+    // that holds the resolve rectangle, not at the rectangle itself, so the pixel
+    // at (x, y) of the rectangle sits at the tiled offset of (origin + x,
+    // origin + y) within the copy.
+    const uint32_t pitch_pixels =
+        resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 *
+        xenos::kTextureTileWidthHeight;
+    const uint32_t height_pixels =
+        resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+    const uint32_t origin_x = resolve_info.copy_dest_coordinate_info.offset_x_div_8
+                              << xenos::kResolveAlignmentPixelsLog2;
+    const uint32_t origin_y = resolve_info.copy_dest_coordinate_info.offset_y_div_8
+                              << xenos::kResolveAlignmentPixelsLog2;
+    if (!pitch_pixels || origin_x + kDepthProbeWidth > pitch_pixels) {
+      skip("destination_pitch");
+      return;
+    }
+    // 2D only: an array destination is addressed with the 3D tiled function, so
+    // the 2D detile below would read the wrong words rather than fail loudly.
+    if (resolve_info.copy_dest_info.copy_dest_array) {
+      skip("destination_array");
+      return;
+    }
+    const VkDeviceSize length = VkDeviceSize(resolve_info.copy_dest_extent_length);
+    // The copy holds whole 32x32 macro tiles of 4-byte words, so the highest byte
+    // the decode can touch is in the macro tile holding the bottom-right pixel.
+    const VkDeviceSize macro_tile_bytes =
+        VkDeviceSize(xenos::kTextureTileWidthHeight) *
+        VkDeviceSize(xenos::kTextureTileWidthHeight) * 4u;
+    const VkDeviceSize last_macro_tile =
+        VkDeviceSize((origin_x + kDepthProbeWidth - 1u) >> xenos::kTextureTileWidthHeightLog2) +
+        VkDeviceSize((origin_y + kDepthProbeHeight - 1u) >> xenos::kTextureTileWidthHeightLog2) *
+            VkDeviceSize(pitch_pixels >> xenos::kTextureTileWidthHeightLog2);
+    const VkDeviceSize required_bytes = (last_macro_tile + 1u) * macro_tile_bytes;
+    // The plane bound is a coarse lower bound on the range a linear reading would
+    // need; the macro bound above is the exact one, because the tiles, not the
+    // 600 visible rows, decide the extent.
+    const VkDeviceSize plane_bytes =
+        VkDeviceSize(pitch_pixels) * VkDeviceSize(height_pixels) * 4u;
+    // One-shot geometry record, before any refusal, so a range that cannot be
+    // captured still says what it was.
+    if (!depth_probe_guest_range_logged_) {
+      depth_probe_guest_range_logged_ = true;
+      REXGPU_INFO(
+          "depth_probe guest_range frame={} addr={:08X} range_bytes={} pitch={} height={} "
+          "origin={},{} endian={} plane={} required={}",
+          frame, resolve_info.copy_dest_extent_start, uint64_t(length), pitch_pixels,
+          height_pixels, origin_x, origin_y,
+          uint32_t(resolve_info.copy_dest_info.copy_dest_endian), uint64_t(plane_bytes),
+          uint64_t(required_bytes));
+    }
+    if (length < required_bytes || length < plane_bytes) {
+      // Never read the tiled offsets against a range that cannot hold them.
+      skip("short_range");
+      return;
+    }
+
+    if (!EnsureDepthProbeGuestBuffers(length)) {
+      if (!depth_probe_alloc_failed_logged_) {
+        depth_probe_alloc_failed_logged_ = true;
+        REXGPU_ERROR(
+            "VulkanRenderTargetCache: guest scene depth probe disabled, buffers unavailable");
+      }
+      return;
+    }
+
+    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+    // The resolve dispatch left the range as a compute write. Transition it for
+    // reading and flush the barrier *before* recording the copy: SubmitBarriers
+    // emits the pending barriers at the current position in the deferred command
+    // stream, so a barrier pushed now and flushed later would land after the copy
+    // it exists to order.
+    shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+    command_processor_.SubmitBarriers(true);
+    VkBufferCopy copy_region = {};
+    copy_region.srcOffset = VkDeviceSize(resolve_info.copy_dest_extent_start);
+    copy_region.dstOffset = 0;
+    copy_region.size = length;
+    command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), depth_probe_staging_buffer_, 1,
+                                   &copy_region);
+    // The staging buffer is written by the copy above and read by the next one.
+    command_processor_.PushBufferMemoryBarrier(
+        depth_probe_staging_buffer_, 0, length, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    command_processor_.SubmitBarriers(true);
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = 0;
+    command_buffer.CmdVkCopyBuffer(depth_probe_staging_buffer_, depth_probe_guest_readback_buffer_,
+                                   1, &copy_region);
+    // Host visibility for the decode in CompletedSubmissionUpdated.
+    command_processor_.PushBufferMemoryBarrier(
+        depth_probe_guest_readback_buffer_, 0, length, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    command_processor_.SubmitBarriers(true);
+
+    // Nothing here writes guest memory or the EDRAM buffer, so
+    // MarkRangeAsResolved and MarkEdramBufferModified must not be called - they
+    // would claim ownership of data this probe never produced.
+    depth_probe_pending_ = true;
+    depth_probe_pending_guest_ = true;
+    depth_probe_pending_frame_ = frame;
+    depth_probe_pending_pitch_ = pitch_pixels;
+    depth_probe_pending_height_ = height_pixels;
+    depth_probe_pending_origin_x_ = origin_x;
+    depth_probe_pending_origin_y_ = origin_y;
+    depth_probe_pending_endian_ = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+    depth_probe_last_frame_ = frame;
+    ++depth_probe_frames_done_;
+    return;
+  }
+
+  // Host source: the colour resolve is the proven pre-HUD instant that still has
+  // the scene depth in a host render target. Only the colour resolve carries the
+  // finished scene there; a depth resolve exists only if the guest asks for one,
+  // and would carry one guest-selected, guest-quantised sample instead.
+  if (resolve_info.IsCopyingDepth()) {
+    skip("copying_depth");
+    return;
+  }
+  if (draw_resolution_scaled) {
+    skip("resolution_scaled");
+    return;
+  }
+  // The scene resolve extent, in units of 8 guest pixels. Anything else is
+  // composition or a different target, not the scene.
+  if (resolve_info.coordinate_info.width_div_8 != (kDepthProbeWidth / 8u) ||
+      resolve_info.height_div_8 != (kDepthProbeHeight / 8u)) {
+    skip("extent");
+    return;
+  }
+  if (!depth_probe_target_) {
+    skip("no_depth_target");
+    return;
+  }
+  if (!depth_probe_target_->key().is_depth) {
+    skip("not_depth_target");
+    return;
+  }
+
+  if (first_frame >= 0) {
+    if (frame < uint32_t(first_frame)) {
+      // Before the requested window - expected, not a refusal.
+      return;
+    }
+    if (frame > uint32_t(first_frame) + 16u) {
+      // The window is bounded in frames as well as in probe count, so a probe
+      // that misses its first frames stops instead of surprising a long session.
+      skip("window_passed");
+      return;
+    }
+  }
+  // One probe per guest frame, and only the first colour resolve of the frame -
+  // later resolves in the same frame are the effects and composition passes.
+  if (depth_probe_last_frame_ == frame) {
+    return;
+  }
+  if (depth_probe_frames_done_ >= uint32_t(REXCVAR_GET(depth_probe_frames))) {
+    return;
+  }
+  if (depth_probe_pending_) {
+    // The single readback buffer has not been read on the CPU yet; recording
+    // another capture would overwrite it before the GPU finished with it.
+    return;
+  }
+
+  auto& depth_rt = *static_cast<VulkanRenderTarget*>(depth_probe_target_);
+  const xenos::MsaaSamples guest_msaa_samples = depth_rt.key().msaa_samples;
+  // The host image's sample count is not the guest's when 2x is emulated as 4x,
+  // and the pipeline is specialised on it: a non-multisampled image needs an
+  // explicit LOD fetch instead of a sample index.
+  uint32_t host_sample_count_log2 = uint32_t(guest_msaa_samples);
+  if (guest_msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+    host_sample_count_log2 = 2;
+  }
+  // Depth cannot be resolved, so one sample must be chosen. Use the same
+  // guest-to-host mapping guest depth copies use, or a silhouette would differ
+  // from what the guest itself would have read.
+  uint32_t host_sample_index = 0;
+  if (guest_msaa_samples == xenos::MsaaSamples::k2X) {
+    host_sample_index = draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+        uint32_t(REXCVAR_GET(depth_probe_sample)), msaa_2x_attachments_supported_);
+  } else if (guest_msaa_samples >= xenos::MsaaSamples::k4X) {
+    host_sample_index = uint32_t(REXCVAR_GET(depth_probe_sample)) & 3u;
+  }
+
+  if (!EnsureDepthProbeResources()) {
+    if (!depth_probe_alloc_failed_logged_) {
+      depth_probe_alloc_failed_logged_ = true;
+      REXGPU_ERROR("VulkanRenderTargetCache: scene depth probe disabled, resources unavailable");
+    }
+    return;
+  }
+  VkPipeline pipeline = GetDepthProbePipeline(host_sample_count_log2);
+  if (pipeline == VK_NULL_HANDLE) {
+    if (!depth_probe_alloc_failed_logged_) {
+      depth_probe_alloc_failed_logged_ = true;
+      REXGPU_ERROR("VulkanRenderTargetCache: scene depth probe disabled, resources unavailable");
+    }
+    return;
+  }
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  VkImage depth_image = depth_rt.image();
+  VkImageSubresourceRange depth_subresource_range = ui::vulkan::util::InitializeSubresourceRange(
+      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+
+  // The state the image is actually in, which is not necessarily the depth-draw
+  // state: another dump may already have left it sampled. Restoring what was
+  // observed is both truthful and the only way the non-interference gate - the
+  // three-tuple equal before and after - can pass on a correct run. Logged before
+  // the entry barrier so a reader can compare it with the after line.
+  const VkPipelineStageFlags depth_stage_mask_before = depth_rt.current_stage_mask();
+  const VkAccessFlags depth_access_mask_before = depth_rt.current_access_mask();
+  const VkImageLayout depth_layout_before = depth_rt.current_layout();
+  REXGPU_INFO("depth_rt state=before frame={} stage=0x{:08X} access=0x{:08X} layout={}", frame,
+              uint32_t(depth_stage_mask_before), uint32_t(depth_access_mask_before),
+              uint32_t(depth_layout_before));
+
+  // Read-only transition for the compute fetch. The triple must be recorded here
+  // as well as in the barrier because Update() builds the next draw's barrier from
+  // current_*, so leaving a stale triple would corrupt ownership bookkeeping.
+  command_processor_.PushImageMemoryBarrier(
+      depth_image, depth_subresource_range, depth_stage_mask_before,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, depth_access_mask_before, VK_ACCESS_SHADER_READ_BIT,
+      depth_layout_before, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  depth_rt.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+
+  command_processor_.BindExternalComputePipeline(pipeline);
+  VkDescriptorSet descriptor_sets[2] = {depth_probe_descriptor_set_,
+                                        depth_rt.GetDescriptorSetTransferSource()};
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         depth_probe_pipeline_layout_, 0, 2, descriptor_sets, 0,
+                                         nullptr);
+  DepthProbePushConstants push_constants;
+  push_constants.width = kDepthProbeWidth;
+  push_constants.height = kDepthProbeHeight;
+  push_constants.row_stride = kDepthProbeRowStride;
+  push_constants.host_sample_index = host_sample_index;
+  command_buffer.CmdVkPushConstants(depth_probe_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                    sizeof(push_constants), &push_constants);
+
+  command_buffer.CmdVkDispatch((kDepthProbeWidth + 7u) / 8u, (kDepthProbeHeight + 7u) / 8u, 1);
+
+  // Restore exactly the triple observed before the entry barrier - not
+  // unconditionally the draw triple, which would claim a state the image may not
+  // have had and would make the before/after non-interference check fail. The
+  // depth image is never written, so this is the only thing the probe changes.
+  command_processor_.PushImageMemoryBarrier(
+      depth_image, depth_subresource_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      depth_stage_mask_before, VK_ACCESS_SHADER_READ_BIT, depth_access_mask_before,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, depth_layout_before);
+  depth_rt.SetUsage(depth_stage_mask_before, depth_access_mask_before, depth_layout_before);
+  REXGPU_INFO("depth_rt state=after frame={} stage=0x{:08X} access=0x{:08X} layout={}", frame,
+              uint32_t(depth_rt.current_stage_mask()), uint32_t(depth_rt.current_access_mask()),
+              uint32_t(depth_rt.current_layout()));
+
+  // Copy out to the host-visible buffer. Nothing here writes the depth image,
+  // touches guest memory or the EDRAM buffer, so MarkEdramBufferModified must not
+  // be called - that would claim ownership of data this probe never produced.
+  command_processor_.PushBufferMemoryBarrier(
+      depth_probe_buffer_, 0, kDepthProbeBytes, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  // Flush here, before the copy is recorded: SubmitBarriers emits the pending
+  // barriers at the current position in the deferred command stream, so a barrier
+  // pushed now and flushed later would land *after* the copy it exists to order.
+  // This also emits the image restore above, keeping it after the dispatch.
+  command_processor_.SubmitBarriers(true);
+  VkBufferCopy copy_region = {};
+  copy_region.size = kDepthProbeBytes;
+  command_buffer.CmdVkCopyBuffer(depth_probe_buffer_, depth_probe_readback_buffer_, 1,
+                                 &copy_region);
+  command_processor_.PushBufferMemoryBarrier(
+      depth_probe_readback_buffer_, 0, kDepthProbeBytes, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+
+  depth_probe_pending_ = true;
+  depth_probe_pending_guest_ = false;
+  depth_probe_pending_frame_ = frame;
+  depth_probe_last_frame_ = frame;
+  ++depth_probe_frames_done_;
+}
+
+void VulkanRenderTargetCache::VerifyDepthProbe() {
+  if (!depth_probe_pending_) {
+    return;
+  }
+  depth_probe_pending_ = false;
+  const bool guest_source = depth_probe_pending_guest_;
+  depth_probe_pending_guest_ = false;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // The GPU wrote one of these buffers, so the host copy is only valid after
+  // invalidation. readback_bytes is what is decoded, hashed and dumped: the host
+  // source's compute output, or the guest source's detiled float32.
+  VkMappedMemoryRange mapped_range = {};
+  mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  mapped_range.offset = 0;
+  mapped_range.size = VK_WHOLE_SIZE;
+  const void* readback_bytes = nullptr;
+  if (guest_source) {
+    if (depth_probe_guest_readback_buffer_ == VK_NULL_HANDLE ||
+        depth_probe_guest_readback_mapped_ == nullptr) {
+      return;
+    }
+    mapped_range.memory = depth_probe_guest_readback_memory_;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+
+    const size_t pixel_count = size_t(kDepthProbeWidth) * size_t(kDepthProbeHeight);
+    if (depth_probe_guest_linear_.size() != pixel_count) {
+      depth_probe_guest_linear_.assign(pixel_count, 0.0f);
+    }
+    const uint32_t pitch = depth_probe_pending_pitch_;
+    const uint32_t endian = depth_probe_pending_endian_;
+    const uint32_t origin_x = depth_probe_pending_origin_x_;
+    const uint32_t origin_y = depth_probe_pending_origin_y_;
+    const uint8_t* const tiled =
+        reinterpret_cast<const uint8_t*>(depth_probe_guest_readback_mapped_);
+    // Undo the destination endianness the resolve copy applied to the EDRAM word.
+    // These are the same two transforms as resolve_fast_32bpp_1x2xmsaa: 8-in-16
+    // swaps the bytes inside each 16-bit half, 16-in-32 swaps the halves, and
+    // 8-in-32 does both. Every one is an involution, so applying it again undoes
+    // it. The guest depth word itself carries the 24-bit unorm depth in bits
+    // 8:31 and the stencil in bits 0:7 - the depth is *not* the low 24 bits, so
+    // the stencil byte must not be mistaken for depth.
+    auto undo_endian = [endian](uint32_t word) {
+      if (endian == uint32_t(xenos::Endian::k8in16) ||
+          endian == uint32_t(xenos::Endian::k8in32)) {
+        word = ((word & UINT32_C(0x00FF00FF)) << 8) | ((word & UINT32_C(0xFF00FF00)) >> 8);
+      }
+      if (endian == uint32_t(xenos::Endian::k8in32) ||
+          endian == uint32_t(xenos::Endian::k16in32)) {
+        word = (word << 16) | (word >> 16);
+      }
+      return word;
+    };
+    // bpp log2 2: one 32-bit word per pixel. The captured range was bounded by
+    // its own macro-tile count, so every tiled offset below is inside the copy.
+    for (uint32_t y = 0; y < kDepthProbeHeight; ++y) {
+      for (uint32_t x = 0; x < kDepthProbeWidth; ++x) {
+        const int32_t tiled_offset = texture_util::GetTiledOffset2D(
+            int32_t(origin_x + x), int32_t(origin_y + y), pitch, 2);
+        uint32_t word;
+        std::memcpy(&word, tiled + tiled_offset, sizeof(word));
+        // Never normalise: the guest's quantised nonlinear depth is the payload,
+        // and 1.0 is "nothing drawn", exactly as on the host path. The row stride
+        // is the same as the host source's, so the dump and the hash match in
+        // format.
+        depth_probe_guest_linear_[size_t(y) * size_t(kDepthProbeRowStride) + size_t(x)] =
+            float((undo_endian(word) >> 8) & UINT32_C(0xFFFFFF)) / float(0xFFFFFF);
+      }
+    }
+    // One-shot record of the first words and their decoded depth, so the layout
+    // is confirmable from a run instead of argued in a comment: the resolve copy
+    // keeps the EDRAM word bit for bit, and the EDRAM word holds the 24-bit unorm
+    // depth in bits 8:31 with the stencil in bits 0:7.
+    if (!depth_probe_guest_layout_logged_) {
+      depth_probe_guest_layout_logged_ = true;
+      uint32_t words[3] = {};
+      constexpr uint32_t kSampleX[3] = {0, 1, 0};
+      constexpr uint32_t kSampleY[3] = {0, 0, 1};
+      for (uint32_t i = 0; i < 3; ++i) {
+        const int32_t tiled_offset = texture_util::GetTiledOffset2D(
+            int32_t(origin_x + kSampleX[i]), int32_t(origin_y + kSampleY[i]), pitch, 2);
+        std::memcpy(&words[i], tiled + tiled_offset, sizeof(uint32_t));
+        words[i] = undo_endian(words[i]);
+      }
+      REXGPU_INFO(
+          "depth_probe guest_layout frame={} endian={} pitch={} height={} origin={},{} "
+          "word00={:08X} depth00={} word10={:08X} depth10={} word01={:08X} depth01={}",
+          depth_probe_pending_frame_, endian, pitch, depth_probe_pending_height_, origin_x,
+          origin_y, words[0], words[0] >> 8, words[1], words[1] >> 8, words[2], words[2] >> 8);
+    }
+    readback_bytes = depth_probe_guest_linear_.data();
+  } else {
+    if (depth_probe_readback_buffer_ == VK_NULL_HANDLE ||
+        depth_probe_readback_mapped_ == nullptr) {
+      return;
+    }
+    mapped_range.memory = depth_probe_readback_memory_;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+    readback_bytes = depth_probe_readback_mapped_;
+  }
+
+  const float* const depth = reinterpret_cast<const float*>(readback_bytes);
+  const size_t pixel_count = size_t(kDepthProbeWidth) * size_t(kDepthProbeHeight);
+  // 1.0 means "nothing drawn" on this path (LESS only fills where nothing nearer
+  // exists), so it is counted separately from "< 1.0": that is what distinguishes
+  // an all-background test frame from a scene, and what a consumer must not
+  // threshold away.
+  uint64_t undrawn = 0;
+  uint64_t below_one = 0;
+  uint64_t below_095 = 0;
+  uint64_t not_finite = 0;
+  double sum = 0.0;
+  float min_depth = 0.0f;
+  float max_depth = 0.0f;
+  bool have_finite = false;
+  for (size_t i = 0; i < pixel_count; ++i) {
+    const float value = depth[i];
+    if (!std::isfinite(value)) {
+      ++not_finite;
+      continue;
+    }
+    if (!have_finite) {
+      min_depth = value;
+      max_depth = value;
+      have_finite = true;
+    } else {
+      min_depth = std::min(min_depth, value);
+      max_depth = std::max(max_depth, value);
+    }
+    sum += double(value);
+    if (value == 1.0f) {
+      ++undrawn;
+    }
+    if (value < 1.0f) {
+      ++below_one;
+    }
+    if (value < 0.95f) {
+      ++below_095;
+    }
+  }
+  const double mean = pixel_count ? sum / double(pixel_count) : 0.0;
+  if (guest_source) {
+    // Same fields as the host path, same order, plus the source tag and the
+    // destination geometry so a summary grep can tell the two apart.
+    REXGPU_INFO(
+        "depth_probe frame={} bytes={} min={:.6f} max={:.6f} mean={:.6f} below1={} below095={} "
+        "undrawn={} nan={} hash={:016X} source=guest_resolve pitch={} height={}",
+        depth_probe_pending_frame_, uint64_t(kDepthProbeBytes), min_depth, max_depth, mean,
+        below_one, below_095, undrawn, not_finite, XXH3_64bits(readback_bytes, kDepthProbeBytes),
+        depth_probe_pending_pitch_, depth_probe_pending_height_);
+  } else {
+    REXGPU_INFO(
+        "depth_probe frame={} bytes={} min={:.6f} max={:.6f} mean={:.6f} below1={} below095={} "
+        "undrawn={} nan={} hash={:016X}",
+        depth_probe_pending_frame_, uint64_t(kDepthProbeBytes), min_depth, max_depth, mean,
+        below_one, below_095, undrawn, not_finite, XXH3_64bits(readback_bytes, kDepthProbeBytes));
+  }
+
+  // Raw dump, no header and no conversion: the bytes are exactly the float32
+  // values that were hashed above, so an offline check can be byte-exact.
+  const std::string dump_prefix = REXCVAR_GET(depth_probe_dump);
+  if (!dump_prefix.empty()) {
+    std::string dump_path = dump_prefix;
+    dump_path += std::to_string(depth_probe_pending_frame_);
+    dump_path += ".bin";
+    std::FILE* const dump_file = std::fopen(dump_path.c_str(), "wb");
+    if (!dump_file) {
+      REXGPU_WARN("depth_probe: can't write {}", dump_path);
+    } else {
+      const size_t written = std::fwrite(depth, 1, size_t(kDepthProbeBytes), dump_file);
+      std::fclose(dump_file);
+      if (written != size_t(kDepthProbeBytes)) {
+        REXGPU_WARN("depth_probe: short write {} of {} bytes to {}", written,
+                    uint64_t(kDepthProbeBytes), dump_path);
+      } else {
+        REXGPU_INFO("depth_probe dump frame={} path={}", depth_probe_pending_frame_, dump_path);
+      }
+    }
+  }
+}
+
+bool VulkanRenderTargetCache::EnsureDepthProbeResources() {
+  if (depth_probe_buffer_ != VK_NULL_HANDLE && depth_probe_readback_buffer_ != VK_NULL_HANDLE &&
+      depth_probe_readback_mapped_ != nullptr &&
+      depth_probe_descriptor_set_ != VK_NULL_HANDLE &&
+      depth_probe_pipeline_layout_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  // A failed allocation is not retried: 2.4 MB either exists or the device cannot
+  // support the probe, and retrying inside every subsequent resolve would churn
+  // the allocator for no benefit.
+  if (depth_probe_alloc_failed_logged_ || depth_probe_pending_) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // The destination is linear float32 with the scene width as its stride, so it
+  // can be read by index without knowing anything about tiling or EDRAM.
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, kDepthProbeBytes,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, depth_probe_buffer_,
+          depth_probe_memory_)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the scene depth probe buffer");
+    DestroyDepthProbeResources();
+    return false;
+  }
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, kDepthProbeBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, depth_probe_readback_buffer_,
+          depth_probe_readback_memory_)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the scene depth probe readback buffer");
+    DestroyDepthProbeResources();
+    return false;
+  }
+  if (dfn.vkMapMemory(device, depth_probe_readback_memory_, 0, VK_WHOLE_SIZE, 0,
+                      &depth_probe_readback_mapped_) != VK_SUCCESS) {
+    depth_probe_readback_mapped_ = nullptr;
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to map the scene depth probe readback buffer");
+    DestroyDepthProbeResources();
+    return false;
+  }
+
+  // Set 0: the destination storage buffer, written and never read by the shader.
+  VkDescriptorPoolSize descriptor_pool_size;
+  descriptor_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  descriptor_pool_size.descriptorCount = 1;
+  depth_probe_descriptor_set_pool_ = std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+      vulkan_device, 1, 1, &descriptor_pool_size, descriptor_set_layout_storage_buffer_);
+  const size_t descriptor_set_index = depth_probe_descriptor_set_pool_->Allocate();
+  if (descriptor_set_index == SIZE_MAX) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to allocate the scene depth probe descriptor set");
+    DestroyDepthProbeResources();
+    return false;
+  }
+  depth_probe_descriptor_set_ = depth_probe_descriptor_set_pool_->Get(descriptor_set_index);
+  VkDescriptorBufferInfo descriptor_buffer_info = {};
+  descriptor_buffer_info.buffer = depth_probe_buffer_;
+  descriptor_buffer_info.offset = 0;
+  descriptor_buffer_info.range = kDepthProbeBytes;
+  VkWriteDescriptorSet descriptor_write = {};
+  descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptor_write.pNext = nullptr;
+  descriptor_write.dstSet = depth_probe_descriptor_set_;
+  descriptor_write.dstBinding = 0;
+  descriptor_write.dstArrayElement = 0;
+  descriptor_write.descriptorCount = 1;
+  descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  descriptor_write.pImageInfo = nullptr;
+  descriptor_write.pBufferInfo = &descriptor_buffer_info;
+  descriptor_write.pTexelBufferView = nullptr;
+  dfn.vkUpdateDescriptorSets(device, 1, &descriptor_write, 0, nullptr);
+
+  // Set 0 - destination buffer, set 1 - the sampled depth image (the shared
+  // layout's stencil binding is declared but unused), plus the four-uint push
+  // constant block that carries the extent and the host sample index.
+  VkDescriptorSetLayout descriptor_set_layouts[2] = {descriptor_set_layout_storage_buffer_,
+                                                     descriptor_set_layout_sampled_image_x2_};
+  VkPushConstantRange push_constant_range;
+  push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push_constant_range.offset = 0;
+  push_constant_range.size = sizeof(DepthProbePushConstants);
+  VkPipelineLayoutCreateInfo pipeline_layout_create_info;
+  pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_create_info.pNext = nullptr;
+  pipeline_layout_create_info.flags = 0;
+  pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
+  pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
+  pipeline_layout_create_info.pushConstantRangeCount = 1;
+  pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
+                                 &depth_probe_pipeline_layout_) != VK_SUCCESS) {
+    depth_probe_pipeline_layout_ = VK_NULL_HANDLE;
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the scene depth probe pipeline layout");
+    DestroyDepthProbeResources();
+    return false;
+  }
+  return true;
+}
+
+bool VulkanRenderTargetCache::EnsureDepthProbeGuestBuffers(VkDeviceSize size) {
+  if (depth_probe_staging_buffer_ != VK_NULL_HANDLE &&
+      depth_probe_guest_readback_buffer_ != VK_NULL_HANDLE &&
+      depth_probe_guest_readback_mapped_ != nullptr && depth_probe_guest_size_ >= size) {
+    return true;
+  }
+  if (depth_probe_pending_) {
+    return false;
+  }
+  // A failed allocation is not retried: the range either fits or the device
+  // cannot support the probe, and retrying inside every subsequent resolve would
+  // churn the allocator for no benefit.
+  if (depth_probe_alloc_failed_logged_) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Created once, for the first resolved range. A later, larger range is refused
+  // rather than resized: this runs inside an open submission, where the queue
+  // cannot be drained to replace a buffer safely.
+  if (depth_probe_staging_buffer_ != VK_NULL_HANDLE ||
+      depth_probe_guest_readback_buffer_ != VK_NULL_HANDLE) {
+    return false;
+  }
+  // Device-local first hop: the resolve leaves the range in the shared memory
+  // buffer, and this copy is a plain transfer of the tiled guest bytes.
+  VkBuffer staging_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size,
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, staging_buffer, staging_memory)) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the guest depth probe staging buffer");
+    return false;
+  }
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory)) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: failed to create the guest depth probe readback buffer");
+    dfn.vkDestroyBuffer(device, staging_buffer, nullptr);
+    dfn.vkFreeMemory(device, staging_memory, nullptr);
+    return false;
+  }
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to map the guest depth probe readback buffer");
+    dfn.vkDestroyBuffer(device, staging_buffer, nullptr);
+    dfn.vkFreeMemory(device, staging_memory, nullptr);
+    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+    dfn.vkFreeMemory(device, readback_memory, nullptr);
+    return false;
+  }
+  depth_probe_staging_buffer_ = staging_buffer;
+  depth_probe_staging_memory_ = staging_memory;
+  depth_probe_guest_readback_buffer_ = readback_buffer;
+  depth_probe_guest_readback_memory_ = readback_memory;
+  depth_probe_guest_readback_mapped_ = mapped;
+  depth_probe_guest_size_ = size;
+  return true;
+}
+
+void VulkanRenderTargetCache::DestroyDepthProbeResources() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (depth_probe_readback_memory_ != VK_NULL_HANDLE &&
+      depth_probe_readback_mapped_ != nullptr) {
+    dfn.vkUnmapMemory(device, depth_probe_readback_memory_);
+  }
+  depth_probe_readback_mapped_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         depth_probe_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         depth_probe_readback_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, depth_probe_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_probe_memory_);
+  // Guest-seam source buffers, if that source was ever captured.
+  if (depth_probe_guest_readback_memory_ != VK_NULL_HANDLE &&
+      depth_probe_guest_readback_mapped_ != nullptr) {
+    dfn.vkUnmapMemory(device, depth_probe_guest_readback_memory_);
+  }
+  depth_probe_guest_readback_mapped_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         depth_probe_guest_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         depth_probe_guest_readback_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         depth_probe_staging_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_probe_staging_memory_);
+  depth_probe_guest_size_ = 0;
+  depth_probe_pending_guest_ = false;
+  for (const auto& depth_probe_pipeline_pair : depth_probe_pipelines_) {
+    // May be null to prevent recreation attempts, like the dump pipelines.
+    if (depth_probe_pipeline_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, depth_probe_pipeline_pair.second, nullptr);
+    }
+  }
+  depth_probe_pipelines_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         depth_probe_pipeline_layout_);
+  depth_probe_descriptor_set_ = VK_NULL_HANDLE;
+  depth_probe_descriptor_set_pool_.reset();
+  depth_probe_pending_ = false;
+  // The target may have been deleted by DestroyAllRenderTargets or ClearCache.
+  depth_probe_target_ = nullptr;
+  depth_probe_target_frame_ = UINT64_MAX;
+}
+
+VkPipeline VulkanRenderTargetCache::GetDepthProbePipeline(uint32_t host_sample_count_log2) {
+  auto pipeline_it = depth_probe_pipelines_.find(host_sample_count_log2);
+  if (pipeline_it != depth_probe_pipelines_.end()) {
+    return pipeline_it->second;
+  }
+  if (depth_probe_pipeline_layout_ == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  const bool source_is_multisampled = host_sample_count_log2 != 0;
+
+  std::vector<spv::Id> id_vector_temp;
+
+  SpirvBuilder builder(spv::Spv_1_0, (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1, nullptr);
+  builder.addCapability(spv::CapabilityShader);
+  builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  builder.setSource(spv::SourceLanguageUnknown, 0);
+
+  spv::Id type_void = builder.makeVoidType();
+  spv::Id type_bool = builder.makeBoolType();
+  spv::Id type_int = builder.makeIntType(32);
+  spv::Id type_int2 = builder.makeVectorType(type_int, 2);
+  spv::Id type_uint = builder.makeUintType(32);
+  spv::Id type_uint3 = builder.makeVectorType(type_uint, 3);
+  spv::Id type_float = builder.makeFloatType(32);
+
+  // Set 0, binding 0: the linear float32 destination, typed as uint and written
+  // through a bitcast so the exact bits - including NaN payloads - survive. No
+  // normalization anywhere: the guest's nonlinear depth is the payload.
+  id_vector_temp.clear();
+  id_vector_temp.push_back(builder.makeRuntimeArray(type_uint));
+  builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride, sizeof(uint32_t));
+  spv::Id type_dest = builder.makeStructType(id_vector_temp, "XeDepthProbeDest");
+  builder.addMemberName(type_dest, 0, "depth");
+  builder.addMemberDecoration(type_dest, 0, spv::DecorationNonReadable);
+  builder.addMemberDecoration(type_dest, 0, spv::DecorationOffset, 0);
+  // Block since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's BufferBlock.
+  builder.addDecoration(type_dest, spv::DecorationBufferBlock);
+  // StorageBuffer since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
+  // Uniform.
+  spv::Id dest_buffer = builder.createVariable(spv::NoPrecision, spv::StorageClassUniform, type_dest,
+                                               "xe_depth_probe_dest");
+  builder.addDecoration(dest_buffer, spv::DecorationDescriptorSet, 0);
+  builder.addDecoration(dest_buffer, spv::DecorationBinding, 0);
+
+  // Set 1, binding 0: the depth source, depth aspect only. The stencil binding of
+  // the shared two-image layout is deliberately not declared - a shader may use a
+  // subset of a compatible layout - and is never read.
+  spv::Id source_texture = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassUniformConstant,
+      builder.makeImageType(type_float, spv::Dim2D, false, false, source_is_multisampled, 1,
+                            spv::ImageFormatUnknown),
+      "xe_depth_probe_source");
+  builder.addDecoration(source_texture, spv::DecorationDescriptorSet, 1);
+  builder.addDecoration(source_texture, spv::DecorationBinding, 0);
+
+  // Push constants, four uints, matching DepthProbePushConstants.
+  id_vector_temp.clear();
+  for (uint32_t i = 0; i < 4; ++i) {
+    id_vector_temp.push_back(type_uint);
+  }
+  spv::Id type_push_constants = builder.makeStructType(id_vector_temp, "XeDepthProbePushConstants");
+  builder.addMemberName(type_push_constants, 0, "width");
+  builder.addMemberDecoration(type_push_constants, 0, spv::DecorationOffset, 0);
+  builder.addMemberName(type_push_constants, 1, "height");
+  builder.addMemberDecoration(type_push_constants, 1, spv::DecorationOffset, int(sizeof(uint32_t)));
+  builder.addMemberName(type_push_constants, 2, "row_stride");
+  builder.addMemberDecoration(type_push_constants, 2, spv::DecorationOffset,
+                              int(sizeof(uint32_t) * 2));
+  builder.addMemberName(type_push_constants, 3, "host_sample_index");
+  builder.addMemberDecoration(type_push_constants, 3, spv::DecorationOffset,
+                              int(sizeof(uint32_t) * 3));
+  builder.addDecoration(type_push_constants, spv::DecorationBlock);
+  spv::Id push_constants = builder.createVariable(spv::NoPrecision, spv::StorageClassPushConstant,
+                                                  type_push_constants,
+                                                  "xe_depth_probe_push_constants");
+
+  // gl_GlobalInvocationID input.
+  spv::Id input_global_invocation_id = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassInput, type_uint3, "gl_GlobalInvocationID");
+  builder.addDecoration(input_global_invocation_id, spv::DecorationBuiltIn,
+                        spv::BuiltInGlobalInvocationId);
+
+  // Begin the main function.
+  std::vector<spv::Id> main_param_types;
+  std::vector<std::vector<spv::Decoration>> main_precisions;
+  spv::Block* main_entry;
+  spv::Function* main_function = builder.makeFunctionEntry(
+      spv::NoPrecision, type_void, "main", main_param_types, main_precisions, &main_entry);
+
+  auto LoadPushConstant = [&](uint32_t member_index) -> spv::Id {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(int32_t(member_index)));
+    return builder.createLoad(
+        builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
+        spv::NoPrecision);
+  };
+
+  spv::Id global_invocation_id = builder.createLoad(input_global_invocation_id, spv::NoPrecision);
+  spv::Id invocation_x = builder.createCompositeExtract(global_invocation_id, type_uint, 0);
+  spv::Id invocation_y = builder.createCompositeExtract(global_invocation_id, type_uint, 1);
+  spv::Id push_width = LoadPushConstant(0);
+  spv::Id push_height = LoadPushConstant(1);
+  spv::Id push_row_stride = LoadPushConstant(2);
+  spv::Id push_host_sample_index = LoadPushConstant(3);
+
+  // The dispatch is rounded up to whole 8x8 tiles, so invocations past the scene
+  // rectangle must not write: the buffer is exactly the extent, not padded.
+  SpirvBuilder::IfBuilder in_bounds_if(
+      builder.createBinOp(
+          spv::OpLogicalAnd, type_bool,
+          builder.createBinOp(spv::OpULessThan, type_bool, invocation_x, push_width),
+          builder.createBinOp(spv::OpULessThan, type_bool, invocation_y, push_height)),
+      spv::SelectionControlMaskNone, builder);
+
+  spv::Builder::TextureParameters source_texture_parameters = {};
+  source_texture_parameters.sampler = builder.createLoad(source_texture, spv::NoPrecision);
+  id_vector_temp.clear();
+  id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, invocation_x));
+  id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, invocation_y));
+  source_texture_parameters.coords = builder.createCompositeConstruct(type_int2, id_vector_temp);
+  if (source_is_multisampled) {
+    // Explicit sample operand: depth cannot be resolved, so one sample is picked
+    // (already mapped from the guest index on the CPU) and read exactly.
+    source_texture_parameters.sample =
+        builder.createUnaryOp(spv::OpBitcast, type_int, push_host_sample_index);
+  } else {
+    // A non-multisampled image has no sample operand at all; only one LOD exists.
+    source_texture_parameters.lod = builder.makeIntConstant(0);
+  }
+  spv::Id source_vec4 = builder.createTextureCall(
+      spv::NoPrecision, builder.makeVectorType(type_float, 4), false, true, false, false, false,
+      source_texture_parameters, spv::ImageOperandsMaskNone);
+  // Component 0 of the depth aspect is the depth value; the stencil aspect is a
+  // separate view and is not touched.
+  spv::Id depth_value = builder.createCompositeExtract(source_vec4, type_float, 0);
+  spv::Id depth_bits = builder.createUnaryOp(spv::OpBitcast, type_uint, depth_value);
+  spv::Id dest_index = builder.createBinOp(
+      spv::OpIAdd, type_uint,
+      builder.createBinOp(spv::OpIMul, type_uint, invocation_y, push_row_stride), invocation_x);
+  id_vector_temp.clear();
+  // The only SSBO structure member.
+  id_vector_temp.push_back(builder.makeIntConstant(0));
+  id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, dest_index));
+  // StorageBuffer since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
+  // Uniform.
+  builder.createStore(depth_bits, builder.createAccessChain(spv::StorageClassUniform, dest_buffer,
+                                                            id_vector_temp));
+  in_bounds_if.makeEndIf();
+
+  // End the main function and make it the entry point.
+  builder.leaveFunction();
+  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize, 8, 8, 1);
+  spv::Instruction* entry_point =
+      builder.addEntryPoint(spv::ExecutionModelGLCompute, main_function, "main");
+  // Bindings only need to be added to the entry point's interface starting with
+  // SPIR-V 1.4 - emitting 1.0 here, so only inputs / outputs.
+  entry_point->addIdOperand(input_global_invocation_id);
+
+  // Serialize the shader code.
+  std::vector<unsigned int> shader_code;
+  builder.dump(shader_code);
+
+  // Create the pipeline, and store the handle even if creation fails not to try
+  // to create it again later.
+  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), depth_probe_pipeline_layout_,
+      reinterpret_cast<const uint32_t*>(shader_code.data()), sizeof(uint32_t) * shader_code.size());
+  if (pipeline == VK_NULL_HANDLE) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: Failed to create the scene depth probe pipeline for "
+        "{}-sample depth",
+        UINT32_C(1) << host_sample_count_log2);
+  }
+  depth_probe_pipelines_.emplace(host_sample_count_log2, pipeline);
+  return pipeline;
+}
+
 void VulkanRenderTargetCache::EndSubmission() {
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->FlushWrites();
@@ -1630,6 +2630,38 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
+  }
+
+  // Bounded inventory of guest depth resolves. The colour probe is blind to depth
+  // by construction, so without this line "no guest depth seam" would be an
+  // inference from the absence of a log that can never fire. Bounded to 32 so a
+  // per-frame depth copy cannot flood the log.
+  //
+  // Scoped to the probe window when one is set: depth is resolved on every frame
+  // from boot, so a global 32-line budget would be spent in the hub and prove
+  // nothing about the scene the rest of the probe is measuring.
+  const int32_t depth_resolve_window_frame = REXCVAR_GET(depth_probe_frame);
+  const uint64_t depth_resolve_frame = command_processor_.GetCurrentFrame();
+  const bool depth_resolve_in_window =
+      depth_resolve_window_frame < 0 ||
+      (depth_resolve_frame >= uint64_t(depth_resolve_window_frame) &&
+       depth_resolve_frame <= uint64_t(depth_resolve_window_frame) + 16u);
+  if (REXCVAR_GET(depth_probe) && resolve_info.IsCopyingDepth() && depth_resolve_in_window &&
+      depth_resolve_logs_ < 32) {
+    ++depth_resolve_logs_;
+    REXGPU_INFO(
+        "depth_resolve frame={} extent={}x{} bytes={} guest_fmt={} msaa={} copy_sample={} "
+        "addr={:08X} clearing_depth={}",
+        uint32_t(depth_resolve_frame), resolve_info.coordinate_info.width_div_8 * 8u,
+        resolve_info.height_div_8 * 8u,
+        resolve_info.copy_dest_extent_length,
+        xenos::GetDepthRenderTargetFormatName(
+            xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format)),
+        uint32_t(resolve_info.depth_edram_info.msaa_samples),
+        uint32_t(draw_util::SanitizeCopySampleSelect(
+            resolve_info.copy_dest_coordinate_info.copy_sample_select,
+            resolve_info.depth_edram_info.msaa_samples, true)),
+        resolve_info.copy_dest_extent_start, resolve_info.IsClearingDepth() ? 1 : 0);
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -1789,6 +2821,14 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                    draw_resolution_scaled,
                                    resolve_info.copy_dest_info.copy_dest_format);
           }
+          if (REXCVAR_GET(depth_probe)) {
+            // The colour resolve is the proven pre-HUD instant: the scene is
+            // complete and the HUD is drawn into guest memory afterwards, so the
+            // depth attachment still holds the scene here. The guest depth
+            // resolve, the other source, is captured here as well because this
+            // is the seam where the resolve copy has just written guest memory.
+            MaybeRunDepthProbe(shared_memory, resolve_info, draw_resolution_scaled);
+          }
         }
       }
     }
@@ -1894,6 +2934,78 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
+
+      // Remember the depth render target this frame drew into. The colour resolve
+      // cannot find it from its own attachments - the composition quads bind no
+      // depth - so without this the probe would read whichever depth image the
+      // last draw happened to use, or none. Only the host source needs it; the
+      // guest source reads the guest's own resolve and never opens the cache.
+      //
+      // A frame has several depth targets of different sizes. The scene one is the
+      // widest, so the widest seen so far in the frame wins; "first come" instead
+      // picked a 7-tile (280 px) effect target and produced a cleared vertical
+      // split at x=270 rather than a scene.
+      if (REXCVAR_GET(depth_probe) && REXCVAR_GET(depth_probe_source) == 1) {
+        const uint64_t update_frame = command_processor_.GetCurrentFrame();
+        if (depth_probe_target_frame_ != update_frame) {
+          // Re-evaluate on the first update of every frame: the previous frame's
+          // pointer is not evidence about this one.
+          depth_probe_target_frame_ = update_frame;
+          depth_probe_target_ = nullptr;
+        }
+        RenderTarget* const candidate = depth_and_color_render_targets[0];
+        if (candidate) {
+          const RenderTargetKey& candidate_key = candidate->key();
+          if (candidate_key.is_depth) {
+            // Pitch is in 32bpp EDRAM tiles of 80 samples; an N-sample surface
+            // stores N samples per pixel, so the pixel width is samples >> msaa.
+            const uint32_t candidate_width_pixels =
+                (candidate_key.pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >>
+                uint32_t(candidate_key.msaa_samples);
+            uint32_t current_width_pixels = 0;
+            if (depth_probe_target_) {
+              const RenderTargetKey& current_key = depth_probe_target_->key();
+              current_width_pixels =
+                  (current_key.pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >>
+                  uint32_t(current_key.msaa_samples);
+            }
+            if (candidate_width_pixels > current_width_pixels) {
+              depth_probe_target_ = candidate;
+            }
+            const int32_t target_window_frame = REXCVAR_GET(depth_probe_frame);
+            const bool target_in_window =
+                target_window_frame < 0 ||
+                (update_frame >= uint64_t(target_window_frame) &&
+                 update_frame <= uint64_t(target_window_frame) + 16u);
+            if (target_in_window && depth_probe_target_logs_ < 32) {
+              // Deduplicated by identity so the log is an inventory of the frame's
+              // depth targets, not one line per draw.
+              bool seen = false;
+              for (uint32_t i = 0; i < depth_probe_candidate_count_; ++i) {
+                if (depth_probe_candidates_[i].key == candidate_key.key) {
+                  seen = true;
+                  break;
+                }
+              }
+              if (!seen) {
+                if (depth_probe_candidate_count_ < rex::countof(depth_probe_candidates_)) {
+                  depth_probe_candidates_[depth_probe_candidate_count_].key = candidate_key.key;
+                  ++depth_probe_candidate_count_;
+                }
+                ++depth_probe_target_logs_;
+                REXGPU_INFO(
+                    "depth_probe candidate frame={} base_tiles={} pitch={} msaa={} width={} "
+                    "format={} adopted={}",
+                    update_frame, uint32_t(candidate_key.base_tiles),
+                    uint32_t(candidate_key.pitch_tiles_at_32bpp),
+                    uint32_t(candidate_key.msaa_samples), candidate_width_pixels,
+                    uint32_t(candidate_key.resource_format),
+                    depth_probe_target_ == candidate ? 1 : 0);
+              }
+            }
+          }
+        }
+      }
 
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
@@ -2389,6 +3501,17 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
     image_create_info.format = GetDepthVulkanFormat(key.GetDepthFormat());
     transfer_format = image_create_info.format;
     image_create_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // One-shot convention check for the depth probe: which guest depth format the
+    // scene actually uses is only inferable from viewport ranges, and a kD24FS8
+    // surface would be half scale in the same buffer, so the guess has to be
+    // confirmable from a real run.
+    if (REXCVAR_GET(depth_probe) && !depth_format_logged_) {
+      depth_format_logged_ = true;
+      REXGPU_INFO("depth_rt format guest={} vulkan={} samples={} unorm24={}",
+                  xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat()),
+                  uint32_t(image_create_info.format), uint32_t(image_create_info.samples),
+                  depth_unorm24_vulkan_format_supported_ ? 1 : 0);
+    }
   } else {
     xenos::ColorRenderTargetFormat color_format = key.GetColorFormat();
     image_create_info.format = GetColorVulkanFormat(color_format);
