@@ -65,6 +65,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat color_3_view_format
           : xenos::kColorRenderTargetFormatBits;    // 24
       uint32_t color_rts_use_transfer_formats : 1;  // 25
+      // Phase 2 motion guide: this pass includes the guide attachment, so it needs
+      // its own render pass and framebuffer objects. The attachment exists only
+      // while the guide is active, which keeps every guide-off key identical.
+      uint32_t motion_attachment_used : 1;  // 26
     };
     uint32_t key = 0;
     struct Hasher {
@@ -75,6 +79,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     bool operator<(const RenderPassKey& other_key) const { return key < other_key.key; }
   };
   static_assert_size(RenderPassKey, sizeof(uint32_t));
+
+  // Phase 2 motion guide attachment: `xy` is the previous guest NDC, `z` the
+  // previous clip w (the fragment divides), `w` is 1 where the draw had a
+  // complete previous-frame index set. Single-sample by the time NR sees it.
+  static constexpr VkFormat kMotionGuideAttachmentFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
   struct Framebuffer {
     VkFramebuffer framebuffer = VK_NULL_HANDLE;

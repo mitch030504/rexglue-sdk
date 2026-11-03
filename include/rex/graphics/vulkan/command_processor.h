@@ -543,6 +543,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
 
+  // Phase 2 motion guide contract: the clip arena and its descriptor exist only
+  // while the guide is enabled and the device can host a five-attachment pass.
+  // Two equal halves; the draw writes the current half and reads the previous one.
+  static constexpr VkDeviceSize kMotionClipArenaBytes = VkDeviceSize(64) << 20;
+  bool motion_guide_enabled_ = false;
+  VkBuffer motion_clip_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory motion_clip_buffer_memory_ = VK_NULL_HANDLE;
+
   // Phase 2 motion guide: the key carried by the most recent kMotion marker and the
   // draw that consumes it. Set on the CP thread by OnTraceMarker, taken by the next
   // IssueDraw and written into the system constants; `pending` is cleared on use so

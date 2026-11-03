@@ -697,14 +697,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
 
-  // The motion guide adds a fifth colour attachment. Both limits are above the
-  // Vulkan 1.0 minimum of 4, so an unsupported device is reported once here and
-  // the guide is expected to stay inactive rather than fail a render pass.
+  // The motion guide adds a fifth colour attachment and reads the arena SSBO in the
+  // vertex stage; both limits are above the Vulkan 1.0 minimum of 4, so an
+  // unsupported device is reported once here and the guide is expected to stay
+  // inactive rather than fail a render pass. The EDRAM-interlock path additionally
+  // needs its own SSBO, so 7 is logged as the interlock requirement.
   if (!device->SupportsMotionGuide()) {
     REXLOG_INFO(
-        "Motion guide inactive: needs {} colour attachments and fragment combined output "
-        "resources, device reports {} and {}",
-        VulkanDevice::kMotionGuideColorAttachments, device->properties_.maxColorAttachments,
+        "Motion guide inactive: needs {} colour attachments and {} fragment combined output "
+        "resources ({} with EDRAM interlock), device reports {} and {}",
+        VulkanDevice::kMotionGuideColorAttachments,
+        VulkanDevice::kMotionGuideCombinedOutputResources,
+        VulkanDevice::kMotionGuideCombinedOutputResourcesInterlock,
+        device->properties_.maxColorAttachments,
         device->properties_.maxFragmentCombinedOutputResources);
   }
 

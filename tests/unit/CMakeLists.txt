@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     graphics/render_target_key_test.cpp
+    graphics/spirv_modification_test.cpp
     graphics/trace_marker_test.cpp
     test_memory.cpp
     audio/guest_audio_stretch_test.cpp
@@ -36,6 +37,9 @@ target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # spirv_translator.h includes the SPIR-V builder; the modification-bit test needs
+    # the union definition without linking the translator.
+    ${PROJECT_SOURCE_DIR}/thirdparty/glslang
 )
 
 target_link_libraries(unit_tests PRIVATE

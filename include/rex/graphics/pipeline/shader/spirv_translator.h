@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // uint32_t 1, bit 6 (bit 38 of the modification value).
+      // Phase 2 motion guide: translate this shader into the motion variant that
+      // reads and writes the clip arena and writes the guide attachment. Selected
+      // from per-shader criteria - not per draw - so a scene-phase change cannot
+      // thrash the pipeline cache; a draw without an identity is handled by a
+      // per-draw validity constant and a stub variant, not by a different
+      // modification.
+      uint32_t motion_guide : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -88,6 +96,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // uint32_t 1, bit 17 (bit 49 of the modification value).
+      // Phase 2 motion guide: this pixel shader writes the guide attachment. The
+      // stub variant shares this bit and is distinguished by a system constant,
+      // so both variants are one pipeline key each.
+      uint32_t motion_guide : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -317,6 +330,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t motion_key_low = 0;
     uint32_t motion_key_high = 0;
     uint32_t motion_key_valid = 0;
+
+    // Phase 2 motion guide, per draw. `motion_clip_base` is the arena slot where
+    // this draw's post-VS guest clip positions are written; `motion_prev_clip_base`
+    // is 0xFFFFFFFF when the whole draw has no complete previous-frame index set
+    // (validity is all-or-nothing per draw, never per vertex). The scene-UV
+    // constants and the jitter delta are consumed by the fragment stage so it
+    // never derives the mapping from the viewport. Index bounds are the block's
+    // [min, max] slots; an index outside them stores no history.
+    uint32_t motion_clip_base = 0xFFFFFFFFu;
+    uint32_t motion_prev_clip_base = 0xFFFFFFFFu;
+    float motion_scene_uv_scale[2] = {0.0f, 0.0f};
+    float motion_scene_uv_offset[2] = {0.0f, 0.0f};
+    float motion_jitter_uv[2] = {0.0f, 0.0f};
+    uint32_t motion_index_min = 0;
+    uint32_t motion_index_max = 0;
   };
 
   enum ConstantBuffer : uint32_t {

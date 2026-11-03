@@ -183,13 +183,21 @@ class VulkanDevice {
   // guide's own. Vulkan 1.0 guarantees only 4 for maxColorAttachments and
   // maxFragmentCombinedOutputResources, so a conformant device may not fit it.
   static constexpr uint32_t kMotionGuideColorAttachments = 5;
+  // maxFragmentCombinedOutputResources counts colour attachments plus the
+  // fragment stage's storage buffers, storage images and input attachments - it
+  // does NOT count depth. The shared-memory SSBO is one resource, so the normal
+  // path needs 6; the EDRAM-interlock path adds a second SSBO and needs 7.
+  static constexpr uint32_t kMotionGuideCombinedOutputResources = 6;
+  static constexpr uint32_t kMotionGuideCombinedOutputResourcesInterlock = 7;
 
-  // Whether a 5-attachment pass is possible on this device. Callers must report
-  // this as an inactive reason, not assert: the requirement is above the Vulkan
-  // minimum, and the motion guide is optional.
-  bool SupportsMotionGuide() const {
+  // Whether a 5-attachment motion pass is possible on this device. Callers must
+  // report this as an inactive reason, not assert: the requirement is above the
+  // Vulkan minimum, and the motion guide is optional.
+  bool SupportsMotionGuide(bool edram_fragment_shader_interlock = false) const {
     return properties_.maxColorAttachments >= kMotionGuideColorAttachments &&
-           properties_.maxFragmentCombinedOutputResources >= kMotionGuideColorAttachments;
+           properties_.maxFragmentCombinedOutputResources >=
+               (edram_fragment_shader_interlock ? kMotionGuideCombinedOutputResourcesInterlock
+                                                : kMotionGuideCombinedOutputResources);
   }
 
   // Enabled extensions not fully covered by the device properties and optional

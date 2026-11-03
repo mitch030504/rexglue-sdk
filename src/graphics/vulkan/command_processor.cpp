@@ -977,7 +977,36 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
+
+  // Phase 2 motion guide contract. `motion_guide` is defined by the application (a
+  // development switch), so it is queried by name instead of linked; the effective
+  // state is cached because the descriptor layout and the arena are per-session.
+  // The arena is allocated here and stays unused until the shader variant lands.
+  const bool motion_guide_requested = REXCVAR_QUERY(bool, motion_guide);
+  motion_guide_enabled_ =
+      motion_guide_requested &&
+      GetVulkanDevice()->SupportsMotionGuide(edram_fragment_shader_interlock);
+  if (motion_guide_requested && !motion_guide_enabled_) {
+    REXLOG_WARN(
+        "motion_guide requested but the device cannot host a five-attachment pass: needs {} "
+        "colour attachments and {} combined output resources ({} with EDRAM interlock), device "
+        "reports {} and {}; the guide stays inactive",
+        ui::vulkan::VulkanDevice::kMotionGuideColorAttachments,
+        ui::vulkan::VulkanDevice::kMotionGuideCombinedOutputResources,
+        ui::vulkan::VulkanDevice::kMotionGuideCombinedOutputResourcesInterlock,
+        GetVulkanDevice()->properties().maxColorAttachments,
+        GetVulkanDevice()->properties().maxFragmentCombinedOutputResources);
+  }
+  if (motion_guide_enabled_ &&
+      !ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          GetVulkanDevice(), kMotionClipArenaBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, motion_clip_buffer_,
+          motion_clip_buffer_memory_)) {
+    REXGPU_ERROR("Failed to create the motion clip arena; the guide stays inactive");
+    motion_guide_enabled_ = false;
+  }
+
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -992,19 +1021,32 @@ bool VulkanCommandProcessor::SetupContext() {
   shared_memory_and_edram_descriptor_set_layout_create_info.flags = 0;
   shared_memory_and_edram_descriptor_set_layout_create_info.pBindings =
       shared_memory_and_edram_descriptor_set_layout_bindings;
+  uint32_t shared_memory_and_edram_binding_count = 1;
   if (edram_fragment_shader_interlock) {
     // EDRAM.
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorType =
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorCount = 1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].stageFlags =
-        VK_SHADER_STAGE_FRAGMENT_BIT;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].pImmutableSamplers = nullptr;
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 2;
-  } else {
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
+    VkDescriptorSetLayoutBinding& edram_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[shared_memory_and_edram_binding_count];
+    edram_binding.binding = 1;
+    edram_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    edram_binding.descriptorCount = 1;
+    edram_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    edram_binding.pImmutableSamplers = nullptr;
+    ++shared_memory_and_edram_binding_count;
   }
+  if (motion_guide_enabled_) {
+    // Motion clip arena, vertex stage only. Kept at binding 2 so bindings 0 and 1
+    // keep their meaning for every existing shader translation.
+    VkDescriptorSetLayoutBinding& motion_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[shared_memory_and_edram_binding_count];
+    motion_binding.binding = 2;
+    motion_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    motion_binding.descriptorCount = 1;
+    motion_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    motion_binding.pImmutableSamplers = nullptr;
+    ++shared_memory_and_edram_binding_count;
+  }
+  shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+      shared_memory_and_edram_binding_count;
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1033,8 +1075,9 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  descriptor_pool_sizes[0].descriptorCount =
-      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  descriptor_pool_sizes[0].descriptorCount = shared_memory_binding_count +
+                                             uint32_t(edram_fragment_shader_interlock) +
+                                             uint32_t(motion_guide_enabled_);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
@@ -1073,7 +1116,7 @@ bool VulkanCommandProcessor::SetupContext() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet write_descriptor_sets[3];
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   write_descriptor_set_shared_memory.pNext = nullptr;
@@ -1102,8 +1145,27 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
-                             write_descriptor_sets, 0, nullptr);
+  uint32_t write_descriptor_set_count = 1 + uint32_t(edram_fragment_shader_interlock);
+  VkDescriptorBufferInfo motion_clip_descriptor_buffer_info;
+  if (motion_guide_enabled_) {
+    motion_clip_descriptor_buffer_info.buffer = motion_clip_buffer_;
+    motion_clip_descriptor_buffer_info.offset = 0;
+    motion_clip_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet& write_descriptor_set_motion =
+        write_descriptor_sets[write_descriptor_set_count];
+    write_descriptor_set_motion.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_motion.pNext = nullptr;
+    write_descriptor_set_motion.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_motion.dstBinding = 2;
+    write_descriptor_set_motion.dstArrayElement = 0;
+    write_descriptor_set_motion.descriptorCount = 1;
+    write_descriptor_set_motion.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_descriptor_set_motion.pImageInfo = nullptr;
+    write_descriptor_set_motion.pBufferInfo = &motion_clip_descriptor_buffer_info;
+    write_descriptor_set_motion.pTexelBufferView = nullptr;
+    ++write_descriptor_set_count;
+  }
+  dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
 
   // Swap objects.
 
@@ -2020,6 +2082,10 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          gamma_ramp_upload_buffer_memory_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, gamma_ramp_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, gamma_ramp_buffer_memory_);
+
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, motion_clip_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         motion_clip_buffer_memory_);
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
