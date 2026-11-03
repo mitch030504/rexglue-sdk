@@ -119,6 +119,27 @@ void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {
   }
 }
 
+namespace {
+
+// The guest index endianness transform, matching SpirvShaderTranslator::
+// EndianSwap32Uint exactly. The motion slot must use the value the vertex fetch
+// uses, not the raw host read: for 16-bit guest DMA those differ by a byte swap.
+uint32_t SwapGuestIndexEndian(uint32_t value, xenos::Endian endian) {
+  switch (endian) {
+    case xenos::Endian::k8in16:
+    case xenos::Endian::k8in32:
+      // 8-in-16 or one half of 8-in-32 - the same 32-bit byte-pair swap.
+      return ((value >> 8) & UINT32_C(0x00FF00FF)) | ((value & UINT32_C(0x00FF00FF)) << 8);
+    case xenos::Endian::k16in32:
+      return (value >> 16) | (value << 16);
+    case xenos::Endian::kNone:
+    default:
+      return value;
+  }
+}
+
+}  // namespace
+
 void VulkanPrimitiveProcessor::BeginSubmission() {
   if (builtin_index_buffer_upload_ != VK_NULL_HANDLE &&
       builtin_index_buffer_upload_submission_ == UINT64_MAX) {
@@ -299,14 +320,16 @@ void VulkanPrimitiveProcessor::ScanMotionIndexBounds(const ProcessingResult& res
     if (result_out.index_buffer_type == ProcessedIndexBufferType::kNone) {
       value = i;
     } else if (is_dma) {
-      // Guest DMA is read from big-endian guest memory by the shader's index
-      // fetch, so gl_VertexIndex is the decoded value. Reading the stream raw
-      // here byte-reverses every 16-bit index and widens a compact mesh to a
-      // ~64K span, which fills the arena and leaves the shader's slots outside
-      // the block. Decode exactly like the fetch does.
+      // Guest DMA is read from big-endian guest memory; the shader's fetch applies
+      // EndianSwap32Uint with the draw's index endianness, and the motion block now
+      // applies the same transform to its builtin. The scan must therefore emit the
+      // same decoded value - the raw host read differs by the endian transform for
+      // 16-bit indices, and no swap is right for kNone.
       const uint8_t* bytes = reinterpret_cast<const uint8_t*>(stream);
-      value = is_16bit ? uint32_t(memory::load_and_swap<uint16_t>(bytes + size_t(i) * sizeof(uint16_t)))
-                       : memory::load_and_swap<uint32_t>(bytes + size_t(i) * sizeof(uint32_t));
+      const uint32_t raw =
+          is_16bit ? uint32_t(reinterpret_cast<const uint16_t*>(bytes)[i])
+                   : reinterpret_cast<const uint32_t*>(bytes)[i];
+      value = SwapGuestIndexEndian(raw, result_out.host_shader_index_endian);
     } else if (is_16bit) {
       value = uint32_t(reinterpret_cast<const uint16_t*>(stream)[i]);
     } else {

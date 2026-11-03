@@ -1484,9 +1484,20 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     SpirvShaderTranslator::Modification pixel_shader_modification(
         description_out.pixel_shader_modification);
     if (pixel_shader_modification.pixel.motion_guide) {
-      pixel_shader_modification.pixel.motion_guide_output_location =
-          VulkanRenderTargetCache::GetMotionGuideSubpassIndex(render_pass_key);
-      description_out.pixel_shader_modification = pixel_shader_modification.value;
+      // A pass without the guide attachment - a depth-only prepass, or a transfer
+      // pass - has no colour slot for the output. Drawing the motion variant there
+      // writes to a location the pass does not provide, silently discarding the
+      // guide write (and the state is at best undefined). Clear the bit so the
+      // draw uses the ordinary pixel shader; the geometry is drawn again with the
+      // attachment in the colour pass.
+      if (!render_pass_key.motion_attachment_used) {
+        pixel_shader_modification.pixel.motion_guide = 0;
+        description_out.pixel_shader_modification = pixel_shader_modification.value;
+      } else {
+        pixel_shader_modification.pixel.motion_guide_output_location =
+            VulkanRenderTargetCache::GetMotionGuideSubpassIndex(render_pass_key);
+        description_out.pixel_shader_modification = pixel_shader_modification.value;
+      }
     }
   }
 

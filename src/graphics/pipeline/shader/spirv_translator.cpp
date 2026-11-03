@@ -2629,10 +2629,22 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
 
     // The low 24 bits of gl_VertexIndex are the arena's index space; the upper
     // bits are reserved for host-side vertex expansion.
+    // The 32-bit Vulkan builtin is the host read of the guest index, so for a
+    // 16-bit big-endian stream it is byte-reversed. The vertex fetch applies
+    // EndianSwap32Uint with kSystemConstantVertexIndexEndian; the slot must use the
+    // same decoded value the CPU scan computes, or almost every index falls outside
+    // the block (no history) and the few that fit address another vertex's slot.
+    spv::Id motion_vertex_index_raw = builder_->createUnaryOp(
+        spv::OpBitcast, type_uint_, builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
+    spv::Id motion_vertex_index_endian = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_util_),
+        spv::NoPrecision);
     spv::Id motion_vertex_index = builder_->createBinOp(
         spv::OpBitwiseAnd, type_uint_,
-        builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+        EndianSwap32Uint(motion_vertex_index_raw, motion_vertex_index_endian),
         builder_->makeUintConstant(UINT32_C(0xFFFFFF)));
     spv::Id motion_index_min = load_motion_system_constant(kSystemConstantMotionIndexMin);
     spv::Id motion_index_max = load_motion_system_constant(kSystemConstantMotionIndexMax);
