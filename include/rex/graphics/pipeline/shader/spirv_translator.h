@@ -307,6 +307,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+
+    // Phase 2 motion guide: the 64-bit identity key of the draw that recorded this
+    // constant buffer (kMotion marker, split into 32-bit words because the UBO is
+    // word-addressed), and 0/1 validity. Appended after every existing member, so
+    // all offsets and every non-motion shader translation stay byte-identical; no
+    // member-table entry exists yet, so shaders cannot read it until the motion
+    // variant adds one.
+    uint32_t motion_key_low = 0;
+    uint32_t motion_key_high = 0;
+    uint32_t motion_key_valid = 0;
   };
 
   enum ConstantBuffer : uint32_t {

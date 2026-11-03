@@ -543,6 +543,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
 
+  // Phase 2 motion guide: the key carried by the most recent kMotion marker and the
+  // draw that consumes it. Set on the CP thread by OnTraceMarker, taken by the next
+  // IssueDraw and written into the system constants; `pending` is cleared on use so
+  // a key can never leak into a second draw. The counters make a key/draw mismatch
+  // visible instead of silent, and are logged once per frame on kBegin.
+  uint64_t motion_pending_key_ = 0;
+  bool motion_pending_valid_ = false;
+  bool motion_seen_ = false;
+  uint64_t motion_logged_frame_ = UINT64_MAX;
+  uint32_t motion_frame_keys_ = 0;
+  uint32_t motion_frame_draws_ = 0;
+  uint32_t motion_frame_missing_ = 0;
+  uint32_t motion_frame_stale_ = 0;
+
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;
   std::deque<std::pair<uint64_t, VkBuffer>> destroy_buffers_;

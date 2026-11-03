@@ -3600,6 +3600,33 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::OnTraceMarker(const TraceMarker& marker) {
+  if (marker.kind == TraceMarker::kMotion) {
+    // node carries the low half, geometry the high half (see the hook: the key is
+    // emitted after the kInstance marker but before the guest's draw packet).
+    if (motion_pending_valid_) {
+      // The previous key was never consumed by a draw: the marker stream and the
+      // draw stream disagreed. Count it rather than letting the new key overwrite
+      // the old one silently.
+      ++motion_frame_stale_;
+    }
+    motion_pending_key_ = (uint64_t(marker.geometry) << 32) | uint64_t(marker.node);
+    motion_pending_valid_ = true;
+    motion_seen_ = true;
+    ++motion_frame_keys_;
+  } else if (marker.kind == TraceMarker::kBegin && motion_seen_) {
+    // Frame boundary: report the previous frame's key/draw accounting and reset.
+    const uint64_t frame = uint64_t(marker.frame);
+    if (motion_logged_frame_ != frame) {
+      motion_logged_frame_ = frame;
+      REXLOG_INFO("motion_guide frame={} keys={} draws={} missing={} stale={}", frame,
+                  motion_frame_keys_, motion_frame_draws_, motion_frame_missing_,
+                  motion_frame_stale_);
+    }
+    motion_frame_keys_ = 0;
+    motion_frame_draws_ = 0;
+    motion_frame_missing_ = 0;
+    motion_frame_stale_ = 0;
+  }
   if (GetVulkanDevice()->vulkan_instance()->extensions().ext_EXT_debug_utils &&
       BeginSubmission(true)) {
     deferred_command_buffer().CmdTraceMarker(marker);
@@ -4001,6 +4028,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
+
+  // Phase 2 motion guide: take the key the kMotion marker left for this draw and
+  // put it in the system constants. A draw without a key must not inherit the
+  // previous draw's, so the fields are always written and `valid` distinguishes
+  // them; the UBO is only re-uploaded when the value actually changes.
+  if (motion_seen_) {
+    const bool keyed = motion_pending_valid_;
+    const uint64_t key = motion_pending_key_;
+    motion_pending_key_ = 0;
+    motion_pending_valid_ = false;
+    ++motion_frame_draws_;
+    if (!keyed) ++motion_frame_missing_;
+    if (system_constants_.motion_key_low != uint32_t(key) ||
+        system_constants_.motion_key_high != uint32_t(key >> 32) ||
+        system_constants_.motion_key_valid != uint32_t(keyed ? 1 : 0)) {
+      system_constants_.motion_key_low = uint32_t(key);
+      system_constants_.motion_key_high = uint32_t(key >> 32);
+      system_constants_.motion_key_valid = keyed ? 1 : 0;
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
+    }
+  }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
