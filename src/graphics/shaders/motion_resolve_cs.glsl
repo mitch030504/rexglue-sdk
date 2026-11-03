@@ -26,8 +26,19 @@
 // texelFetch on a sampler2DMS with a constant sample index is sample-count
 // agnostic (the guide is 2x here, 4x under 2x-emulated-as-4x), so one shader
 // serves every pass the guide is attached to.
+//
+// One frame is split across render pass keys, so the guide attachment exists per
+// framebuffer and the composite is several dispatches into the same output. The
+// first dispatch (keep_existing = 0) overwrites the whole output, so the pixels
+// that pass left invalid are invalid. Every later dispatch (keep_existing = 1)
+// writes only where its own sample is valid, so a later pass fills holes without
+// erasing motion an earlier pass wrote.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform MotionPush {
+  uint keep_existing;
+} push;
 
 layout(set = 0, binding = 0) uniform sampler2DMS motion_image;
 
@@ -47,6 +58,11 @@ void main() {
     return;
   }
   const vec4 motion = texelFetch(motion_image, ivec2(pixel), 0);
+  // w is the validity flag. A later pass must not erase an earlier pass's motion
+  // with a pixel it never wrote, but a later valid sample does win.
+  if (push.keep_existing != 0u && !(motion.w > 0.0)) {
+    return;
+  }
   // Half precision is the attachment's own storage precision, so the pack is
   // lossless for it and the dump is byte-for-byte the guide's values.
   pixels[pixel.y * kSceneWidth + pixel.x] =

@@ -2377,6 +2377,28 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // Motion-guide frame end. This is ExecutePacketType3_XE_SWAP's Vulkan side, and
+  // the only instant at which the guide is complete: one frame's scene is split
+  // across render pass keys (several framebuffers, each with its own attachment),
+  // and the pre-HUD colour seam can run before the scene draws at all (it is the
+  // clear). Composite every framebuffer that received a motion draw this frame
+  // before AdvanceMotionFrame rotates the clip arena and the presented frame.
+  //
+  // The resolve is a compute dispatch, so any pass still open must end first. If
+  // the frame's draws were already submitted (vulkan_submit_on_primary_buffer_end
+  // does this by default), open a submission for the composite; queue submission
+  // order and the resolve's own barriers order it after those draws.
+  if (render_target_cache_ != nullptr && render_target_cache_->motion_guide_enabled() &&
+      render_target_cache_->motion_guide_frame_pending()) {
+    if (submission_open_) {
+      EndRenderPass();
+    } else if (!BeginSubmission(true)) {
+      REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
+    }
+    if (submission_open_) {
+      render_target_cache_->ResolveMotionGuideFrame();
+    }
+  }
   // Frame boundary: idempotent with the kBegin marker (with markers this is
   // always a no-op), and the only rotation without them. The frame is the GPU's
   // presented count, never the marker's CPU swap count, which can be ahead.

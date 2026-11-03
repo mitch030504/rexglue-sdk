@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
@@ -135,13 +136,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // Host sample count the image was created with - the same value the render
     // pass was built with, recorded here because the resolve can only bind the
     // image to a sampler2DMS when it really is multisampled, and the key it came
-    // from is not available at the resolve seam.
+    // from is not available when the frame-end composite reads it.
     VkSampleCountFlagBits motion_samples = VK_SAMPLE_COUNT_1_BIT;
-    // Motion-writing draws issued into this framebuffer in the current frame,
-    // reset when the pass is first entered. The resolve only takes a framebuffer
-    // that actually received draws: the frame's first 1000x600 colour seam is the
-    // clear before the scene, and resolving that attachment yields an empty field.
-    mutable uint32_t motion_draws_this_frame = 0;
+    // Guest frame number this framebuffer was recorded for in the frame's
+    // composite list, or UINT64_MAX if it has not received a motion-writing draw
+    // yet. The first such draw in a frame stamps it and adds the framebuffer to
+    // VulkanRenderTargetCache::motion_frame_framebuffers_; a second draw into the
+    // same framebuffer in the same frame must not add it twice, and the stamp is
+    // how the frame boundary (a new GetCurrentFrame) makes the next frame's first
+    // draw add it again. mutable: recording a draw updates frame bookkeeping, not
+    // the framebuffer's identity.
+    mutable uint64_t motion_draw_frame = UINT64_MAX;
     // The resolve's descriptor set for this image view, allocated from the cache's
     // pool the first time this framebuffer is resolved and never rewritten: a
     // descriptor set still bound by an earlier submission may be executing, so a
@@ -301,8 +306,42 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // entry into the same framebuffer in the same frame, do nothing.
   void MaybeClearMotionAttachment(const Framebuffer* framebuffer);
   // Called by the command processor for every draw that will write the guide, so
-  // the resolve can tell a pass that received motion from a cleared pass.
+  // the frame-end composite knows which framebuffers hold this frame's motion.
   void NotifyMotionDraw();
+  // Whether any framebuffer received a motion-writing draw this frame, and thus
+  // whether ResolveMotionGuideFrame has anything to composite. Lets the command
+  // processor avoid opening a submission for an empty frame; false while the guide
+  // is off, because NotifyMotionDraw records nothing then.
+  bool motion_guide_frame_pending() const { return !motion_frame_framebuffers_.empty(); }
+
+  // Phase 2 motion guide resolve - the guide's single-sample, 1000x600 form.
+  // A frame's scene is split across render pass keys, so it is written into
+  // several framebuffers, each with its own guide attachment at the host pass
+  // extent (wider than the scene, and multisampled). NR needs one single-sample
+  // 1000x600 RGBA16F image, so this composites every framebuffer that received a
+  // motion draw this frame (`motion_frame_framebuffers_`, in first-draw order) at
+  // the frame boundary - the swap, after every pass has ended and before the next
+  // frame clears the attachments. One compute dispatch per framebuffer fetches
+  // sample 0 of exactly the scene rectangle (x, y) - a crop of the attachment's
+  // top-left corner, never a scale - and packs it as 1000*600 RGBA16F into a
+  // device-local buffer. Sample 0, not a resolve: there is no image resolve or
+  // copy command anywhere in this path, and the depth guide reads the same
+  // sample.
+  // The first dispatch overwrites the whole output, so its invalid pixels are
+  // invalid; every later dispatch writes only where its own sample is valid, so
+  // a later pass fills holes without erasing earlier motion. A buffer memory
+  // barrier between dispatches makes the previous write visible/ordered.
+  // The resolve must not run at the colour seam: there the guide may still be
+  // the pre-scene clear, or only part of the scene, which is what made the dump
+  // alternate between empty and partial.
+  // Each framebuffer's guide image is transitioned
+  // COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY -> COLOR_ATTACHMENT_OPTIMAL
+  // around its dispatch, which is the layout every render pass with the guide
+  // expects at both ends; the attachment is still valid at frame end and is
+  // cleared at the next frame's pass entry. The command processor must have an
+  // open submission and no open render pass when calling this - IssueSwap does
+  // both.
+  void ResolveMotionGuideFrame();
 
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
@@ -1054,23 +1093,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // pipeline key (a non-multisampled image has no sample operand to fetch from).
   VkPipeline GetDepthProbePipeline(uint32_t host_sample_count_log2);
 
-  // Phase 2 motion guide resolve - the guide's single-sample, 1000x600 form.
-  // The attachment is written by the scene draws at the host pass extent (wider
-  // than the scene, and multisampled), which is not what the neural renderer
-  // consumes; one compute dispatch at the pre-HUD resolve seam fetches sample 0 of
-  // exactly the scene rectangle (x, y) - a crop of the attachment's top-left
-  // corner, never a scale - and packs it as 1000*600 RGBA16F into a device-local
-  // buffer. Sample 0, not a resolve: there is no image resolve or copy command
-  // anywhere in this path, and the depth guide reads the same sample.
-  // Called only while the guide is active and the last updated framebuffer has a
-  // guide, at most once per guest frame, and only after that framebuffer's guide
-  // was entered this frame (a framebuffer that has not been drawn into yet still
-  // holds the previous frame's vectors). The image is transitioned
-  // COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY -> COLOR_ATTACHMENT_OPTIMAL
-  // around the dispatch, which is the layout every render pass with the guide
-  // expects at both ends, so it is the only state the image ever has between
-  // passes and no other subsystem's layout tracking is involved.
-  void MaybeResolveMotionGuide();
+  // Phase 2 motion guide dump.
   // Writes the pending dump as `<prefix>m<frame>.bin`, exactly 4800000 bytes of
   // RGBA16F little-endian, row-major [y][x], top-left origin, with no header - the
   // contract tools/motion_guide_analyze.py reads. The `m` is appended here, not
@@ -1347,16 +1370,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // A creation failure is not retried: retrying inside every resolve would churn
   // the allocator and log once per frame for an error that cannot resolve itself.
   bool motion_guide_resources_failed_ = false;
-  // One resolve per guest frame, and no dump while the previous one still needs
-  // its CPU write, so the single readback buffer is never overwritten before the
-  // GPU has finished with it.
-  uint32_t motion_guide_last_frame_ = UINT32_MAX;
+  // Framebuffers that received a motion-writing draw this frame, in first-draw
+  // order. This vector is the frame's gate: the resolve composites exactly these
+  // and nothing else, and ResolveMotionGuideFrame takes and clears it, so the next
+  // frame starts empty. Cleared with the resolve resources as well, because a
+  // cache clear destroys the framebuffers these point to.
+  std::vector<const Framebuffer*> motion_frame_framebuffers_;
+  // No dump while the previous one still needs its CPU write, so the single
+  // readback buffer is never overwritten before the GPU has finished with it.
   bool motion_guide_pending_ = false;
   uint32_t motion_guide_pending_frame_ = 0;
   uint32_t motion_guide_dump_frames_done_ = 0;
-  // Bounded logging: a few lines show the resolve's extent, attachment extent and
-  // sample count per run, and every refusal reason is nameable at most once, so a
-  // resolve that never fires is explainable from the log instead of silent.
+  // Bounded logging: a few lines show how many framebuffers the composite
+  // resolved and the first attachment's extent and sample count per run, and
+  // every refusal reason is nameable at most once, so a resolve that never fires
+  // is explainable from the log instead of silent.
   uint32_t motion_guide_resolve_logs_ = 0;
   uint32_t motion_guide_skipped_logs_ = 0;
   // Bounded one-shot log of the pass keys the guide sees, so an attachment that is

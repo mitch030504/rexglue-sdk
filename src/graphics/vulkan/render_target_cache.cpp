@@ -117,6 +117,15 @@ struct DepthProbePushConstants {
   uint32_t host_sample_index;
 };
 
+// Matches the push constant block built into the motion guide resolve compute
+// shader. keep_existing is 0 for the first framebuffer of the frame: the whole
+// output is overwritten, so the pixels that pass left invalid are invalid. Every
+// later framebuffer uses 1 and writes only where its own sample has w > 0, so a
+// later pass fills holes without erasing motion an earlier pass wrote.
+struct MotionGuideResolvePushConstants {
+  uint32_t keep_existing;
+};
+
 }  // namespace
 
 REXCVAR_DEFINE_BOOL(wb_probe, false, "GPU/Vulkan",
@@ -1382,6 +1391,11 @@ void VulkanRenderTargetCache::ClearCache() {
   // map also runs ~Framebuffer, which releases that framebuffer's motion guide
   // image, memory and view - the guide is not a render target, so nothing below
   // would free it.
+  //
+  // The frame's composite list holds framebuffer pointers, so it must be emptied
+  // first: a cache clear can happen within a frame, and the stale entries would
+  // otherwise be resolved at the swap.
+  motion_frame_framebuffers_.clear();
   last_update_framebuffer_ = VK_NULL_HANDLE;
   for (const auto& framebuffer_pair : framebuffers_) {
     dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
@@ -2562,74 +2576,56 @@ void VulkanRenderTargetCache::VerifyColourProbe() {
   }
 }
 
-void VulkanRenderTargetCache::MaybeResolveMotionGuide() {
+void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // Guide off is the default, and everything below either allocates or records
   // commands, so this is deliberately the first check: a guide-off run executes
-  // none of this.
+  // none of this and never touches the frame's framebuffer list.
   if (!motion_guide_enabled()) {
     return;
   }
-  const Framebuffer* const framebuffer = last_update_framebuffer_;
-  if (framebuffer == nullptr || framebuffer->motion_image == VK_NULL_HANDLE ||
-      framebuffer->motion_view == VK_NULL_HANDLE || framebuffer->motion_draws_this_frame == 0) {
-    // The seam is also reached from passes without a guest attachment, and those
-    // get no guide attachment at all, so there is nothing to read.
+  // Take the frame's list and clear it in one step. This is the start of the next
+  // frame for the list: every refusal below - and normal completion - leaves it
+  // empty, so a framebuffer can never be resolved on a later frame because of a
+  // stale entry. One entry is one dispatch; the per-framebuffer stamp is what
+  // keeps a framebuffer that received several draws from being added twice.
+  std::vector<const Framebuffer*> framebuffers;
+  framebuffers.swap(motion_frame_framebuffers_);
+  if (framebuffers.empty()) {
+    // A frame with no motion-writing draw - menus, transitions - has nothing to
+    // composite. This is the frame's gate, not a timing guess.
     return;
   }
   const uint64_t frame64 = command_processor_.GetCurrentFrame();
   const uint32_t frame = uint32_t(frame64);
   // Bounded, reason-tagged refusal log, like the probes': normal lifecycle stops
-  // (the per-frame dedupe, a pending dump) are the resolve working as designed and
-  // are not logged, so the budget survives for a real refusal.
+  // (a pending dump) are the resolve working as designed and are not logged, so
+  // the budget survives for a real refusal.
   auto skip = [this, frame](const char* reason) {
     if (motion_guide_skipped_logs_ < 8) {
       ++motion_guide_skipped_logs_;
       REXGPU_INFO("motion_resolve skip frame={} reason={}", frame, reason);
     }
   };
+  // Recording needs an open submission; the caller (IssueSwap) opens one when the
+  // frame's draws were already submitted. Refused rather than asserted so a future
+  // caller cannot corrupt the deferred command buffer.
+  if (!command_processor_.submission_open()) {
+    skip("submission_closed");
+    return;
+  }
 
-  // One resolve per guest frame. A frame resolves 1000x600 several times, and the
-  // guide is complete once the scene pass has ended; more dispatches would only
-  // re-read the same attachment.
-  if (motion_guide_last_frame_ == frame) {
-    return;
-  }
-  // The clear stamp is written when the framebuffer's pass is entered, so it also
-  // answers "has this frame drawn into the guide yet". If it has not, the
-  // attachment still holds an earlier frame's vectors, and resolving would hand NR
-  // a stale field. This is what skips the frame's resolves that happen before the
-  // scene pass, whatever extent they resolve.
-  if (framebuffer->motion_cleared_frame != frame64) {
-    skip("guide_not_written_this_frame");
-    return;
-  }
-  // texelFetch on a sampler2DMS reads any multisampled attachment (2x on this
-  // title, 4x when 2x is emulated as 4x) with an explicit sample index, but a 1x
-  // image cannot be bound to it at all. The scene pass cannot be 1x here, so this
-  // is a guard against a 1x pass being the current one at the seam.
-  if (framebuffer->motion_samples == VK_SAMPLE_COUNT_1_BIT) {
-    skip("single_sample_guide");
-    return;
-  }
-  // The scene is a crop of the attachment's top-left corner, so the attachment has
-  // to contain it. A smaller pass would be fetched out of bounds and return
-  // zeroes, which would read as an empty scene instead of a refused resolve.
-  if (framebuffer->host_extent.width < kMotionGuideWidth ||
-      framebuffer->host_extent.height < kMotionGuideHeight) {
-    skip("attachment_smaller_than_scene");
-    return;
-  }
   // (x, y) is the guest pixel grid. At a draw resolution scale the attachment is
   // larger and this crop would cover only the scene's top-left quarter rather than
   // all of it, so it is refused instead of quietly quartering the guide. The
   // intended target is scale 1; a scaled resolve would need a strided or scaled
-  // fetch, which is a different shader.
+  // fetch, which is a different shader. Checked once, before any dispatch,
+  // because it is a property of the device, not of one framebuffer.
   if (IsDrawResolutionScaled()) {
     skip("resolution_scaled");
     return;
   }
 
-  if (!EnsureMotionGuideResources() || !EnsureMotionGuideDescriptorSet(*framebuffer)) {
+  if (!EnsureMotionGuideResources()) {
     return;
   }
 
@@ -2642,52 +2638,123 @@ void VulkanRenderTargetCache::MaybeResolveMotionGuide() {
   // not a guest render target.
   const VkImageSubresourceRange motion_subresource_range =
       ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
-  command_processor_.PushImageMemoryBarrier(
-      framebuffer->motion_image, motion_subresource_range,
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  // Flushed before the dispatch is recorded: SubmitBarriers emits the pending
-  // barriers at the current position in the deferred command stream, so a barrier
-  // pushed now and flushed later would land after the dispatch it orders.
-  command_processor_.SubmitBarriers(true);
 
-  command_processor_.BindExternalComputePipeline(motion_guide_pipeline_);
-  const VkDescriptorSet descriptor_set = framebuffer->motion_descriptor_set;
-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                         motion_guide_pipeline_layout_, 0, 1, &descriptor_set, 0,
-                                         nullptr);
-  // One dispatch for the whole scene: 125x75 groups of 8x8 exactly cover
-  // 1000x600, and the shader still bounds-checks because the group size is a
-  // shader constant, not a property of the buffer.
-  command_buffer.CmdVkDispatch((kMotionGuideWidth + 7u) / 8u, (kMotionGuideHeight + 7u) / 8u, 1);
+  // The framebuffer whose attachment is reported in the log, and the number of
+  // dispatches. resolved_count also decides keep_existing: only the first
+  // dispatch overwrites the output.
+  const Framebuffer* first_resolved = nullptr;
+  uint32_t resolved_count = 0;
+  for (const Framebuffer* framebuffer : framebuffers) {
+    if (framebuffer->motion_draw_frame != frame64) {
+      // The entry outlived the frame it was recorded for: the previous swap could
+      // not record a composite (no submission), and the attachment may already
+      // have been cleared or reused by this frame. Drop it rather than hand NR a
+      // field of mixed frames.
+      continue;
+    }
+    if (framebuffer->motion_image == VK_NULL_HANDLE || framebuffer->motion_view == VK_NULL_HANDLE) {
+      // NotifyMotionDraw only records a framebuffer with a view, so this is a
+      // guard against a cache clear, not a normal path.
+      continue;
+    }
+    // texelFetch on a sampler2DMS reads any multisampled attachment (2x on this
+    // title, 4x when 2x is emulated as 4x) with an explicit sample index, but a 1x
+    // image cannot be bound to it at all. The scene pass cannot be 1x here, so
+    // this is a guard against a 1x pass having written the guide.
+    if (framebuffer->motion_samples == VK_SAMPLE_COUNT_1_BIT) {
+      skip("single_sample_guide");
+      continue;
+    }
+    // The scene is a crop of the attachment's top-left corner, so the attachment has
+    // to contain it. A smaller pass would be fetched out of bounds and return
+    // zeroes, which would read as an empty scene instead of a refused resolve.
+    if (framebuffer->host_extent.width < kMotionGuideWidth ||
+        framebuffer->host_extent.height < kMotionGuideHeight) {
+      skip("attachment_smaller_than_scene");
+      continue;
+    }
+    if (!EnsureMotionGuideDescriptorSet(*framebuffer)) {
+      continue;
+    }
 
-  command_processor_.PushImageMemoryBarrier(
-      framebuffer->motion_image, motion_subresource_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_READ_BIT,
-      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-  // Emitted now rather than with the next probe's barriers, so the image is back
-  // in the layout the next render pass loads from even if nothing else is recorded
-  // before the pass is entered.
-  command_processor_.SubmitBarriers(true);
+    command_processor_.PushImageMemoryBarrier(
+        framebuffer->motion_image, motion_subresource_range,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Between dispatches: the previous dispatch wrote the output buffer, and the
+    // next one writes the same range. SHADER_READ is in the destination scope
+    // because keep_existing reads what earlier passes left in the buffer
+    // conceptually - a later dispatch must not be reordered before the earlier
+    // one's writes. No barrier is needed before the first dispatch, because it
+    // overwrites the whole buffer and nothing reads the old contents.
+    if (resolved_count != 0) {
+      command_processor_.PushBufferMemoryBarrier(
+          motion_guide_output_buffer_, 0, kMotionGuideBytes, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    // Flushed before the dispatch is recorded: SubmitBarriers emits the pending
+    // barriers at the current position in the deferred command stream, so a barrier
+    // pushed now and flushed later would land after the dispatch it orders.
+    command_processor_.SubmitBarriers(true);
 
-  motion_guide_last_frame_ = frame;
+    // Bound after the flush so an open render pass (should the caller have left
+    // one) is ended before the compute pipeline is bound - binding compute inside
+    // a render pass is illegal. The call is cached, so later dispatches in this
+    // loop do not emit it again.
+    command_processor_.BindExternalComputePipeline(motion_guide_pipeline_);
+    const VkDescriptorSet descriptor_set = framebuffer->motion_descriptor_set;
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                           motion_guide_pipeline_layout_, 0, 1, &descriptor_set, 0,
+                                           nullptr);
+    MotionGuideResolvePushConstants push_constants;
+    push_constants.keep_existing = resolved_count != 0 ? 1u : 0u;
+    command_buffer.CmdVkPushConstants(motion_guide_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(push_constants), &push_constants);
+    // One dispatch for the whole scene: 125x75 groups of 8x8 exactly cover
+    // 1000x600, and the shader still bounds-checks because the group size is a
+    // shader constant, not a property of the buffer.
+    command_buffer.CmdVkDispatch((kMotionGuideWidth + 7u) / 8u, (kMotionGuideHeight + 7u) / 8u, 1);
+
+    command_processor_.PushImageMemoryBarrier(
+        framebuffer->motion_image, motion_subresource_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // Emitted now rather than with the next barrier, so the image is back in the
+    // layout the next frame's render pass loads from even if nothing else is
+    // recorded before then.
+    command_processor_.SubmitBarriers(true);
+
+    if (resolved_count == 0) {
+      first_resolved = framebuffer;
+    }
+    ++resolved_count;
+  }
+  if (resolved_count == 0) {
+    return;
+  }
+
   if (motion_guide_resolve_logs_ < 4) {
     ++motion_guide_resolve_logs_;
     // The attachment may be wider than the scene and is 2x MSAA; both are stated
     // so a dump that shows a crop or a repeated pixel can be explained from the
-    // log instead of guessed at.
+    // log instead of guessed at. framebuffers is how many passes the scene was
+    // split into - more than one means the composite had to fill holes, and it is
+    // the number that used to be 1 by luck of whichever seam resolved first.
     REXGPU_INFO(
-        "motion_resolve frame={} scene={}x{} attachment={}x{} samples={} bytes={}", frame,
-        kMotionGuideWidth, kMotionGuideHeight, framebuffer->host_extent.width,
-        framebuffer->host_extent.height, uint32_t(framebuffer->motion_samples),
-        uint64_t(kMotionGuideBytes));
+        "motion_resolve frame={} framebuffers={} scene={}x{} first_attachment={}x{} samples={} "
+        "bytes={}",
+        frame, resolved_count, kMotionGuideWidth, kMotionGuideHeight,
+        first_resolved->host_extent.width, first_resolved->host_extent.height,
+        uint32_t(first_resolved->motion_samples), uint64_t(kMotionGuideBytes));
   }
 
   // The dump is a separate, bounded decision: the resolve itself runs every frame
   // the guide is active because NR consumes its buffer, while the copy-out exists
-  // only for a measurement run.
+  // only for a measurement run. It is recorded after every dispatch, so the file
+  // is the composite and not just the first pass's field.
   const std::string dump_prefix = REXCVAR_GET(motion_dump);
   if (dump_prefix.empty() || motion_guide_readback_buffer_ == VK_NULL_HANDLE) {
     return;
@@ -2702,7 +2769,7 @@ void VulkanRenderTargetCache::MaybeResolveMotionGuide() {
   if (motion_guide_pending_) {
     // The single readback buffer has not been written on the CPU yet; recording
     // another copy would overwrite it before the GPU finished with the previous
-    // one.
+    // one. Only the dump is skipped - the composite above still ran.
     return;
   }
 
@@ -2889,18 +2956,23 @@ bool VulkanRenderTargetCache::EnsureMotionGuideResources() {
       vulkan_device, 16, uint32_t(rex::countof(motion_pool_sizes)), motion_pool_sizes,
       motion_guide_descriptor_set_layout_);
 
-  // Nothing about the resolve varies per frame or per framebuffer - the scene
-  // rectangle, the sample index and the output stride are the shader's own
-  // constants - so there are no push constants and one pipeline serves every pass
-  // the guide is attached to.
+  // The scene rectangle, the sample index and the output stride are the shader's
+  // own constants, so one pipeline serves every framebuffer and every pass the
+  // guide is attached to. The only per-dispatch value is keep_existing, which says
+  // whether this is the first framebuffer of the frame (overwrite the composite)
+  // or a later one (fill only valid pixels).
   VkPipelineLayoutCreateInfo motion_pipeline_layout_create_info;
   motion_pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   motion_pipeline_layout_create_info.pNext = nullptr;
   motion_pipeline_layout_create_info.flags = 0;
   motion_pipeline_layout_create_info.setLayoutCount = 1;
   motion_pipeline_layout_create_info.pSetLayouts = &motion_guide_descriptor_set_layout_;
-  motion_pipeline_layout_create_info.pushConstantRangeCount = 0;
-  motion_pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  VkPushConstantRange motion_push_constant_range;
+  motion_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  motion_push_constant_range.offset = 0;
+  motion_push_constant_range.size = sizeof(MotionGuideResolvePushConstants);
+  motion_pipeline_layout_create_info.pushConstantRangeCount = 1;
+  motion_pipeline_layout_create_info.pPushConstantRanges = &motion_push_constant_range;
   if (dfn.vkCreatePipelineLayout(device, &motion_pipeline_layout_create_info, nullptr,
                                  &motion_guide_pipeline_layout_) != VK_SUCCESS) {
     motion_guide_pipeline_layout_ = VK_NULL_HANDLE;
@@ -3001,7 +3073,9 @@ void VulkanRenderTargetCache::DestroyMotionGuideResources() {
                                          motion_guide_descriptor_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, motion_guide_sampler_);
   motion_guide_pending_ = false;
-  motion_guide_last_frame_ = UINT32_MAX;
+  // The framebuffers these point to are destroyed by the callers (Shutdown and
+  // ClearCache) right before or after this, so the list must not survive them.
+  motion_frame_framebuffers_.clear();
   // A fresh start: this runs on Shutdown and ClearCache, so the next resolve
   // recreates everything - which is also how a device loss is recovered from.
   motion_guide_resources_failed_ = false;
@@ -3684,12 +3758,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
             // memory, before the composition and HUD passes touch it.
             MaybeRunColourProbe(shared_memory, resolve_info, draw_resolution_scaled);
           }
-          if (motion_guide_enabled()) {
-            // Same seam, motion side: the scene pass that wrote the guide has
-            // ended and the HUD has not been drawn yet. The guide is not guest
-            // memory, so this does not depend on which address was resolved.
-            MaybeResolveMotionGuide();
-          }
+          // The motion guide is deliberately not resolved here. This seam can run
+          // before the scene draws (the clear), and one frame's scene is split
+          // across render pass keys, so a resolve at the seam read whichever
+          // attachment happened to be current and produced an empty or partial
+          // field. The guide is composited once at the frame end instead - see
+          // ResolveMotionGuideFrame, called from IssueSwap.
         }
       }
     }
@@ -3790,6 +3864,10 @@ bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
       REXGPU_INFO("motion_guide active: max_color_attachments={} format={}",
                   kMotionGuideColorAttachmentCount, uint32_t(kMotionGuideAttachmentFormat));
     } else {
+      // Drop anything collected for the frame that was in flight: the guide will
+      // not be composited while it is inactive, and the list must not survive into
+      // a later enable with attachments that were never written for it.
+      motion_frame_framebuffers_.clear();
       // An inactive reason has to be nameable, not silent: either the backend
       // cannot carry a fifth attachment at all or this device cannot use the
       // attachment format. The command processor adds its own reasons
@@ -3804,9 +3882,21 @@ bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
 }
 
 void VulkanRenderTargetCache::NotifyMotionDraw() {
-  if (last_update_framebuffer_ != nullptr &&
-      last_update_framebuffer_->motion_view != VK_NULL_HANDLE) {
-    ++last_update_framebuffer_->motion_draws_this_frame;
+  const Framebuffer* const framebuffer = last_update_framebuffer_;
+  if (framebuffer == nullptr || framebuffer->motion_view == VK_NULL_HANDLE) {
+    // A guide-off framebuffer never reaches the list; the motion_view check is
+    // also what keeps a guide-off run from touching it at all.
+    return;
+  }
+  // Record the framebuffer once per frame, in first-draw order: the scene of one
+  // frame is split across render pass keys, and each key has its own framebuffer
+  // and guide attachment. The stamp is the guest frame the resolve will composite
+  // for, so a second draw - or a re-entered pass - in the same frame does not add a
+  // duplicate dispatch, while the next frame's first draw does.
+  const uint64_t frame = command_processor_.GetCurrentFrame();
+  if (framebuffer->motion_draw_frame != frame) {
+    framebuffer->motion_draw_frame = frame;
+    motion_frame_framebuffers_.push_back(framebuffer);
   }
 }
 
@@ -4143,7 +4233,6 @@ void VulkanRenderTargetCache::MaybeClearMotionAttachment(const Framebuffer* fram
     return;
   }
   framebuffer->motion_cleared_frame = frame;
-  framebuffer->motion_draws_this_frame = 0;
 
   // vkCmdClearAttachments, not an image clear: the pass is already open here, and
   // a transfer or clear command would be illegal outside a subpass. The index is
