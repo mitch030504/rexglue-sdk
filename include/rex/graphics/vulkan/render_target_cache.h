@@ -811,6 +811,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
+  // Shared capture machinery for a range the guest resolved into shared memory,
+  // used by both the depth probe's guest source and the colour probe. The range
+  // is copied into a device-local staging buffer and then into a host-visible
+  // readback buffer of the same size, and the CPU detiles it from there. One
+  // instance per probe, so the two can never share - and overwrite - a buffer.
+  struct GuestRangeCapture {
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    VkBuffer readback_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+    void* readback_mapped = nullptr;
+    VkDeviceSize size = 0;
+    // A failed allocation is not retried: the range either fits or the device
+    // cannot support the probe, and retrying inside every subsequent resolve
+    // would churn the allocator for no benefit.
+    bool alloc_failed = false;
+  };
+
   // Development-only writeback probe (cvar wb_probe, off by default).
   // Copies a resolved guest colour range out to a scratch buffer and back twice,
   // then compares the three snapshots on the CPU after the submission completes.
@@ -847,10 +865,30 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                           bool draw_resolution_scaled);
   void VerifyDepthProbe();
   bool EnsureDepthProbeResources();
-  // Guest source only. Lazily created from the first resolved range and refused
-  // rather than resized if a later range is larger - this runs inside an open
-  // submission, where the queue cannot be drained to replace a buffer safely.
-  bool EnsureDepthProbeGuestBuffers(VkDeviceSize size);
+  // Development-only native pre-HUD scene colour capture (cvar colour_probe, off
+  // by default). At the first 1000x600 colour resolve of a guest frame the
+  // resolved range - a tiled guest RGBA8 texture holding the scene at the pre-HUD
+  // instant - is copied out with the shared GuestRangeCapture machinery, detiled
+  // on the CPU and dumped as a 1000x600 row-major RGBA8 rectangle. Read-only with
+  // respect to guest memory: nothing is written back and no ownership is claimed.
+  void MaybeRunColourProbe(VulkanSharedMemory& shared_memory,
+                           const draw_util::ResolveInfo& resolve_info,
+                           bool draw_resolution_scaled);
+  void VerifyColourProbe();
+  void DestroyColourProbeResources();
+  // Shared by the guest depth source and the colour probe. Lazily created from the
+  // first resolved range and refused rather than resized if a later range is
+  // larger - this runs inside an open submission, where the queue cannot be
+  // drained to replace a buffer safely. `label` names the capture in the
+  // allocation error, so a failure still says which probe broke.
+  bool EnsureGuestRangeCapture(GuestRangeCapture& capture, VkDeviceSize size, const char* label);
+  // Records the shared-memory read barrier and the two copies that get `length`
+  // bytes at `start` into the capture's host-visible readback buffer.
+  void RecordGuestRangeCopyOut(GuestRangeCapture& capture, VulkanSharedMemory& shared_memory,
+                               uint32_t start, VkDeviceSize length);
+  // Invalidates the mapped readback and returns its bytes, or null.
+  const uint8_t* MapGuestRangeCapture(GuestRangeCapture& capture);
+  void DestroyGuestRangeCapture(GuestRangeCapture& capture);
   void DestroyDepthProbeResources();
   // host_sample_count_log2 is uint32_t(xenos::MsaaSamples) except for 2x emulated
   // as 4x, which is 2. Depth cannot be resolved, so sample count is part of the
@@ -1007,12 +1045,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Guest-seam source (depth_probe_source=0): the resolved guest range copied
   // into a device-local staging buffer and then into a host-visible readback
   // buffer of the same size, from which the tiled k_24_8 words are detiled.
-  VkBuffer depth_probe_staging_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory depth_probe_staging_memory_ = VK_NULL_HANDLE;
-  VkBuffer depth_probe_guest_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory depth_probe_guest_readback_memory_ = VK_NULL_HANDLE;
-  void* depth_probe_guest_readback_mapped_ = nullptr;
-  VkDeviceSize depth_probe_guest_size_ = 0;
+  GuestRangeCapture depth_probe_guest_;
   // Decoded guest scene depth, in exactly the layout the host source writes, so
   // the statistics, the hash and the dump file do not depend on the source.
   std::vector<float> depth_probe_guest_linear_;
@@ -1045,6 +1078,46 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Bounded inventory of guest depth resolves, so "depth has no guest-memory
   // seam" becomes a measured statement rather than an inference.
   uint32_t depth_resolve_logs_ = 0;
+
+  // Development-only native pre-HUD scene colour capture (cvar colour_probe).
+  // The resolved range is a tiled guest RGBA8 texture: the same staging and
+  // readback machinery as the guest depth source, enlarged to 32 bpp colour.
+  GuestRangeCapture colour_probe_guest_;
+  // The detiled scene rectangle, row-major, four bytes per pixel - exactly the
+  // bytes that are hashed and dumped.
+  std::vector<uint8_t> colour_probe_rgba8_;
+  // Destination geometry and endianness of the pending capture, recorded at the
+  // resolve so the CPU decode does not depend on register state later.
+  uint32_t colour_probe_pending_pitch_ = 0;
+  uint32_t colour_probe_pending_height_ = 0;
+  uint32_t colour_probe_pending_origin_x_ = 0;
+  uint32_t colour_probe_pending_origin_y_ = 0;
+  uint32_t colour_probe_pending_endian_ = 0;
+  // One-shot reporting of the guest range, the destination format and the first
+  // decoded words, so a refused range, a wrong channel order and a wrong offset
+  // are all visible from a run instead of assumed.
+  bool colour_probe_range_logged_ = false;
+  bool colour_probe_format_logged_ = false;
+  bool colour_probe_layout_logged_ = false;
+  // One capture per guest frame, and none while a recorded capture still needs
+  // its CPU-side decode, so the single readback buffer is never overwritten
+  // before the GPU has finished writing a previous capture into it.
+  bool colour_probe_pending_ = false;
+  uint32_t colour_probe_pending_frame_ = 0;
+  uint32_t colour_probe_last_frame_ = UINT32_MAX;
+  // Which of the frame's 1000x600 colour resolves to capture, and how many
+  // have been seen this frame. A frame resolves this extent several times at
+  // several addresses; only some carry the finished scene.
+  uint32_t colour_probe_resolve_frame_ = UINT32_MAX;
+  uint32_t colour_probe_resolve_index_ = 0;
+  uint32_t colour_probe_frames_done_ = 0;
+  // Bounded reason-tagged refusals, so a probe that never fires is explainable
+  // from the log instead of silent.
+  uint32_t colour_probe_skipped_logs_ = 0;
+  // Own budget for the per-resolve inventory, so it cannot be spent by boot-time
+  // refusal logs before the probe window opens.
+  uint32_t colour_probe_resolve_logs_ = 0;
+  bool colour_probe_alloc_failed_logged_ = false;
 
   // For pixel (fragment) shader interlock.
 
