@@ -553,6 +553,12 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
   return true;
 }
 
+// The scene (world) phase. `src/hooks/engine_trace_hook.cpp` emits kPhase with
+// the phase function address in `geometry` on entry to each phase function;
+// 0x8219FB80 is the one that draws the world before the HUD. The guide writes
+// clip history only while this phase is active.
+constexpr uint32_t kMotionScenePhaseAddress = UINT32_C(0x8219FB80);
+
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -981,7 +987,6 @@ bool VulkanCommandProcessor::SetupContext() {
   // Phase 2 motion guide contract. `motion_guide` is defined by the application (a
   // development switch), so it is queried by name instead of linked; the effective
   // state is cached because the descriptor layout and the arena are per-session.
-  // The arena is allocated here and stays unused until the shader variant lands.
   const bool motion_guide_requested = REXCVAR_QUERY(bool, motion_guide);
   motion_guide_enabled_ =
       motion_guide_requested &&
@@ -996,6 +1001,18 @@ bool VulkanCommandProcessor::SetupContext() {
         ui::vulkan::VulkanDevice::kMotionGuideCombinedOutputResourcesInterlock,
         GetVulkanDevice()->properties().maxColorAttachments,
         GetVulkanDevice()->properties().maxFragmentCombinedOutputResources);
+  }
+  if (motion_guide_enabled_) {
+    // The cache owns the attachment and may refuse it (not on the host render
+    // target path, or the format cannot be both a colour attachment and sampled).
+    // Asked before the arena exists so a refusal allocates nothing; ignoring the
+    // result would leave the guide writing to an attachment that is never there.
+    if (!render_target_cache_->SetMotionGuideEnabled(true)) {
+      motion_guide_enabled_ = false;
+      REXLOG_WARN(
+          "motion_guide requested but the render target cache cannot carry the guide on this "
+          "device/path; the guide stays inactive");
+    }
   }
   if (motion_guide_enabled_ &&
       !ui::vulkan::util::CreateDedicatedAllocationBuffer(
@@ -1071,6 +1088,10 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
   }
+  // Remembered so a later scale change can invalidate the motion layout for the
+  // reason it happens, not as a generic cache clear.
+  motion_resolution_scale_x_ = texture_cache_->draw_resolution_scale_x();
+  motion_resolution_scale_y_ = texture_cache_->draw_resolution_scale_y();
 
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
@@ -2086,6 +2107,17 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, motion_clip_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                          motion_clip_buffer_memory_);
+  // The arena is gone; keep no block or frame stamp that claims otherwise. The
+  // counters are session-scoped, like the arena itself.
+  motion_clip_blocks_.clear();
+  motion_frame_ = UINT64_MAX;
+  motion_parity_ = 0;
+  motion_frame_slot_cursor_ = 0;
+  motion_arena_barrier_pending_ = false;
+  motion_scene_draw_ = false;
+  motion_pending_key_ = 0;
+  motion_pending_valid_ = false;
+  std::memset(motion_clip_invalidations_, 0, sizeof(motion_clip_invalidations_));
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
@@ -2344,6 +2376,10 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // Frame boundary: idempotent with the kBegin marker (with markers this is
+  // always a no-op), and the only rotation without them. The frame is the GPU's
+  // presented count, never the marker's CPU swap count, which can be ahead.
+  AdvanceMotionFrame(guest_frame_count());
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3180,6 +3216,10 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+  // The motion arena barrier is recorded once per frame at the rotation point; if
+  // the rotation happened with no submission open, this is the first place it can
+  // be inserted, and it must be before any draw reads the arena.
+  FlushPendingMotionArenaBarrier();
   SubmitBarriers(false);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
@@ -3209,12 +3249,19 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   current_framebuffer_ = framebuffer;
 
   if (use_dynamic_rendering) {
-    VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
+    // The guide is a fifth colour attachment at index 4; the array must have room
+    // for it even though indices below 4 may be holes. Never read past the count
+    // the cache returns.
+    VkRenderingAttachmentInfo
+        color_attachments[VulkanRenderTargetCache::kMotionGuideColorAttachmentCount];
     VkRenderingAttachmentInfo depth_attachment;
     VkRenderingAttachmentInfo stencil_attachment;
     uint32_t color_attachment_count = 0;
     render_target_cache_->GetLastUpdateRenderingAttachments(
-        color_attachments, &color_attachment_count, &depth_attachment, &stencil_attachment);
+        color_attachments, VulkanRenderTargetCache::kMotionGuideColorAttachmentCount,
+        &color_attachment_count, &depth_attachment, &stencil_attachment);
+    assert_true(color_attachment_count <=
+                VulkanRenderTargetCache::kMotionGuideColorAttachmentCount);
     bool has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     bool has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
 
@@ -3249,6 +3296,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+  // The guide starts each frame at w = 0, but a pass resumed within the same frame
+  // must keep what it already wrote, so the clear is a once-per-frame stamp inside
+  // the pass (vkCmdClearAttachments is the only clear legal here). No-op for a
+  // framebuffer without a guide.
+  if (motion_guide_enabled_) {
+    render_target_cache_->MaybeClearMotionAttachment(framebuffer);
+  }
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -3665,36 +3719,334 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
   }
 }
 
+void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
+  if (!motion_guide_enabled_ || frame == motion_frame_) {
+    return;
+  }
+  // A draw resolution change relayouts every framebuffer; the guide's image and
+  // the arena layout's meaning both go with it. Route it through the same reset so
+  // the invalidation is counted instead of silently reading old slots.
+  if (motion_frame_ != UINT64_MAX && texture_cache_ &&
+      (motion_resolution_scale_x_ != texture_cache_->draw_resolution_scale_x() ||
+       motion_resolution_scale_y_ != texture_cache_->draw_resolution_scale_y())) {
+    ResetMotionClipAllocator(MotionClipInvalidationReason::kResize);
+  }
+  // A key still pending here outlived its frame (no kEnd arrived); it must not be
+  // attributed to a draw of the frame starting now, and its stale count belongs to
+  // the frame that just ended.
+  if (motion_pending_valid_) {
+    motion_pending_valid_ = false;
+    motion_pending_key_ = 0;
+    ++motion_frame_stale_;
+  }
+  // Only frame - 1 can ever be a valid previous frame, so anything older (or never
+  // issued) is dead weight - unstable keys would otherwise grow the table forever.
+  // Dropped before the log so `blocks` is the number that can still be read.
+  for (auto it = motion_clip_blocks_.begin(); it != motion_clip_blocks_.end();) {
+    const uint64_t last_frame = it->second.last_frame;
+    if (last_frame == UINT64_MAX || last_frame + 1 < frame) {
+      it = motion_clip_blocks_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // Report the frame that just ended, before its counters are cleared. The frame
+  // is the allocator's stamp, not marker.frame: it must match the parity and the
+  // blocks' last_frame exactly, and the CPU swap count can be ahead of the GPU.
+  if (motion_frame_ != UINT64_MAX) {
+    REXLOG_INFO(
+        "motion_guide frame={} blocks={} realloc={} index_set_changed={} clamped={} keys={} "
+        "draws={} missing={} stale={} no_variant={} no_bounds={} no_viewport={} history={}",
+        motion_frame_, motion_clip_blocks_.size(), motion_frame_reallocated_,
+        motion_frame_index_set_changed_, motion_frame_clamped_, motion_frame_keys_,
+        motion_frame_draws_, motion_frame_missing_, motion_frame_stale_,
+        motion_frame_no_variant_, motion_frame_no_bounds_, motion_frame_no_viewport_,
+        motion_frame_history_);
+  }
+  motion_frame_ = frame;
+  motion_parity_ = uint32_t(frame & 1);
+  motion_frame_slot_cursor_ = 0;
+  motion_frame_keys_ = 0;
+  motion_frame_draws_ = 0;
+  motion_frame_missing_ = 0;
+  motion_frame_stale_ = 0;
+  motion_frame_no_variant_ = 0;
+  motion_frame_no_bounds_ = 0;
+  motion_frame_no_viewport_ = 0;
+  motion_frame_history_ = 0;
+  motion_frame_reallocated_ = 0;
+  motion_frame_index_set_changed_ = 0;
+  motion_frame_clamped_ = 0;
+  // The rotation point: one barrier for the whole arena between the previous
+  // frame's vertex-stage writes and this frame's vertex-stage reads and writes,
+  // rather than one per draw.
+  motion_arena_barrier_pending_ = motion_clip_buffer_ != VK_NULL_HANDLE;
+  FlushPendingMotionArenaBarrier();
+}
+
+void VulkanCommandProcessor::FlushPendingMotionArenaBarrier() {
+  if (!motion_arena_barrier_pending_ || !submission_open_ ||
+      motion_clip_buffer_ == VK_NULL_HANDLE) {
+    return;
+  }
+  // Both ends are the vertex stage: the arena is only touched by the motion
+  // vertex store and load. The destination includes write because the current
+  // frame overwrites the half it reads from on the next rotation.
+  if (PushBufferMemoryBarrier(motion_clip_buffer_, 0, VK_WHOLE_SIZE,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)) {
+    motion_arena_barrier_pending_ = false;
+  }
+}
+
+void VulkanCommandProcessor::ResetMotionClipAllocator(MotionClipInvalidationReason reason) {
+  if (!motion_guide_enabled_) {
+    return;
+  }
+  motion_clip_blocks_.clear();
+  motion_frame_slot_cursor_ = 0;
+  const size_t reason_index = size_t(reason);
+  static_assert(size_t(MotionClipInvalidationReason::kCount) == 4,
+                "Update kInvalidationReasonNames when adding a reason");
+  ++motion_clip_invalidations_[reason_index];
+  // One line per reason per session: an arena under pressure can reset every
+  // frame, and the counter keeps that visible without one line per reset.
+  if (motion_clip_invalidations_[reason_index] == 1) {
+    static const char* const kInvalidationReasonNames[] = {"clear_cache", "resize", "device_loss",
+                                                           "arena_full"};
+    REXLOG_INFO("motion_guide allocator reset reason={} (all clip history dropped)",
+                kInvalidationReasonNames[reason_index]);
+  }
+}
+
+bool VulkanCommandProcessor::AllocateMotionClipBlock(uint64_t key, uint32_t draw_index_min,
+                                                     uint32_t draw_index_max,
+                                                     uint64_t index_fingerprint,
+                                                     MotionClipDraw& draw_out) {
+  // A key may be drawn as several primitives. The block is placed once per frame;
+  // every later sub-draw of the same key reuses that placement and the history
+  // decision made for it. Re-placing it here advanced the cursor per sub-draw, so
+  // the offset changed every time and previous-frame history could never be valid.
+  {
+    auto existing = motion_clip_blocks_.find(key);
+    if (existing != motion_clip_blocks_.end() &&
+        existing->second.allocated_frame == motion_frame_) {
+      const MotionClipBlock& block = existing->second;
+      draw_out.key = key;
+      draw_out.clip_base = motion_parity_ * kMotionClipSlotsPerHalf + block.slot_offset;
+      draw_out.prev_clip_base = block.frame_prev_clip_base;
+      draw_out.index_min = block.index_min;
+      draw_out.index_max = block.index_max;
+      draw_out.allocated = true;
+      if (block.frame_prev_clip_base != UINT32_MAX) {
+        ++motion_frame_history_;
+      }
+      return true;
+    }
+  }
+  // Two attempts: the second only after a full-arena reset, where the first block
+  // necessarily fits (its capacity is capped to one half).
+  for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+    auto it = motion_clip_blocks_.find(key);
+    const bool reused = it != motion_clip_blocks_.end();
+    const uint32_t previous_offset = reused ? it->second.slot_offset : UINT32_MAX;
+    const uint32_t previous_capacity = reused ? it->second.capacity : 0;
+    const uint32_t previous_index_min = reused ? it->second.index_min : draw_index_min;
+    const uint32_t previous_index_max = reused ? it->second.index_max : draw_index_min;
+    const uint64_t previous_fingerprint = reused ? it->second.index_fingerprint : 0;
+    const uint64_t previous_last_frame = reused ? it->second.last_frame : UINT64_MAX;
+
+    // The block is a fixed gl_VertexIndex window: slot = base + (index - index_min).
+    // Its min may only move down, which requires rewriting every slot, so that is
+    // a reallocation like growth.
+    const uint32_t new_index_min = std::min(previous_index_min, draw_index_min);
+    const uint64_t required_span = uint64_t(draw_index_max) - new_index_min + 1;
+    const uint32_t slot_cap = std::min(kMotionClipMaxDrawSlots, kMotionClipSlotsPerHalf);
+    const uint32_t needed_capacity = uint32_t(std::min<uint64_t>(required_span, slot_cap));
+    // An index outside the written window stores nothing; a draw that had to be
+    // clipped can never have complete history, so it is also reported separately.
+    const bool clamped = required_span > needed_capacity;
+    const bool reallocated =
+        reused && (new_index_min != previous_index_min || needed_capacity > previous_capacity);
+    uint32_t capacity = previous_capacity;
+    if (needed_capacity > capacity) {
+      capacity = needed_capacity;
+    }
+    // Keep the previous offset when the layout still lines up, so the same block
+    // is at the same slot in both halves and its history stays readable. A shifted
+    // layout loses history for every block after the shift, which is safe because
+    // validity is all-or-nothing.
+    const uint32_t offset = (reused && previous_offset == motion_frame_slot_cursor_)
+                                ? previous_offset
+                                : motion_frame_slot_cursor_;
+    if (uint64_t(motion_frame_slot_cursor_) + capacity > kMotionClipSlotsPerHalf) {
+      // Writing past the half would alias the other parity's blocks. Dropping all
+      // history is the only alternative that cannot produce wrong motion.
+      ResetMotionClipAllocator(MotionClipInvalidationReason::kArenaFull);
+      continue;
+    }
+    motion_frame_slot_cursor_ += capacity;
+
+    // All-or-nothing: the previous half is readable only if this exact block was
+    // written last frame, the layout kept its offset, the block still covers the
+    // whole index set, and the index set is the same one.
+    const bool history_valid =
+        reused && !reallocated && capacity == previous_capacity && previous_capacity != 0 &&
+        previous_offset == offset && previous_last_frame != UINT64_MAX &&
+        previous_last_frame + 1 == motion_frame_ && previous_fingerprint == index_fingerprint &&
+        draw_index_max <= previous_index_max;
+
+    MotionClipBlock& block = motion_clip_blocks_[key];
+    block.slot_offset = offset;
+    block.capacity = capacity;
+    block.index_min = new_index_min;
+    block.index_max = new_index_min + capacity - 1;
+    block.index_fingerprint = index_fingerprint;
+    if (reallocated) {
+      ++motion_frame_reallocated_;
+    }
+    if (reused && previous_fingerprint != index_fingerprint) {
+      ++motion_frame_index_set_changed_;
+    }
+    if (clamped) {
+      ++motion_frame_clamped_;
+    }
+    if (history_valid) {
+      ++motion_frame_history_;
+    }
+
+    draw_out.key = key;
+    draw_out.clip_base = motion_parity_ * kMotionClipSlotsPerHalf + offset;
+    draw_out.prev_clip_base =
+        history_valid ? (motion_parity_ ^ 1) * kMotionClipSlotsPerHalf + offset : UINT32_MAX;
+    draw_out.index_min = new_index_min;
+    draw_out.index_max = new_index_min + capacity - 1;
+    block.allocated_frame = motion_frame_;
+    block.frame_prev_clip_base = draw_out.prev_clip_base;
+    draw_out.allocated = true;
+    return true;
+  }
+  REXGPU_ERROR("motion_guide: could not place a clip block after an arena reset");
+  return false;
+}
+
+void VulkanCommandProcessor::CommitMotionClipBlock(uint64_t key) {
+  auto it = motion_clip_blocks_.find(key);
+  if (it != motion_clip_blocks_.end()) {
+    it->second.last_frame = motion_frame_;
+  }
+}
+
+void VulkanCommandProcessor::UpdateMotionSceneConstants(
+    const draw_util::ViewportInfo& viewport_info) {
+  // The fragment stage reconstructs the current pixel's guest NDC as
+  // 2 * scene_uv - 1 and compares it with the guest clip the vertex stage stored,
+  // so scene_uv is guest-NDC UV, not a render-target UV. Inverting the host
+  // viewport transform (GetHostViewportInfo's ndc_scale/ndc_offset) keeps the
+  // guest Y convention for free: a normal top-left Direct3D viewport has a
+  // negative guest Y scale, so scale Y is negative and offset Y is about 1 (v = 1
+  // at the top). Do not "fix" that sign here. The scene is authored as a 1000x600
+  // rect and the guest viewport covers it; the mapping is viewport-relative, so
+  // if the viewport ever differs from that rect it still yields the guest NDC the
+  // stored clips are in, rather than stretching to the scene rect.
+  for (uint32_t i = 0; i < 2; ++i) {
+    const float extent = float(viewport_info.xy_extent[i]);
+    const float ndc_scale = viewport_info.ndc_scale[i];
+    if (!extent || !ndc_scale) {
+      system_constants_.motion_scene_uv_scale[i] = 0.0f;
+      system_constants_.motion_scene_uv_offset[i] = 0.0f;
+      continue;
+    }
+    system_constants_.motion_scene_uv_scale[i] = 1.0f / (extent * ndc_scale);
+    system_constants_.motion_scene_uv_offset[i] =
+        0.5f *
+            ((-2.0f * float(viewport_info.xy_offset[i]) / extent) - 1.0f -
+             viewport_info.ndc_offset[i]) /
+            ndc_scale +
+        0.5f;
+  }
+  // Deliberately zero, see the report: the fragment stage subtracts
+  // motion_jitter_uv from NDC motion, so the field must be the difference between
+  // the current and the previous frame's projection jitter in guest-NDC units and
+  // with the scene-UV Y sign. That difference has not been measured for the guide
+  // (the upscaler's own sign is measured separately, rex::ui::temporal::
+  // JitterForFrame + temporal_jitter_flip). Zero is a known no-op; a guessed sign
+  // is not. The resolve stage must call rex::ui::temporal::JitterForFrame for the
+  // current and the previous frame and supply
+  // (jitter_current - jitter_previous) * 2 / viewport_extent, Y matching scene_uv.
+  system_constants_.motion_jitter_uv[0] = 0.0f;
+  system_constants_.motion_jitter_uv[1] = 0.0f;
+}
+
 void VulkanCommandProcessor::OnTraceMarker(const TraceMarker& marker) {
-  if (marker.kind == TraceMarker::kMotion) {
-    // node carries the low half, geometry the high half (see the hook: the key is
-    // emitted after the kInstance marker but before the guest's draw packet).
-    if (motion_pending_valid_) {
-      // The previous key was never consumed by a draw: the marker stream and the
-      // draw stream disagreed. Count it rather than letting the new key overwrite
-      // the old one silently.
-      ++motion_frame_stale_;
+  // Everything below is guide state. With the guide off, the hook may still be
+  // emitting markers, but this processor must not allocate, log or touch the
+  // constants - the guide is bit-identical to Stage 0 in that case.
+  if (motion_guide_enabled_) {
+    switch (marker.kind) {
+      case TraceMarker::kMotion:
+        // node carries the low half, geometry the high half (see the hook: the key
+        // is emitted after the kInstance marker but before the guest's draw packet).
+        if (motion_pending_valid_) {
+          // The previous key was never consumed by a draw: the marker stream and the
+          // draw stream disagreed. Count it rather than letting the new key overwrite
+          // the old one silently.
+          ++motion_frame_stale_;
+        }
+        motion_pending_key_ = (uint64_t(marker.geometry) << 32) | uint64_t(marker.node);
+        motion_pending_valid_ = true;
+        ++motion_frame_keys_;
+        break;
+      case TraceMarker::kBegin:
+        // A frame boundary as the guest sees it. The allocator rotates on the GPU
+        // presented frame count, never on marker.frame, which is the CPU VdSwap
+        // count and can be a frame or two ahead. Idempotent with the swap call.
+        // The phase predicate is sticky, so a frame that ended without kEnd must
+        // still start outside the scene.
+        if (motion_scene_draw_) {
+          motion_scene_draw_ = false;
+          render_target_cache_->SetMotionGuideSceneDraw(false);
+          REXLOG_INFO("motion_guide scene_draw=0 reason=frame_begin");
+        }
+        AdvanceMotionFrame(guest_frame_count());
+        break;
+      case TraceMarker::kPhase: {
+        // Sticky until the next phase or kEnd: the cache cannot infer the phase
+        // from register state, so this is the only source for it.
+        const bool scene_draw = marker.geometry == kMotionScenePhaseAddress;
+        if (scene_draw != motion_scene_draw_) {
+          motion_scene_draw_ = scene_draw;
+          render_target_cache_->SetMotionGuideSceneDraw(scene_draw);
+          REXLOG_INFO("motion_guide scene_draw={} reason=phase_{:08X}", scene_draw ? 1 : 0,
+                      marker.geometry);
+        }
+        break;
+      }
+      case TraceMarker::kEnd:
+        // The frame's draws are over; a key that no draw consumed must never be
+        // attributed to the next frame's first draw.
+        if (motion_pending_valid_) {
+          motion_pending_valid_ = false;
+          motion_pending_key_ = 0;
+          ++motion_frame_stale_;
+        }
+        if (motion_scene_draw_) {
+          motion_scene_draw_ = false;
+          render_target_cache_->SetMotionGuideSceneDraw(false);
+          REXLOG_INFO("motion_guide scene_draw=0 reason=phase_end");
+        }
+        break;
+      default:
+        break;
     }
-    motion_pending_key_ = (uint64_t(marker.geometry) << 32) | uint64_t(marker.node);
-    motion_pending_valid_ = true;
-    motion_seen_ = true;
-    ++motion_frame_keys_;
-  } else if (marker.kind == TraceMarker::kBegin && motion_seen_) {
-    // Frame boundary: report the previous frame's key/draw accounting and reset.
-    const uint64_t frame = uint64_t(marker.frame);
-    if (motion_logged_frame_ != frame) {
-      motion_logged_frame_ = frame;
-      REXLOG_INFO("motion_guide frame={} keys={} draws={} missing={} stale={}", frame,
-                  motion_frame_keys_, motion_frame_draws_, motion_frame_missing_,
-                  motion_frame_stale_);
-    }
-    motion_frame_keys_ = 0;
-    motion_frame_draws_ = 0;
-    motion_frame_missing_ = 0;
-    motion_frame_stale_ = 0;
   }
   if (GetVulkanDevice()->vulkan_instance()->extensions().ext_EXT_debug_utils &&
       BeginSubmission(true)) {
+    // The rotation may have happened with no submission open (kBegin is consumed
+    // before the frame's first command); record its arena barrier as the first
+    // thing in the frame's command buffer.
+    FlushPendingMotionArenaBarrier();
     deferred_command_buffer().CmdTraceMarker(marker);
   }
 }
@@ -3743,10 +4095,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const uint64_t motion_key = motion_pending_key_;
   motion_pending_key_ = 0;
   motion_pending_valid_ = false;
-  if (motion_seen_) {
+  if (motion_guide_enabled_) {
     ++motion_frame_draws_;
-    if (!motion_keyed) ++motion_frame_missing_;
+    if (!motion_keyed) {
+      ++motion_frame_missing_;
+    }
   }
+  // The block this draw writes, if any. Stamped as written only after the draw
+  // command is recorded, so a draw that returns early leaves no history behind.
+  MotionClipDraw motion_clip_draw;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -4109,15 +4466,50 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
 
-  // Phase 2 motion guide: apply the key taken at IssueDraw entry. A draw without a
-  // key must not inherit the previous draw's, so the fields are always written and
-  // `valid` distinguishes them. The guide is a development feature and the key is
-  // per draw, so the UBO is re-uploaded whenever the guide is active rather than
-  // tracking equality that a retry iteration could have already written.
-  if (motion_seen_) {
+  // Phase 2 motion guide: apply the key taken at IssueDraw entry and this draw's
+  // clip block. A draw without a key, outside the scene phase, or with an
+  // unreadable index stream writes 0xFFFFFFFF bases, so the shader neither reads
+  // nor writes the arena; the fields are always written and never inherited. The
+  // guide is a development feature and the block placement is per draw, so the UBO
+  // is re-uploaded whenever the guide is active rather than tracking equality that
+  // a retry iteration could have already written.
+  if (motion_guide_enabled_) {
+    const bool motion_vertex_variant =
+        vertex_shader_modification.vertex.motion_guide != 0;
+    if (motion_keyed && !motion_vertex_variant) {
+      ++motion_frame_no_variant_;
+    }
+    const bool motion_bounds_valid = primitive_processor_->motion_index_bounds_valid();
+    // Scene membership comes from the identity key and the pass shape, not from
+    // the viewport or the phase markers: measured, keyed draws report host-window
+    // viewports (1376x1080, 832x1080, 1920x1080 - split panels and the full
+    // window), and the phase markers toggle per batch (4 blocks against 700 keys).
+    // Composition and HUD draws carry no identity, so a keyed draw is a scene draw.
+    if (motion_keyed && motion_vertex_variant && motion_bounds_valid && motion_frame_ != UINT64_MAX) {
+      // The block is placed here, but only stamped as written after the draw
+      // command is recorded, so a draw that fails later cannot look like history.
+      if (!AllocateMotionClipBlock(motion_key, primitive_processor_->motion_index_min(),
+                                   primitive_processor_->motion_index_max(),
+                                   primitive_processor_->motion_index_fingerprint(),
+                                   motion_clip_draw)) {
+        motion_clip_draw = MotionClipDraw();
+      }
+    }
+    if (motion_keyed && motion_vertex_variant && !motion_bounds_valid) {
+      ++motion_frame_no_bounds_;
+    }
+
     system_constants_.motion_key_low = uint32_t(motion_key);
     system_constants_.motion_key_high = uint32_t(motion_key >> 32);
-    system_constants_.motion_key_valid = motion_keyed ? 1 : 0;
+    // Validity is per draw, but only a draw whose vertex shader has the motion
+    // variant can have written or read the arena; a mismatch writes zero rather
+    // than a plausible garbage vector.
+    system_constants_.motion_key_valid = (motion_keyed && motion_vertex_variant) ? 1 : 0;
+    system_constants_.motion_clip_base = motion_clip_draw.clip_base;
+    system_constants_.motion_prev_clip_base = motion_clip_draw.prev_clip_base;
+    system_constants_.motion_index_min = motion_clip_draw.index_min;
+    system_constants_.motion_index_max = motion_clip_draw.index_max;
+    UpdateMotionSceneConstants(viewport_info);
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
   }
@@ -4303,6 +4695,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+
+  // The draw command is recorded, so the block now holds this frame's clip data
+  // in the current half and becomes the previous frame for the next one. Stamping
+  // it only now keeps skipped draws (async placeholders, failed binds) out of the
+  // history.
+  if (motion_clip_draw.allocated) {
+    CommitMotionClipBlock(motion_clip_draw.key);
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -5148,6 +5548,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     ++fences_awaited;
   }
   if (device_lost_) {
+    // The arena's contents are gone with the device; keep the counters and blocks
+    // from claiming any of it is still readable.
+    ResetMotionClipAllocator(MotionClipInvalidationReason::kDeviceLoss);
     if (graphics_system_) {
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     }
@@ -5574,6 +5977,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
         device_lost_ = true;
+        ResetMotionClipAllocator(MotionClipInvalidationReason::kDeviceLoss);
         if (graphics_system_) {
           graphics_system_->OnHostGpuLossFromAnyThread(true);
         }
@@ -5626,6 +6030,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       texture_cache_->ClearCache();
 
       render_target_cache_->ClearCache();
+
+      // The guide images went with the framebuffers, and the arena's other half
+      // was written under a layout this processor can no longer vouch for. Reset
+      // the allocator and the scene predicate together so no stale block can be
+      // read as frame - 1 of a new layout.
+      if (motion_guide_enabled_) {
+        ResetMotionClipAllocator(MotionClipInvalidationReason::kClearCache);
+        motion_scene_draw_ = false;
+        render_target_cache_->SetMotionGuideSceneDraw(false);
+      }
 
       // Not clearing the pipeline layouts and the descriptor set layouts as
       // they're referenced by pipelines, which are not destroyed.

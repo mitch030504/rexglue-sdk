@@ -623,6 +623,13 @@ class PrimitiveProcessor {
     }
   }
 
+ public:
+  // Read-only views for backend subclasses that must inspect the raw index stream
+  // for the motion guide; the base keeps ownership of both.
+  const RegisterFile& register_file() const { return register_file_; }
+  memory::Memory& memory() const { return memory_; }
+
+ private:
   const RegisterFile& register_file_;
   memory::Memory& memory_;
   SharedMemory& shared_memory_;

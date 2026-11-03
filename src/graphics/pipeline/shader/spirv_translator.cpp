@@ -124,6 +124,10 @@ void SpirvShaderTranslator::Reset() {
   std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
+  std::fill(output_motion_prev_clip_.begin(), output_motion_prev_clip_.end(), spv::NoResult);
+  buffer_motion_clip_ = spv::NoResult;
+  std::fill(input_motion_prev_clip_.begin(), input_motion_prev_clip_.end(), spv::NoResult);
+  output_fragment_motion_ = spv::NoResult;
   output_per_vertex_member_count_ = 0;
   output_per_vertex_member_clip_distance_ = UINT32_MAX;
   output_per_vertex_member_cull_distance_ = UINT32_MAX;
@@ -310,10 +314,42 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
   };
+  // Phase 2 motion guide. Only the motion variant declares these, so a guide-off
+  // translation keeps a byte-identical uniform block; the indices continue the
+  // SystemConstantIndex enumeration and the scalar split of the float2 fields is
+  // explained there.
+  Modification motion_guide_modification = GetSpirvShaderModification();
+  bool motion_guide_variant = motion_guide_modification.vertex.motion_guide ||
+                              motion_guide_modification.pixel.motion_guide;
+  const SystemConstant motion_guide_system_constants[] = {
+      {"motion_clip_base", offsetof(SystemConstants, motion_clip_base), type_uint_},
+      {"motion_prev_clip_base", offsetof(SystemConstants, motion_prev_clip_base), type_uint_},
+      {"motion_key_valid", offsetof(SystemConstants, motion_key_valid), type_uint_},
+      {"motion_scene_uv_scale_x", offsetof(SystemConstants, motion_scene_uv_scale), type_float_},
+      {"motion_scene_uv_scale_y", offsetof(SystemConstants, motion_scene_uv_scale) + sizeof(float),
+       type_float_},
+      {"motion_scene_uv_offset_x", offsetof(SystemConstants, motion_scene_uv_offset), type_float_},
+      {"motion_scene_uv_offset_y",
+       offsetof(SystemConstants, motion_scene_uv_offset) + sizeof(float), type_float_},
+      {"motion_jitter_uv_x", offsetof(SystemConstants, motion_jitter_uv), type_float_},
+      {"motion_jitter_uv_y", offsetof(SystemConstants, motion_jitter_uv) + sizeof(float),
+       type_float_},
+      {"motion_index_min", offsetof(SystemConstants, motion_index_min), type_uint_},
+      {"motion_index_max", offsetof(SystemConstants, motion_index_max), type_uint_},
+  };
+  static_assert(rex::countof(motion_guide_system_constants) ==
+                    static_cast<size_t>(kSystemConstantMotionIndexMax -
+                                        kSystemConstantMotionClipBase + 1),
+                "Motion guide system constant enumeration mismatch");
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
   for (size_t i = 0; i < rex::countof(system_constants); ++i) {
     id_vector_temp_.push_back(system_constants[i].type);
+  }
+  if (motion_guide_variant) {
+    for (size_t i = 0; i < rex::countof(motion_guide_system_constants); ++i) {
+      id_vector_temp_.push_back(motion_guide_system_constants[i].type);
+    }
   }
   spv::Id type_system_constants = builder_->makeStructType(id_vector_temp_, "XeSystemConstants");
   for (size_t i = 0; i < rex::countof(system_constants); ++i) {
@@ -322,6 +358,17 @@ void SpirvShaderTranslator::StartTranslation() {
                             system_constant.name);
     builder_->addMemberDecoration(type_system_constants, static_cast<unsigned int>(i),
                                   spv::DecorationOffset, int(system_constant.offset));
+  }
+  if (motion_guide_variant) {
+    for (size_t i = 0; i < rex::countof(motion_guide_system_constants); ++i) {
+      const SystemConstant& system_constant = motion_guide_system_constants[i];
+      unsigned int system_constant_index =
+          static_cast<unsigned int>(kSystemConstantMotionClipBase) + static_cast<unsigned int>(i);
+      builder_->addMemberName(type_system_constants, system_constant_index,
+                              system_constant.name);
+      builder_->addMemberDecoration(type_system_constants, system_constant_index,
+                                    spv::DecorationOffset, int(system_constant.offset));
+    }
   }
   builder_->addDecoration(type_system_constants, spv::DecorationBlock);
   uniform_system_constants_ =
@@ -1670,6 +1717,37 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     main_interface_.push_back(input_vertex_index_);
   }
 
+  Modification shader_modification = GetSpirvShaderModification();
+
+  // Phase 2 motion guide: the arena the current and previous guest clip
+  // positions are exchanged through. Declared only for the motion variant, so
+  // every other translation keeps its bindings unchanged.
+  if (shader_modification.vertex.motion_guide) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeRuntimeArray(type_float4_));
+    // Storage buffers have std430 packing, one vec4 per arena slot.
+    builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                            sizeof(float) * 4);
+    spv::Id type_motion_clip = builder_->makeStructType(id_vector_temp_, "XeMotionClip");
+    builder_->addMemberName(type_motion_clip, 0, "clip");
+    builder_->addMemberDecoration(type_motion_clip, 0, spv::DecorationRestrict);
+    builder_->addMemberDecoration(type_motion_clip, 0, spv::DecorationOffset, 0);
+    builder_->addDecoration(type_motion_clip, features_.spirv_version >= spv::Spv_1_3
+                                                  ? spv::DecorationBlock
+                                                  : spv::DecorationBufferBlock);
+    buffer_motion_clip_ = builder_->createVariable(
+        spv::NoPrecision,
+        features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                               : spv::StorageClassUniform,
+        type_motion_clip, "xe_motion_clip");
+    builder_->addDecoration(buffer_motion_clip_, spv::DecorationDescriptorSet,
+                            int(kDescriptorSetSharedMemoryAndEdram));
+    builder_->addDecoration(buffer_motion_clip_, spv::DecorationBinding, 2);
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(buffer_motion_clip_);
+    }
+  }
+
   uint32_t output_location = 0;
 
   // Create the interpolator outputs.
@@ -1688,8 +1766,6 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
       ++output_location;
     }
   }
-
-  Modification shader_modification = GetSpirvShaderModification();
 
   if (shader_modification.vertex.output_point_parameters) {
     if (shader_modification.vertex.host_vertex_shader_type ==
@@ -1712,6 +1788,23 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
       builder_->addDecoration(output_point_size_, spv::DecorationLocation, int(output_location));
       builder_->addDecoration(output_point_size_, spv::DecorationInvariant);
       main_interface_.push_back(output_point_size_);
+      ++output_location;
+    }
+  }
+
+  // Phase 2 motion guide: the previous guest clip position, interpolated so the
+  // fragment stage can reconstruct its NDC with the primitive's own
+  // perspective. Host-only outputs, allocated after the point parameter so the
+  // guest interpolator and point locations are unchanged.
+  if (shader_modification.vertex.motion_guide) {
+    for (uint32_t i = 0; i < 3; ++i) {
+      output_motion_prev_clip_[i] = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassOutput, type_float_,
+          fmt::format("xe_out_motion_prev_clip_{}", i).c_str());
+      builder_->addDecoration(output_motion_prev_clip_[i], spv::DecorationLocation,
+                              int(output_location));
+      builder_->addDecoration(output_motion_prev_clip_[i], spv::DecorationInvariant);
+      main_interface_.push_back(output_motion_prev_clip_[i]);
       ++output_location;
     }
   }
@@ -2461,6 +2554,10 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
 
   spv::Id position_xyz;
 
+  // Guest clip XY with the guest W-format handling applied, kept for the motion
+  // guide because the arena stores the guest clip, not the host NDC.
+  spv::Id guest_position_xy;
+
   // Open a scope since position_xy and position_z won't be synchronized anymore
   // after position_xyz is built and modified later.
   {
@@ -2483,6 +2580,7 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
         spv::OpSelect, type_float2_,
         builder_->smearScalar(spv::NoPrecision, is_xy_divided_by_w, type_bool2_),
         guest_position_xy_mul_w, position_xy);
+    guest_position_xy = position_xy;
 
     // Check if the shader returns Z/W rather than Z, and if it does, revert
     // that.
@@ -2507,6 +2605,111 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       position_xyz = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
     }
+  }
+
+  // Phase 2 motion guide: exchange this vertex's guest clip position with the
+  // arena. The slot is the guest vertex index relative to the block the draw
+  // owns; validity is all-or-nothing per draw, so a base of 0xFFFFFFFF is the
+  // only way a whole draw has no history - there is no per-vertex flag.
+  if (shader_modification.vertex.motion_guide &&
+      shader_modification.vertex.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex) {
+    assert_true(buffer_motion_clip_ != spv::NoResult);
+    spv::StorageClass motion_clip_storage_class = features_.spirv_version >= spv::Spv_1_3
+                                                     ? spv::StorageClassStorageBuffer
+                                                     : spv::StorageClassUniform;
+    auto load_motion_system_constant = [this](SystemConstantIndex index) -> spv::Id {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(builder_->makeIntConstant(index));
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                      id_vector_temp_util_),
+          spv::NoPrecision);
+    };
+
+    // The low 24 bits of gl_VertexIndex are the arena's index space; the upper
+    // bits are reserved for host-side vertex expansion.
+    spv::Id motion_vertex_index = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_,
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+        builder_->makeUintConstant(UINT32_C(0xFFFFFF)));
+    spv::Id motion_index_min = load_motion_system_constant(kSystemConstantMotionIndexMin);
+    spv::Id motion_index_max = load_motion_system_constant(kSystemConstantMotionIndexMax);
+    spv::Id motion_index_in_range = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, motion_vertex_index,
+                              motion_index_min),
+        builder_->createBinOp(spv::OpULessThanEqual, type_bool_, motion_vertex_index,
+                              motion_index_max));
+
+    // Store the current guest clip for the next frame.
+    spv::Id motion_clip_base = load_motion_system_constant(kSystemConstantMotionClipBase);
+    SpirvBuilder::IfBuilder if_motion_clip_store(
+        builder_->createBinOp(
+            spv::OpLogicalAnd, type_bool_,
+            builder_->createBinOp(spv::OpINotEqual, type_bool_, motion_clip_base,
+                                  builder_->makeUintConstant(UINT32_MAX)),
+            motion_index_in_range),
+        spv::SelectionControlDontFlattenMask, *builder_);
+    {
+      spv::Id motion_clip_slot = builder_->createBinOp(
+          spv::OpIAdd, type_uint_, motion_clip_base,
+          builder_->createBinOp(spv::OpISub, type_uint_, motion_vertex_index, motion_index_min));
+      spv::Id motion_clip;
+      {
+        std::unique_ptr<spv::Instruction> composite_construct_op =
+            std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_float4_,
+                                               spv::OpCompositeConstruct);
+        composite_construct_op->addIdOperand(guest_position_xy);
+        composite_construct_op->addIdOperand(position_w);
+        composite_construct_op->addIdOperand(const_float_1_);
+        motion_clip = composite_construct_op->getResultId();
+        builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
+      }
+      id_vector_temp_.clear();
+      // The only SSBO struct member.
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(motion_clip_slot);
+      builder_->createStore(motion_clip, builder_->createAccessChain(
+                                             motion_clip_storage_class, buffer_motion_clip_,
+                                             id_vector_temp_));
+    }
+    if_motion_clip_store.makeEndIf();
+
+    // Fetch the previous guest clip, which the fragment stage divides by the
+    // interpolated W. Zero the outputs first so a vertex outside the block
+    // interpolates to W = 0, which the fragment treats as no motion.
+    for (size_t i = 0; i < output_motion_prev_clip_.size(); ++i) {
+      builder_->createStore(const_float_0_, output_motion_prev_clip_[i]);
+    }
+    spv::Id motion_prev_clip_base = load_motion_system_constant(kSystemConstantMotionPrevClipBase);
+    SpirvBuilder::IfBuilder if_motion_prev_clip_load(
+        builder_->createBinOp(
+            spv::OpLogicalAnd, type_bool_,
+            builder_->createBinOp(spv::OpINotEqual, type_bool_, motion_prev_clip_base,
+                                  builder_->makeUintConstant(UINT32_MAX)),
+            motion_index_in_range),
+        spv::SelectionControlDontFlattenMask, *builder_);
+    {
+      spv::Id motion_clip_slot = builder_->createBinOp(
+          spv::OpIAdd, type_uint_, motion_prev_clip_base,
+          builder_->createBinOp(spv::OpISub, type_uint_, motion_vertex_index, motion_index_min));
+      id_vector_temp_.clear();
+      // The only SSBO struct member.
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(motion_clip_slot);
+      spv::Id motion_prev_clip = builder_->createLoad(
+          builder_->createAccessChain(motion_clip_storage_class, buffer_motion_clip_,
+                                      id_vector_temp_),
+          spv::NoPrecision);
+      for (uint32_t i = 0; i < 3; ++i) {
+        builder_->createStore(
+            builder_->createCompositeExtract(motion_prev_clip, type_float_, i),
+            output_motion_prev_clip_[i]);
+      }
+    }
+    if_motion_prev_clip_load.makeEndIf();
   }
 
   uint32_t clip_distance_next_component = 0;
@@ -2885,6 +3088,21 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
       ++input_location;
     }
+
+    // Phase 2 motion guide: the interpolated previous guest clip position.
+    // Host-only inputs, allocated after the point coordinates so the guest
+    // interpolator and point locations are unchanged.
+    if (shader_modification.pixel.motion_guide) {
+      for (uint32_t i = 0; i < 3; ++i) {
+        input_motion_prev_clip_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassInput, type_float_,
+            fmt::format("xe_in_motion_prev_clip_{}", i).c_str());
+        builder_->addDecoration(input_motion_prev_clip_[i], spv::DecorationLocation,
+                                int(input_location));
+        main_interface_.push_back(input_motion_prev_clip_[i]);
+        ++input_location;
+      }
+    }
   }
 
   bool float24_depth_conversion = IsWritingFloat24Depth();
@@ -2901,7 +3119,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
+      shader_modification.pixel.motion_guide) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
@@ -2983,6 +3202,19 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       builder_->addDecoration(output_fragment_sample_mask_, spv::DecorationBuiltIn,
                               spv::BuiltInSampleMask);
       main_interface_.push_back(output_fragment_sample_mask_);
+    }
+    output_fragment_motion_ = spv::NoResult;
+    if (shader_modification.pixel.motion_guide) {
+      // Phase 2 motion guide: its own colour attachment after the guest render
+      // targets, so the fragment output location is the subpass attachment
+      // index.
+      assert_true(!is_depth_only_fragment_shader_);
+      output_fragment_motion_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassOutput, type_float4_, "xe_out_fragment_motion");
+      builder_->addDecoration(output_fragment_motion_, spv::DecorationLocation,
+                              int(xenos::kMaxColorRenderTargets));
+      builder_->addDecoration(output_fragment_motion_, spv::DecorationInvariant);
+      main_interface_.push_back(output_fragment_motion_);
     }
   }
 }

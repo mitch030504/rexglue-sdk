@@ -168,6 +168,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
+  // Whether the Phase 2 motion guide is active this session: the motion_guide
+  // cvar, device support, the render target cache accepting the attachment, and
+  // the clip arena existing. The primitive processor asks this to decide whether
+  // it should scan a draw's index stream.
+  bool motion_guide_enabled() const { return motion_guide_enabled_; }
+
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
   // bottom of pipe should be specified only if explicitly needed). Returning
@@ -487,6 +493,72 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
+  // Phase 2 motion guide clip arena (see the state block below).
+  struct MotionClipBlock {
+    // Offset of the block inside either half of the arena, in float4 slots. The
+    // same layout is used in both halves, so the previous frame's block is at the
+    // same offset in the other half.
+    uint32_t slot_offset;
+    // Size of the block in slots, and the gl_VertexIndex window it covers. Never
+    // shrinks: a stable draw keeps its offset and its history.
+    uint32_t capacity;
+    uint32_t index_min;
+    uint32_t index_max;
+    // Guest frame that last recorded clip data into this block, or UINT64_MAX if
+    // it has never been issued. Only a block written on frame - 1 may be read.
+    uint64_t last_frame;
+    // Order-sensitive identity of the index set drawn last (stream + the fields
+    // that select it). A different identity means the slots mean different
+    // vertices, so the whole draw loses history.
+    uint64_t index_fingerprint;
+    // One identity key can be drawn as several primitives (sub-draws). The block
+    // is placed once per frame and every sub-draw reuses that placement and its
+    // history decision; re-placing it per sub-draw moved the offset within the
+    // frame and made previous-frame history impossible.
+    uint64_t allocated_frame = UINT64_MAX;
+    uint32_t frame_prev_clip_base = UINT32_MAX;
+  };
+  // Per-draw result handed to the system constants. 0xFFFFFFFF in either base
+  // disables that side in the shader.
+  struct MotionClipDraw {
+    uint64_t key = 0;
+    uint32_t clip_base = UINT32_MAX;
+    uint32_t prev_clip_base = UINT32_MAX;
+    uint32_t index_min = 0;
+    uint32_t index_max = 0;
+    bool allocated = false;
+  };
+  enum class MotionClipInvalidationReason : uint32_t {
+    // ClearCaches (also the path a draw resolution change takes).
+    kClearCache,
+    // Draw resolution scale observed to have changed.
+    kResize,
+    kDeviceLoss,
+    // The current half had no room for the layout.
+    kArenaFull,
+
+    kCount,
+  };
+  // Rotates the allocator to a guest frame: parity, layout, per-frame counters
+  // and the arena barrier. Idempotent for the same frame; called at XE_SWAP and
+  // on kBegin, always with guest_frame_count().
+  void AdvanceMotionFrame(uint64_t frame);
+  // Records the queued arena barrier once the submission is open. Called at the
+  // rotation point and before the first pass entry after it.
+  void FlushPendingMotionArenaBarrier();
+  // Drops every block, for a reason that makes the previous layout unreadable.
+  void ResetMotionClipAllocator(MotionClipInvalidationReason reason);
+  // Places the draw's block, decides whether the previous half is readable, and
+  // fills the constants. Returns false only if the arena cannot be rebuilt.
+  bool AllocateMotionClipBlock(uint64_t key, uint32_t draw_index_min, uint32_t draw_index_max,
+                               uint64_t index_fingerprint, MotionClipDraw& draw_out);
+  // Stamps the block as written for the current guest frame. Called only after
+  // the draw command has actually been recorded.
+  void CommitMotionClipBlock(uint64_t key);
+  // Fills motion_scene_uv_scale/offset (and leaves the jitter at zero, see the
+  // definition) for the current viewport.
+  void UpdateMotionSceneConstants(const draw_util::ViewportInfo& viewport_info);
+
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -551,19 +623,63 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkBuffer motion_clip_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory motion_clip_buffer_memory_ = VK_NULL_HANDLE;
 
+  // One clip is a float4 (xy = guest clip xy, z = clip w, w = written), so a slot
+  // is 16 bytes and each half of the arena is kMotionClipSlotsPerHalf slots. The
+  // shader indexes the arena in exactly these units.
+  static constexpr uint32_t kMotionClipSlotBytes = sizeof(float) * 4;
+  static constexpr uint32_t kMotionClipSlotsPerHalf =
+      uint32_t(kMotionClipArenaBytes / 2 / kMotionClipSlotBytes);
+  // A single draw may not reserve the whole half: max - min + 1 can be enormous
+  // for a sparse index set, and one such draw would evict every other block.
+  static constexpr uint32_t kMotionClipMaxDrawSlots = UINT32_C(1) << 20;
+
+  // Guest frame the allocator is currently laid out for, UINT64_MAX before the
+  // first rotation. Draws use this, not the trace marker's frame, because the
+  // marker's count is CPU-side and drifts from the GPU's presented frames.
+  uint64_t motion_frame_ = UINT64_MAX;
+  // Half the current frame writes; the other half was written by frame - 1.
+  uint32_t motion_parity_ = 0;
+  // Slots reserved so far in the current frame's layout. Reset every frame, so a
+  // stable draw order and a stable capacity reproduce the previous layout and
+  // keep each block at its previous offset.
+  uint32_t motion_frame_slot_cursor_ = 0;
+  bool motion_arena_barrier_pending_ = false;
+  // Mirrors render_target_cache_'s sticky scene predicate so the once-per-change
+  // log can name the transition without querying it.
+  bool motion_scene_draw_ = false;
+  std::unordered_map<uint64_t, MotionClipBlock> motion_clip_blocks_;
+  uint32_t motion_clip_invalidations_[size_t(MotionClipInvalidationReason::kCount)] = {};
+  // Draw resolution scale the guide attachment was created under; a change
+  // relayouts every framebuffer, so the arena layout must be rebuilt and counted
+  // instead of trusting the previous half.
+  uint32_t motion_resolution_scale_x_ = 0;
+  uint32_t motion_resolution_scale_y_ = 0;
+
   // Phase 2 motion guide: the key carried by the most recent kMotion marker and the
   // draw that consumes it. Set on the CP thread by OnTraceMarker, taken by the next
   // IssueDraw and written into the system constants; `pending` is cleared on use so
   // a key can never leak into a second draw. The counters make a key/draw mismatch
-  // visible instead of silent, and are logged once per frame on kBegin.
+  // visible instead of silent, and are logged once per frame at the rotation.
   uint64_t motion_pending_key_ = 0;
   bool motion_pending_valid_ = false;
-  bool motion_seen_ = false;
-  uint64_t motion_logged_frame_ = UINT64_MAX;
   uint32_t motion_frame_keys_ = 0;
   uint32_t motion_frame_draws_ = 0;
   uint32_t motion_frame_missing_ = 0;
   uint32_t motion_frame_stale_ = 0;
+  // Draws a key was emitted for that cannot record: the vertex shader has no motion
+  // variant (interpolator capacity / host vertex type / guide path), or the index
+  // stream was not CPU-readable to bound the block. They explain why the block
+  // count can be far below the key count.
+  uint32_t motion_frame_no_variant_ = 0;
+  uint32_t motion_frame_no_bounds_ = 0;
+  // Keyed draws whose viewport is not the 1000x600 scene (effects, shadow passes).
+  uint32_t motion_frame_no_viewport_ = 0;
+  // Draws whose block had a complete, unchanged previous-frame index set - the
+  // only draws that can produce non-zero motion this frame.
+  uint32_t motion_frame_history_ = 0;
+  uint32_t motion_frame_reallocated_ = 0;
+  uint32_t motion_frame_index_set_changed_ = 0;
+  uint32_t motion_frame_clamped_ = 0;
 
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;

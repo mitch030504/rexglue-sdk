@@ -1365,6 +1365,112 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     }
   }
 
+  // Phase 2 motion guide. Write after the alpha test and the guest colour
+  // targets: a discarded fragment has already left through OpKill, and the
+  // guide attachment is only merged for host render targets. A draw without a
+  // usable previous-frame key, or a fragment whose interpolated previous W is
+  // not positive, writes an explicit zero rather than leaving the attachment
+  // undefined.
+  if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.motion_guide) {
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    assert_true(output_fragment_motion_ != spv::NoResult);
+    for (size_t i = 0; i < input_motion_prev_clip_.size(); ++i) {
+      assert_true(input_motion_prev_clip_[i] != spv::NoResult);
+    }
+
+    auto load_motion_system_constant = [this](SystemConstantIndex index) -> spv::Id {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(builder_->makeIntConstant(index));
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                      id_vector_temp_util_),
+          spv::NoPrecision);
+    };
+
+    spv::Id motion_prev_w = builder_->createLoad(input_motion_prev_clip_[2], spv::NoPrecision);
+    spv::Id motion_valid = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                              load_motion_system_constant(kSystemConstantMotionKeyValid),
+                              const_uint_0_),
+        builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, motion_prev_w, const_float_0_));
+    SpirvBuilder::IfBuilder if_motion_valid(motion_valid, spv::SelectionControlDontFlattenMask,
+                                            *builder_);
+    {
+      // The scene UV constants map the host pixel centre to the guest scene,
+      // which is the space the CPU authored the guide mapping for - deriving it
+      // from the viewport here would miss the letterboxing and the guest Y
+      // direction.
+      uint_vector_temp_.clear();
+      uint_vector_temp_.push_back(0);
+      uint_vector_temp_.push_back(1);
+      spv::Id motion_frag_xy = builder_->createRvalueSwizzle(
+          spv::NoPrecision, type_float2_,
+          builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision), uint_vector_temp_);
+      spv::Id motion_scale_x = load_motion_system_constant(kSystemConstantMotionSceneUVScaleX);
+      spv::Id motion_scale_y = load_motion_system_constant(kSystemConstantMotionSceneUVScaleY);
+      spv::Id motion_offset_x = load_motion_system_constant(kSystemConstantMotionSceneUVOffsetX);
+      spv::Id motion_offset_y = load_motion_system_constant(kSystemConstantMotionSceneUVOffsetY);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(motion_scale_x);
+      id_vector_temp_.push_back(motion_scale_y);
+      spv::Id motion_scene_uv_scale =
+          builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(motion_offset_x);
+      id_vector_temp_.push_back(motion_offset_y);
+      spv::Id motion_scene_uv_offset =
+          builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+      spv::Id motion_scene_uv = builder_->createBinOp(
+          spv::OpFAdd, type_float2_,
+          builder_->createBinOp(spv::OpFMul, type_float2_, motion_frag_xy, motion_scene_uv_scale),
+          motion_scene_uv_offset);
+      spv::Id motion_current_ndc = builder_->createBinOp(
+          spv::OpFSub, type_float2_,
+          builder_->createBinOp(spv::OpVectorTimesScalar, type_float2_, motion_scene_uv,
+                                builder_->makeFloatConstant(2.0f)),
+          const_float2_1_);
+
+      spv::Id motion_prev_x = builder_->createLoad(input_motion_prev_clip_[0], spv::NoPrecision);
+      spv::Id motion_prev_y = builder_->createLoad(input_motion_prev_clip_[1], spv::NoPrecision);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(motion_prev_x);
+      id_vector_temp_.push_back(motion_prev_y);
+      spv::Id motion_prev_xy = builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+      spv::Id motion_prev_ndc = builder_->createBinOp(
+          spv::OpFDiv, type_float2_, motion_prev_xy,
+          builder_->smearScalar(spv::NoPrecision, motion_prev_w, type_float2_));
+
+      spv::Id motion_jitter_x = load_motion_system_constant(kSystemConstantMotionJitterUVX);
+      spv::Id motion_jitter_y = load_motion_system_constant(kSystemConstantMotionJitterUVY);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(motion_jitter_x);
+      id_vector_temp_.push_back(motion_jitter_y);
+      spv::Id motion_jitter_uv = builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+      // The jitter is removed here so the temporal filter never sees it as
+      // object motion.
+      spv::Id motion = builder_->createBinOp(
+          spv::OpFSub, type_float2_,
+          builder_->createBinOp(spv::OpFSub, type_float2_, motion_current_ndc, motion_prev_ndc),
+          motion_jitter_uv);
+      spv::Id motion_out;
+      {
+        std::unique_ptr<spv::Instruction> composite_construct_op =
+            std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_float4_,
+                                               spv::OpCompositeConstruct);
+        composite_construct_op->addIdOperand(motion);
+        composite_construct_op->addIdOperand(const_float_0_);
+        composite_construct_op->addIdOperand(const_float_1_);
+        motion_out = composite_construct_op->getResultId();
+        builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
+      }
+      builder_->createStore(motion_out, output_fragment_motion_);
+    }
+    if_motion_valid.makeBeginElse();
+    builder_->createStore(const_float4_0_, output_fragment_motion_);
+    if_motion_valid.makeEndIf();
+  }
+
   if (!edram_fragment_shader_interlock_ && output_fragment_depth_ != spv::NoResult) {
     Modification::DepthStencilMode depth_stencil_mode =
         GetSpirvShaderModification().pixel.depth_stencil_mode;

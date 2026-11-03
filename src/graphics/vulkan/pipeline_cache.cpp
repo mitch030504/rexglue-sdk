@@ -955,6 +955,24 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
       device_properties.shaderCullDistance &&
       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
 
+  // Phase 2 motion guide. Selected per shader from the device and the
+  // interpolator budget only, never from the motion key, so a scene phase
+  // change cannot thrash the pipeline cache. A draw without a complete
+  // previous-frame index set keeps this variant and is stubbed by
+  // motion_key_valid = 0. The guide is a fifth host colour attachment, which
+  // the EDRAM-interlock path cannot provide.
+  uint32_t motion_guide_interpolator_count = rex::bit_count(interpolator_mask);
+  uint32_t motion_guide_output_location_count =
+      3 + (modification.vertex.output_point_parameters ? 1 : 0);
+  modification.vertex.motion_guide =
+      uint32_t(host_vertex_shader_type == Shader::HostVertexShaderType::kVertex &&
+               render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+               command_processor_.motion_guide_enabled() &&
+               motion_guide_interpolator_count + motion_guide_output_location_count <=
+                   xenos::kMaxInterpolators &&
+               (motion_guide_interpolator_count + motion_guide_output_location_count) * 4 <=
+                   device_properties.maxVertexOutputComponents);
+
   return modification;
 }
 
@@ -1006,6 +1024,31 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       }
     }
   }
+
+  // Phase 2 motion guide: the fragment half of the vertex variant. The host
+  // vertex type was picked before this call and is not visible here, so the
+  // primitive types that the primitive processor or a geometry shader can
+  // expand are excluded - the motion variant has no stage to forward its
+  // interpolators through. The interpolator count is the same one the vertex
+  // side uses, so a fragment motion variant always has its vertex counterpart.
+  const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  bool motion_guide_primitive_supported =
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kPointList &&
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList &&
+      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kQuadList &&
+      !(xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+        regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+            xenos::VGTOutputPath::kTessellationEnable);
+  uint32_t motion_guide_interpolator_count = rex::bit_count(interpolator_mask);
+  uint32_t motion_guide_input_location_count = 3 + (modification.pixel.param_gen_point ? 1 : 0);
+  modification.pixel.motion_guide =
+      uint32_t(motion_guide_primitive_supported &&
+               render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+               command_processor_.motion_guide_enabled() &&
+               motion_guide_interpolator_count + motion_guide_input_location_count <=
+                   xenos::kMaxInterpolators &&
+               (motion_guide_interpolator_count + motion_guide_input_location_count) * 4 <=
+                   command_processor_.GetVulkanDevice()->properties().maxFragmentInputComponents);
 
   return modification;
 }
@@ -3331,7 +3374,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 
   VkPipelineColorBlendStateCreateInfo color_blend_state = {};
   color_blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  VkPipelineColorBlendAttachmentState color_blend_attachments[xenos::kMaxColorRenderTargets] = {};
+  // The guest render targets plus the optional motion guide attachment.
+  VkPipelineColorBlendAttachmentState color_blend_attachments[xenos::kMaxColorRenderTargets + 1] =
+      {};
   if (!edram_fragment_shader_interlock) {
     uint32_t color_rts_used = description.render_pass_key.depth_and_color_used >> 1;
     {
@@ -3390,7 +3435,22 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         color_blend_attachment.colorWriteMask = VkColorComponentFlags(color_rt.color_write_mask);
       }
     }
-    color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);
+    // The motion guide is transient data rather than guest colour, so it is
+    // never blended and always writes all four components. The pass key, not the
+    // pixel shader modification, is what says the subpass has the fifth
+    // attachment: the same pass also runs draws whose shader is not the motion
+    // variant, and their blend state must still cover all five. Its attachment
+    // index matches the fragment output location.
+    if (description.render_pass_key.motion_attachment_used) {
+      VkPipelineColorBlendAttachmentState& motion_blend_attachment =
+          color_blend_attachments[xenos::kMaxColorRenderTargets];
+      motion_blend_attachment.blendEnable = VK_FALSE;
+      motion_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+      color_blend_state.attachmentCount = xenos::kMaxColorRenderTargets + 1;
+    } else {
+      color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);
+    }
     color_blend_state.pAttachments = color_blend_attachments;
   }
 
@@ -3422,7 +3482,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
 
   VkPipelineRenderingCreateInfo pipeline_rendering_create_info = {};
-  VkFormat color_attachment_formats[xenos::kMaxColorRenderTargets] = {};
+  VkFormat color_attachment_formats[xenos::kMaxColorRenderTargets + 1] = {};
   bool use_dynamic_rendering =
       REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
   if (use_dynamic_rendering) {
@@ -3440,6 +3500,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         color_attachment_formats[i] = render_target_cache_.GetColorVulkanFormat(color_formats[i]);
         color_attachment_count = i + 1;
       }
+    }
+    // The dynamic rendering path must describe the same attachment set as the
+    // VkRenderingInfo the pass builds: the guide is always attachment 4, so the
+    // count covers the unused guest slots below it exactly like the render pass
+    // path does.
+    if (key.motion_attachment_used) {
+      color_attachment_formats[xenos::kMaxColorRenderTargets] =
+          VulkanRenderTargetCache::kMotionGuideAttachmentFormat;
+      color_attachment_count = xenos::kMaxColorRenderTargets + 1;
     }
     pipeline_rendering_create_info.colorAttachmentCount = color_attachment_count;
     pipeline_rendering_create_info.pColorAttachmentFormats =

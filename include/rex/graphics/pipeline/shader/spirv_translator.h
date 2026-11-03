@@ -917,6 +917,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    // Phase 2 motion guide. These members are appended to the uniform block only
+    // when the shader itself is a motion variant, so every other translation
+    // keeps its existing member indices and offsets. The vec2 fields of
+    // SystemConstants are split into two scalars because the struct is 4-byte
+    // aligned and std140 requires 8-byte alignment for a two-component vector.
+    kSystemConstantMotionClipBase,
+    kSystemConstantMotionPrevClipBase,
+    kSystemConstantMotionKeyValid,
+    kSystemConstantMotionSceneUVScaleX,
+    kSystemConstantMotionSceneUVScaleY,
+    kSystemConstantMotionSceneUVOffsetX,
+    kSystemConstantMotionSceneUVOffsetY,
+    kSystemConstantMotionJitterUVX,
+    kSystemConstantMotionJitterUVY,
+    kSystemConstantMotionIndexMin,
+    kSystemConstantMotionIndexMax,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -925,6 +941,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
+
+  // Phase 2 motion guide, vertex motion variant only - the clip arena, an SSBO
+  // of vec4 slots.
+  spv::Id buffer_motion_clip_;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
@@ -968,6 +988,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id output_point_coordinates_;
   // VS, only when needed - float.
   spv::Id output_point_size_;
+  // VS motion variant only - float3, the previous-frame guest clip position
+  // (x, y, w), interpolated rather than divided so the PS reconstructs the
+  // previous NDC with the primitive's own perspective.
+  std::array<spv::Id, 3> output_motion_prev_clip_;
 
   enum OutputPerVertexMember : unsigned int {
     kOutputPerVertexMemberPosition,
@@ -984,6 +1008,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // With fragment shader interlock, variables in the main function.
   // Otherwise, framebuffer color attachment outputs.
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_or_var_fragment_data_;
+  // PS motion variant only - float3, the interpolated previous-frame guest clip
+  // position (x, y, w).
+  std::array<spv::Id, 3> input_motion_prev_clip_;
+  // PS motion variant only - float4, the motion guide output at the attachment
+  // index after the guest color render targets.
+  spv::Id output_fragment_motion_;
   // For host render targets and only when needed - float.
   spv::Id output_fragment_depth_;
   // For host render targets and only when needed - int[1].

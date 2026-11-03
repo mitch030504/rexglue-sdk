@@ -514,6 +514,15 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                         kUsedColorFormatFeatures) == kUsedColorFormatFeatures;
   bool color_rgba16_unorm_supported = (color_rgba16_unorm_properties.optimalTilingFeatures &
                                        kUsedColorFormatFeatures) == kUsedColorFormatFeatures;
+  // Phase 2 motion guide: the guide is written as a colour attachment this stage
+  // and read back (dump, then the single-sample resolve) next stage, so a format
+  // that cannot do both would produce an attachment nothing can consume. This is a
+  // device fact, not the guide's state - SetMotionGuideEnabled reports it.
+  VkFormatProperties motion_guide_properties;
+  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, kMotionGuideAttachmentFormat,
+                                          &motion_guide_properties);
+  motion_guide_format_supported_ = (motion_guide_properties.optimalTilingFeatures &
+                                    kUsedColorFormatFeatures) == kUsedColorFormatFeatures;
   bool color_rg16_draw_format_supported = true;
   if (!color_rg16_snorm_supported) {
     if (color_rg16_sfloat_supported) {
@@ -1339,7 +1348,10 @@ void VulkanRenderTargetCache::ClearCache() {
   const VkDevice device = vulkan_device->device();
 
   // Framebuffer objects must be destroyed because they reference views of
-  // attachment images, which may be removed by the common ClearCache.
+  // attachment images, which may be removed by the common ClearCache. Clearing the
+  // map also runs ~Framebuffer, which releases that framebuffer's motion guide
+  // image, memory and view - the guide is not a render target, so nothing below
+  // would free it.
   last_update_framebuffer_ = VK_NULL_HANDLE;
   for (const auto& framebuffer_pair : framebuffers_) {
     dfn.vkDestroyFramebuffer(device, framebuffer_pair.second.framebuffer, nullptr);
@@ -3276,6 +3288,35 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   return copied && cleared;
 }
 
+bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
+  const bool was_enabled = motion_guide_enabled();
+  motion_guide_requested_ = enabled;
+  const bool is_enabled = motion_guide_enabled();
+  // Only on a state change, so a one-shot call from the command processor leaves
+  // exactly one line and a repeated call says nothing new.
+  if (is_enabled != was_enabled) {
+    if (is_enabled) {
+      REXGPU_INFO("motion_guide active: attachment={} of {} format={}",
+                  kMotionGuideColorAttachmentIndex, kMotionGuideColorAttachmentCount,
+                  uint32_t(kMotionGuideAttachmentFormat));
+    } else {
+      // An inactive reason has to be nameable, not silent: either the backend
+      // cannot carry a fifth attachment at all or this device cannot use the
+      // attachment format. The command processor adds its own reasons
+      // (motion_guide off, SupportsMotionGuide false).
+      REXGPU_INFO("motion_guide inactive: path={} format_supported={} requested={}",
+                  GetPath() == Path::kHostRenderTargets ? "host_render_targets"
+                                                        : "pixel_shader_interlock",
+                  motion_guide_format_supported_ ? 1 : 0, enabled ? 1 : 0);
+    }
+  }
+  return is_enabled;
+}
+
+void VulkanRenderTargetCache::SetMotionGuideSceneDraw(bool scene_draw) {
+  motion_guide_scene_draw_ = scene_draw;
+}
+
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -3398,6 +3439,24 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
             depth_and_color_render_targets[4]->key().GetColorFormat();
       }
 
+      // Phase 2 motion guide: the guide is a fifth colour attachment, so it is
+      // only added to a pass that already has a guest attachment - with none,
+      // host_extent is the no-attachment fallback and the guide image would be
+      // allocated at that size for a draw that cannot write fragments. The phase
+      // predicate is deliberately not guessed here: the same attachments and the
+      // same shaders serve the scene, the HUD and full-screen effects, so the
+      // command processor, which owns the frame's phase, sets it. Everything else
+      // (guide disabled, no format support, the interlock path) keeps this bit
+      // clear, and therefore keeps every key, render pass and framebuffer exactly
+      // as it was before the guide existed.
+      // The guide attachment belongs to the four-colour-target scene pass. The
+      // command processor's phase flag toggles per batch, so it cannot decide a
+      // pass key; the target shape can, and it is also what makes the fragment
+      // output location (4) equal to the subpass attachment index.
+      if (motion_guide_enabled() && (render_pass_key.depth_and_color_used & 0x1E) == 0x1E) {
+        render_pass_key.motion_attachment_used = 1;
+      }
+
       const Framebuffer* framebuffer = last_update_framebuffer_;
       VkRenderPass render_pass = last_update_render_pass_key_ == render_pass_key
                                      ? last_update_render_pass_
@@ -3486,8 +3545,8 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
 }
 
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
-    VkRenderingAttachmentInfo* color_attachments, uint32_t* color_attachment_count_out,
-    VkRenderingAttachmentInfo* depth_attachment,
+    VkRenderingAttachmentInfo* color_attachments, uint32_t color_attachment_capacity,
+    uint32_t* color_attachment_count_out, VkRenderingAttachmentInfo* depth_attachment,
     VkRenderingAttachmentInfo* stencil_attachment) const {
   RenderPassKey key = last_update_render_pass_key_;
   RenderTarget* const* rts = last_update_accumulated_render_targets();
@@ -3529,7 +3588,93 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       color_attachment_count = i + 1;
     }
   }
+
+  // Phase 2 motion guide: the guide is location 4 even when a guest colour target
+  // below it is unused, because a fragment output location cannot be renumbered -
+  // the uncovered entries stay zeroed, which dynamic rendering treats as an unused
+  // attachment. The view comes from the framebuffer the pass was actually built
+  // with, so it always matches the render pass's fifth attachment.
+  if (key.motion_attachment_used && last_update_framebuffer_ != nullptr &&
+      last_update_framebuffer_->motion_view != VK_NULL_HANDLE) {
+    assert_true(color_attachment_capacity > kMotionGuideColorAttachmentIndex);
+    if (color_attachment_capacity > kMotionGuideColorAttachmentIndex) {
+      VkRenderingAttachmentInfo& motion_attachment =
+          color_attachments[kMotionGuideColorAttachmentIndex];
+      std::memset(&motion_attachment, 0, sizeof(VkRenderingAttachmentInfo));
+      motion_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      motion_attachment.pNext = nullptr;
+      motion_attachment.imageView = last_update_framebuffer_->motion_view;
+      motion_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      motion_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
+      motion_attachment.resolveImageView = VK_NULL_HANDLE;
+      motion_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      // LOAD, not CLEAR: a clear on every begin would erase the motion a resumed
+      // pass already wrote. Starting the frame at w = 0 is
+      // MaybeClearMotionAttachment's job.
+      motion_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      motion_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      motion_attachment.clearValue = {};
+      color_attachment_count = kMotionGuideColorAttachmentCount;
+    }
+  }
   *color_attachment_count_out = color_attachment_count;
+}
+
+void VulkanRenderTargetCache::MaybeClearMotionAttachment(const Framebuffer* framebuffer) {
+  if (!framebuffer || framebuffer->motion_view == VK_NULL_HANDLE) {
+    return;
+  }
+  // Once per guest frame per framebuffer. A pass that is ended and resumed within
+  // the frame (transfers, texture loads) re-enters here, and its earlier motion
+  // must survive that; a new frame must not inherit the previous one, because w is
+  // the validity flag and an unwritten pixel has to be invalid.
+  const uint64_t frame = command_processor_.GetCurrentFrame();
+  if (framebuffer->motion_cleared_frame == frame) {
+    return;
+  }
+  if (!framebuffer->host_extent.width || !framebuffer->host_extent.height) {
+    return;
+  }
+  framebuffer->motion_cleared_frame = frame;
+
+  // vkCmdClearAttachments, not an image clear: the pass is already open here, and
+  // a transfer or clear command would be illegal outside a subpass. The index is
+  // the subpass colour attachment index (the same 4 in a dynamic rendering colour
+  // attachment array), not the framebuffer attachment index. All zeroes means
+  // xy = 0 NDC, z = 0 clip w, w = 0 validity.
+  VkClearAttachment clear_attachment;
+  clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  clear_attachment.colorAttachment = kMotionGuideColorAttachmentIndex;
+  clear_attachment.clearValue.color.float32[0] = 0.0f;
+  clear_attachment.clearValue.color.float32[1] = 0.0f;
+  clear_attachment.clearValue.color.float32[2] = 0.0f;
+  clear_attachment.clearValue.color.float32[3] = 0.0f;
+  VkClearRect clear_rect;
+  clear_rect.rect.offset.x = 0;
+  clear_rect.rect.offset.y = 0;
+  clear_rect.rect.extent = framebuffer->host_extent;
+  clear_rect.baseArrayLayer = 0;
+  clear_rect.layerCount = 1;
+  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear_attachment, 1,
+                                                                     &clear_rect);
+}
+
+VkSampleCountFlagBits VulkanRenderTargetCache::GetHostRenderTargetsSampleCount(
+    RenderPassKey key) const {
+  switch (key.msaa_samples) {
+    case xenos::MsaaSamples::k1X:
+      return VK_SAMPLE_COUNT_1_BIT;
+    case xenos::MsaaSamples::k2X:
+      // 2x emulated as 4x is the only case where the host sample count is not the
+      // guest's own count, and it depends on whether the subpass has attachments -
+      // hence it is derived from the same key by both callers, never remembered.
+      return IsMsaa2xSupported(key.depth_and_color_used != 0) ? VK_SAMPLE_COUNT_2_BIT
+                                                              : VK_SAMPLE_COUNT_4_BIT;
+    case xenos::MsaaSamples::k4X:
+      return VK_SAMPLE_COUNT_4_BIT;
+    default:
+      return VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM;
+  }
 }
 
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {
@@ -3540,23 +3685,13 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     return it->second;
   }
 
-  VkSampleCountFlagBits samples;
-  switch (key.msaa_samples) {
-    case xenos::MsaaSamples::k1X:
-      samples = VK_SAMPLE_COUNT_1_BIT;
-      break;
-    case xenos::MsaaSamples::k2X:
-      samples = IsMsaa2xSupported(key.depth_and_color_used != 0) ? VK_SAMPLE_COUNT_2_BIT
-                                                                 : VK_SAMPLE_COUNT_4_BIT;
-      break;
-    case xenos::MsaaSamples::k4X:
-      samples = VK_SAMPLE_COUNT_4_BIT;
-      break;
-    default:
-      return VK_NULL_HANDLE;
+  const VkSampleCountFlagBits samples = GetHostRenderTargetsSampleCount(key);
+  if (samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
+    return VK_NULL_HANDLE;
   }
 
-  VkAttachmentDescription attachments[1 + xenos::kMaxColorRenderTargets];
+  // One extra for the motion guide, appended after the used guest attachments.
+  VkAttachmentDescription attachments[1 + xenos::kMaxColorRenderTargets + 1];
   if (key.depth_and_color_used & 0b1) {
     VkAttachmentDescription& attachment = attachments[0];
     attachment.flags = 0;
@@ -3569,7 +3704,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     attachment.initialLayout = VulkanRenderTarget::kDepthDrawLayout;
     attachment.finalLayout = VulkanRenderTarget::kDepthDrawLayout;
   }
-  VkAttachmentReference color_attachments[xenos::kMaxColorRenderTargets];
+  VkAttachmentReference color_attachments[kMotionGuideColorAttachmentCount];
   xenos::ColorRenderTargetFormat color_formats[] = {
       key.color_0_view_format,
       key.color_1_view_format,
@@ -3601,6 +3736,32 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     attachment.finalLayout = VulkanRenderTarget::kColorDrawLayout;
   }
 
+  // Phase 2 motion guide: described after the guest attachments, so their indices
+  // - and therefore every existing attachment reference and framebuffer view - are
+  // untouched, but referenced as colour attachment 4, so the fragment output
+  // location is fixed. The sample count is the pass's own, never the guest's: it
+  // has to match the render pass's other attachments, and under 2x-as-4x those
+  // are 4x. LOAD rather than CLEAR because a pass can be resumed within a frame;
+  // MaybeClearMotionAttachment establishes the w = 0 start of the frame.
+  VkAttachmentReference& motion_attachment =
+      color_attachments[kMotionGuideColorAttachmentIndex];
+  motion_attachment.attachment = VK_ATTACHMENT_UNUSED;
+  motion_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  if (key.motion_attachment_used) {
+    const uint32_t motion_attachment_index = rex::bit_count(key.depth_and_color_used);
+    VkAttachmentDescription& attachment = attachments[motion_attachment_index];
+    attachment.flags = 0;
+    attachment.format = kMotionGuideAttachmentFormat;
+    attachment.samples = samples;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    motion_attachment.attachment = motion_attachment_index;
+  }
+
   VkAttachmentReference depth_stencil_attachment;
   depth_stencil_attachment.attachment = (key.depth_and_color_used & 0b1) ? 0 : VK_ATTACHMENT_UNUSED;
   depth_stencil_attachment.layout = VulkanRenderTarget::kDepthDrawLayout;
@@ -3610,7 +3771,10 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.inputAttachmentCount = 0;
   subpass.pInputAttachments = nullptr;
-  subpass.colorAttachmentCount = 32 - rex::lzcnt(uint32_t(key.depth_and_color_used >> 1));
+  subpass.colorAttachmentCount =
+      key.motion_attachment_used
+          ? kMotionGuideColorAttachmentCount
+          : uint32_t(32 - rex::lzcnt(uint32_t(key.depth_and_color_used >> 1)));
   subpass.pColorAttachments = color_attachments;
   subpass.pResolveAttachments = nullptr;
   subpass.pDepthStencilAttachment =
@@ -3624,7 +3788,9 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     dependency_stage_mask |= VulkanRenderTarget::kDepthDrawStageMask;
     dependency_access_mask |= VulkanRenderTarget::kDepthDrawAccessMask;
   }
-  if (key.depth_and_color_used >> 1) {
+  // The guide is a colour attachment, so its stage and access count as colour even
+  // for a depth-only pass.
+  if ((key.depth_and_color_used >> 1) || key.motion_attachment_used) {
     dependency_stage_mask |= VulkanRenderTarget::kColorDrawStageMask;
     dependency_access_mask |= VulkanRenderTarget::kColorDrawAccessMask;
   }
@@ -3648,7 +3814,8 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
   render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
   render_pass_create_info.pNext = nullptr;
   render_pass_create_info.flags = 0;
-  render_pass_create_info.attachmentCount = rex::bit_count(key.depth_and_color_used);
+  render_pass_create_info.attachmentCount =
+      rex::bit_count(key.depth_and_color_used) + (key.motion_attachment_used ? 1u : 0u);
   render_pass_create_info.pAttachments = attachments;
   render_pass_create_info.subpassCount = 1;
   render_pass_create_info.pSubpasses = &subpass;
@@ -3815,6 +3982,40 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
   dfn.vkDestroyImage(device, image_, nullptr);
   dfn.vkFreeMemory(device, memory_, nullptr);
+}
+
+VulkanRenderTargetCache::Framebuffer::~Framebuffer() {
+  if (motion_image == VK_NULL_HANDLE && motion_memory == VK_NULL_HANDLE &&
+      motion_view == VK_NULL_HANDLE) {
+    return;
+  }
+  // Only framebuffers created for a pass with the motion bit can own the guide, and
+  // those always know their cache; the interlock framebuffer, which has neither,
+  // returns above.
+  assert_not_null(render_target_cache);
+  if (render_target_cache) {
+    render_target_cache->DestroyMotionGuideAttachment(*this);
+  }
+}
+
+void VulkanRenderTargetCache::DestroyMotionGuideAttachment(Framebuffer& framebuffer) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // Order matters: the framebuffer that references the view is destroyed by the
+  // caller before this runs, and the view must go before its image.
+  if (framebuffer.motion_view != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, framebuffer.motion_view, nullptr);
+    framebuffer.motion_view = VK_NULL_HANDLE;
+  }
+  if (framebuffer.motion_image != VK_NULL_HANDLE) {
+    dfn.vkDestroyImage(device, framebuffer.motion_image, nullptr);
+    framebuffer.motion_image = VK_NULL_HANDLE;
+  }
+  if (framebuffer.motion_memory != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, framebuffer.motion_memory, nullptr);
+    framebuffer.motion_memory = VK_NULL_HANDLE;
+  }
 }
 
 uint32_t VulkanRenderTargetCache::GetMaxRenderTargetWidth() const {
@@ -4223,7 +4424,7 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     return nullptr;
   }
 
-  VkImageView attachments[1 + xenos::kMaxColorRenderTargets];
+  VkImageView attachments[1 + xenos::kMaxColorRenderTargets + 1];
   uint32_t attachment_count = 0;
   uint32_t depth_and_color_rts_remaining = render_pass_key.depth_and_color_used;
   uint32_t rt_index;
@@ -4240,13 +4441,14 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     }
     attachments[attachment_count++] = attachment;
   }
+  // The guest attachments keep their positions: the guide is appended after them,
+  // matching the description and reference it has in the render pass.
 
   VkFramebufferCreateInfo framebuffer_create_info;
   framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
   framebuffer_create_info.pNext = nullptr;
   framebuffer_create_info.flags = 0;
   framebuffer_create_info.renderPass = render_pass;
-  framebuffer_create_info.attachmentCount = attachment_count;
   framebuffer_create_info.pAttachments = attachments;
   VkExtent2D host_extent;
   if (pitch_tiles_at_32bpp) {
@@ -4266,19 +4468,112 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
                                device_properties.maxFramebufferWidth);
   host_extent.height = std::min(host_extent.height * draw_resolution_scale_y(),
                                 device_properties.maxFramebufferHeight);
+
+  // Phase 2 motion guide: created only for a framebuffer whose render pass declares
+  // the guide, at the extent this framebuffer will render to and the sample count
+  // of the pass it belongs to - both taken from here rather than recomputed, so
+  // image and pass can never disagree. A change of extent or sample count is a
+  // change of FramebufferKey, so it produces a new framebuffer (and a new image)
+  // instead of a resize that the GPU could still be reading.
+  VkImage motion_image = VK_NULL_HANDLE;
+  VkDeviceMemory motion_memory = VK_NULL_HANDLE;
+  VkImageView motion_view = VK_NULL_HANDLE;
+  if (render_pass_key.motion_attachment_used) {
+    VkImageCreateInfo motion_image_create_info;
+    motion_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    motion_image_create_info.pNext = nullptr;
+    motion_image_create_info.flags = 0;
+    motion_image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    motion_image_create_info.format = kMotionGuideAttachmentFormat;
+    motion_image_create_info.extent.width = host_extent.width;
+    motion_image_create_info.extent.height = host_extent.height;
+    motion_image_create_info.extent.depth = 1;
+    motion_image_create_info.mipLevels = 1;
+    motion_image_create_info.arrayLayers = 1;
+    motion_image_create_info.samples = GetHostRenderTargetsSampleCount(render_pass_key);
+    motion_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // Sampled for the dump now and for the single-sample resolve later; an
+    // attachment nothing can read could not be validated.
+    motion_image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT;
+    motion_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    motion_image_create_info.queueFamilyIndexCount = 0;
+    motion_image_create_info.pQueueFamilyIndices = nullptr;
+    motion_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, motion_image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            motion_image, motion_memory)) {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache: Failed to create a {}x{} {}xMSAA motion guide "
+          "attachment",
+          host_extent.width, host_extent.height,
+          uint32_t(GetHostRenderTargetsSampleCount(render_pass_key)));
+      return nullptr;
+    }
+    VkImageViewCreateInfo motion_view_create_info;
+    motion_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    motion_view_create_info.pNext = nullptr;
+    motion_view_create_info.flags = 0;
+    motion_view_create_info.image = motion_image;
+    motion_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    motion_view_create_info.format = kMotionGuideAttachmentFormat;
+    motion_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    motion_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    motion_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    motion_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    motion_view_create_info.subresourceRange =
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+    if (dfn.vkCreateImageView(device, &motion_view_create_info, nullptr, &motion_view) !=
+        VK_SUCCESS) {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache: Failed to create a {}x{} view for the motion "
+          "guide attachment",
+          host_extent.width, host_extent.height);
+      dfn.vkDestroyImage(device, motion_image, nullptr);
+      dfn.vkFreeMemory(device, motion_memory, nullptr);
+      return nullptr;
+    }
+    attachments[attachment_count++] = motion_view;
+    // The pass expects the guide in COLOR_ATTACHMENT_OPTIMAL at both ends and LOADs
+    // it, so its layout has to be established once here: an image starts in
+    // UNDEFINED, and a render pass may not load from a layout it does not own. The
+    // barrier is flushed by the SubmitBarriers that precedes entering the pass.
+    command_processor_.PushImageMemoryBarrier(
+        motion_image, ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT), 0,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  }
+
+  // The attachment count is taken after the guide has been appended, so it always
+  // equals the render pass's attachmentCount.
+  framebuffer_create_info.attachmentCount = attachment_count;
   framebuffer_create_info.width = host_extent.width;
   framebuffer_create_info.height = host_extent.height;
   framebuffer_create_info.layers = 1;
   VkFramebuffer framebuffer;
   if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr, &framebuffer) !=
       VK_SUCCESS) {
+    if (motion_view != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, motion_view, nullptr);
+    }
+    if (motion_image != VK_NULL_HANDLE) {
+      dfn.vkDestroyImage(device, motion_image, nullptr);
+    }
+    if (motion_memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, motion_memory, nullptr);
+    }
     return nullptr;
   }
   // Creates at a persistent location - safe to use pointers.
-  return &framebuffers_
-              .emplace(std::piecewise_construct, std::forward_as_tuple(key),
-                       std::forward_as_tuple(framebuffer, host_extent))
-              .first->second;
+  Framebuffer& new_framebuffer =
+      framebuffers_
+          .emplace(std::piecewise_construct, std::forward_as_tuple(key),
+                   std::forward_as_tuple(framebuffer, host_extent, this))
+          .first->second;
+  new_framebuffer.motion_image = motion_image;
+  new_framebuffer.motion_memory = motion_memory;
+  new_framebuffer.motion_view = motion_view;
+  return &new_framebuffer;
 }
 
 VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key) {

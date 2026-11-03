@@ -80,17 +80,54 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   };
   static_assert_size(RenderPassKey, sizeof(uint32_t));
 
-  // Phase 2 motion guide attachment: `xy` is the previous guest NDC, `z` the
-  // previous clip w (the fragment divides), `w` is 1 where the draw had a
-  // complete previous-frame index set. Single-sample by the time NR sees it.
+  // Phase 2 motion guide attachment: `xy` is the final NDC motion (current minus
+  // previous, jitter removed), `z` is 0, `w` is 1 where the draw had a complete
+  // previous-frame index set and the fragment wrote a vector, 0 elsewhere
+  // (including the per-frame clear). Single-sample by the time NR sees it.
   static constexpr VkFormat kMotionGuideAttachmentFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  // The guide is always the fifth colour attachment (fragment output location 4
+  // in the subpass, index 4 in a dynamic rendering colour attachment array), so
+  // its location is the same whether the draw uses one guest colour target or
+  // four. It is appended after the used guest attachments in the render pass and
+  // framebuffer attachment lists, which therefore keep their existing indices.
+  static constexpr uint32_t kMotionGuideColorAttachmentIndex = xenos::kMaxColorRenderTargets;
+  static constexpr uint32_t kMotionGuideColorAttachmentCount = xenos::kMaxColorRenderTargets + 1;
 
   struct Framebuffer {
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkExtent2D host_extent{};
+    // Phase 2 motion guide attachment. Created with the framebuffer, at exactly
+    // this framebuffer's host_extent and the render pass's sample count, and
+    // destroyed with it - the framebuffer is the only object that knows both
+    // values exactly, so nothing can recompute them differently. All three are
+    // VK_NULL_HANDLE unless the render pass key had motion_attachment_used, which
+    // keeps guide-off framebuffers and their memory footprint unchanged.
+    //
+    // The image is not a guest render target: no EDRAM range owns it, no transfer
+    // or resolve sees it, and it is not in the render target cache at all.
+    VkImage motion_image = VK_NULL_HANDLE;
+    VkDeviceMemory motion_memory = VK_NULL_HANDLE;
+    VkImageView motion_view = VK_NULL_HANDLE;
+    // Guest frame number the guide was last cleared on entry to its pass. A pass
+    // may be ended and resumed within one frame (transfers, texture loads), and a
+    // resume must not erase the motion written before the interruption, so the
+    // clear is a once-per-frame stamp rather than a per-entry action. mutable:
+    // clearing mutates the attachment, not the framebuffer's identity.
+    mutable uint64_t motion_cleared_frame = UINT64_MAX;
+    // For ~Framebuffer: destroying the guide needs the Vulkan device, which the
+    // framebuffer does not hold. Nested in the cache, it can reach it.
+    VulkanRenderTargetCache* render_target_cache = nullptr;
     Framebuffer() = default;
-    Framebuffer(VkFramebuffer framebuffer, const VkExtent2D& host_extent)
-        : framebuffer(framebuffer), host_extent(host_extent) {}
+    Framebuffer(VkFramebuffer framebuffer, const VkExtent2D& host_extent,
+                VulkanRenderTargetCache* render_target_cache)
+        : framebuffer(framebuffer),
+          host_extent(host_extent),
+          render_target_cache(render_target_cache) {}
+    ~Framebuffer();
+    // The guide's handles are owned by exactly one framebuffer; a copy would
+    // double-destroy them. Framebuffers are only ever emplaced in place.
+    Framebuffer(const Framebuffer&) = delete;
+    Framebuffer& operator=(const Framebuffer&) = delete;
   };
 
   VulkanRenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
@@ -124,7 +161,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
+  // Colour attachments of the last successful update, for dynamic rendering.
+  // When the pass key has motion_attachment_used, a fifth entry for the motion
+  // guide is written at kMotionGuideColorAttachmentIndex (4) and the count becomes
+  // kMotionGuideColorAttachmentCount (5); indices below 4 may be a hole, which
+  // dynamic rendering treats as an unused attachment, because only the guide's
+  // location is fixed. The caller must therefore provide capacity for 5 entries,
+  // and color_attachment_capacity says how many it has - a caller that only has
+  // room for the four guest targets gets a count of at most 4 instead of an
+  // out-of-bounds write.
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
+                                         uint32_t color_attachment_capacity,
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
@@ -165,6 +212,52 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     assert_true(GetPath() == Path::kPixelShaderInterlock);
     return fsi_render_pass_;
   }
+
+  // Phase 2 motion guide
+  // --------------------
+  // A fifth host render target that the scene-phase draw writes and NR consumes,
+  // owned here and by the command processor only: the render pass and the
+  // per-framebuffer image live in this cache, the descriptor binding (2) and the
+  // 64 MiB clip arena live in the command processor. Nothing about the guide is
+  // visible to the guest or to EDRAM.
+
+  // Turns the guide on or off. The command processor calls this once after device
+  // initialization, from the same state that makes it report the guide as active
+  // (motion_guide cvar plus VulkanDevice::SupportsMotionGuide). Returns whether
+  // the guide is actually active; if it returns false, the command processor must
+  // keep the guide inactive and report its own reason, because this cache will
+  // never set motion_attachment_used. False here means the host render target
+  // path is not the active one, or this device cannot use the attachment format
+  // as a color attachment that can also be sampled. Requesting the guide while it
+  // is not active creates no image and changes no key, so a guide-off run allocates
+  // nothing.
+  bool SetMotionGuideEnabled(bool enabled);
+  bool motion_guide_enabled() const {
+    return motion_guide_requested_ && path_ == Path::kHostRenderTargets &&
+           motion_guide_format_supported_;
+  }
+
+  // Whether the draw being updated belongs to the scene phase, and thus must
+  // write the guide. The cache cannot infer this: the guest's register state and
+  // the shaders have the same shape for the scene, the HUD and full-screen
+  // effects, so only the command processor, which owns the frame's phase, knows.
+  // Sticky until changed, so it can be set once when the scene phase begins and
+  // cleared once when it ends. Only takes effect while motion_guide_enabled() and
+  // the pass has at least one guest attachment (with none, the framebuffer extent
+  // is the no-attachment fallback and a guide image would be huge and unwritable).
+  void SetMotionGuideSceneDraw(bool scene_draw);
+  bool motion_guide_scene_draw() const { return motion_guide_scene_draw_; }
+
+  // Clears a framebuffer's guide attachment at most once per guest frame, so the
+  // guide starts each frame with w = 0 (a pixel no draw writes must be invalid,
+  // not carry a previous frame's motion) while a pass that is ended and resumed
+  // within the frame keeps what was written before the interruption. Call it
+  // immediately after entering the render pass - or after vkCmdBeginRendering on
+  // the dynamic rendering path - for the framebuffer just bound, inside the render
+  // pass instance: the clear is recorded with vkCmdClearAttachments, which is the
+  // only clear allowed inside a pass. A framebuffer without a guide, and a second
+  // entry into the same framebuffer in the same frame, do nothing.
+  void MaybeClearMotionAttachment(const Framebuffer* framebuffer);
 
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
@@ -792,6 +885,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
       const RenderTarget* const* depth_and_color_render_targets);
 
+  // Host sample count of a pass key - the same value its render pass and its
+  // framebuffer are built with, so the motion guide attachment can never disagree
+  // with the pass it is attached to. 2x emulated as 4x is the only case where it
+  // differs from the guest's own count. VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM if the
+  // guest count is not supported.
+  VkSampleCountFlagBits GetHostRenderTargetsSampleCount(RenderPassKey key) const;
+  // Destroys the guide image, memory and view of a framebuffer, if any. Called by
+  // ~Framebuffer, so every path that destroys a framebuffer - ClearCache,
+  // Shutdown, a failed creation - releases the guide too.
+  void DestroyMotionGuideAttachment(Framebuffer& framebuffer);
+
   VkShaderModule GetTransferShader(TransferShaderKey key);
   // With sample-rate shading, returns a pointer to one pipeline. Without
   // sample-rate shading, returns a pointer to as many pipelines as there are
@@ -904,6 +1008,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // as 4x, which is 2. Depth cannot be resolved, so sample count is part of the
   // pipeline key (a non-multisampled image has no sample operand to fetch from).
   VkPipeline GetDepthProbePipeline(uint32_t host_sample_count_log2);
+
+  // Phase 2 motion guide state (see the public API). The format support is a
+  // device fact from Initialize; the request is the command processor's; the
+  // guide is only active when both hold and the host render target path is in
+  // use, which is what keeps motion_attachment_used out of every other key.
+  bool motion_guide_requested_ = false;
+  bool motion_guide_format_supported_ = false;
+  bool motion_guide_scene_draw_ = false;
 
   bool gamma_render_target_as_unorm16_ = false;
 
