@@ -2595,7 +2595,7 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     // composite. This is the frame's gate, not a timing guess.
     return;
   }
-  const uint64_t frame64 = command_processor_.GetCurrentFrame();
+  const uint64_t frame64 = command_processor_.motion_guide_frame();
   const uint32_t frame = uint32_t(frame64);
   // Composite in last-draw order. The list is first-touch order, but keep_existing
   // is last-dispatch-wins: a pass re-entered after another pass would otherwise keep
@@ -2677,12 +2677,13 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     if (dump_window) {
       REXGPU_INFO(
           "motion_resolve candidate frame={} fb={} draw_frame={} cleared_frame={} image={} "
-          "view={} samples={} extent={}x{} serial={} draws={}",
+          "view={} samples={} extent={}x{} serial={} draws={} history_draws={}",
           frame, static_cast<const void*>(framebuffer), framebuffer->motion_draw_frame,
           framebuffer->motion_cleared_frame, framebuffer->motion_image ? 1 : 0,
           framebuffer->motion_view ? 1 : 0, uint32_t(framebuffer->motion_samples),
           framebuffer->host_extent.width, framebuffer->host_extent.height,
-          framebuffer->motion_last_draw_serial, framebuffer->motion_draw_count);
+          framebuffer->motion_last_draw_serial, framebuffer->motion_draw_count,
+          framebuffer->motion_history_draw_count);
     }
     if (framebuffer->motion_draw_frame != frame64) {
       // The entry outlived the frame it was recorded for: the previous swap could
@@ -2730,18 +2731,21 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // Between dispatches: the previous dispatch wrote the output buffer, and the
-    // next one writes the same range. SHADER_READ is in the destination scope
-    // because keep_existing reads what earlier passes left in the buffer
-    // conceptually - a later dispatch must not be reordered before the earlier
-    // one's writes. No barrier is needed before the first dispatch, because it
-    // overwrites the whole buffer and nothing reads the old contents.
-    if (resolved_count != 0) {
-      command_processor_.PushBufferMemoryBarrier(
-          motion_guide_output_buffer_, 0, kMotionGuideBytes, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    }
+    // The first dispatch of the frame overwrites the whole buffer, but it still
+    // must not race the previous frame's dump copy (a TRANSFER_READ on the same
+    // buffer) or the previous frame's dispatches, which may still be in flight.
+    // Later dispatches read what the earlier one wrote, so they need the RAW/WAR
+    // pair within the frame too.
+    command_processor_.PushBufferMemoryBarrier(
+        motion_guide_output_buffer_, 0, kMotionGuideBytes,
+        VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) |
+            (resolved_count == 0 ? VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT)
+                                 : VkPipelineStageFlags(0)),
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT) |
+            (resolved_count == 0 ? VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT)
+                                 : VkAccessFlags(0)),
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     // Flushed before the dispatch is recorded: SubmitBarriers emits the pending
     // barriers at the current position in the deferred command stream, so a barrier
     // pushed now and flushed later would land after the dispatch it orders.
@@ -2781,8 +2785,14 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     ++resolved_count;
   }
   if (resolved_count == 0) {
+    // The output buffer still holds the previous frame's field. It must not be
+    // presented as this frame's: record that no field was produced so a consumer
+    // falls back instead of reading stale motion, and name the refusal.
+    motion_guide_output_frame_ = UINT64_MAX;
+    skip("no_candidate_resolved");
     return;
   }
+  motion_guide_output_frame_ = frame;
 
   if (motion_guide_resolve_logs_ < 4 || dump_window) {
     ++motion_guide_resolve_logs_;
@@ -3129,6 +3139,12 @@ void VulkanRenderTargetCache::DestroyMotionGuideResources() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          motion_guide_descriptor_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, motion_guide_sampler_);
+  // A pending dump is dropped when the resolve resources go; say so, or a dump
+  // window can end with fewer files than requested and no explanation.
+  if (motion_guide_pending_) {
+    REXGPU_WARN("motion_dump: dropped frame={} with the guide resources",
+                motion_guide_pending_frame_);
+  }
   motion_guide_pending_ = false;
   // The framebuffers these point to are destroyed by the callers (Shutdown and
   // ClearCache) right before or after this, so the list must not survive them.
@@ -3938,7 +3954,7 @@ bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
   return is_enabled;
 }
 
-void VulkanRenderTargetCache::NotifyMotionDraw() {
+void VulkanRenderTargetCache::NotifyMotionDraw(bool history_valid) {
   const Framebuffer* const framebuffer = last_update_framebuffer_;
   if (framebuffer == nullptr || framebuffer->motion_view == VK_NULL_HANDLE) {
     // A guide-off framebuffer never reaches the list; the motion_view check is
@@ -3953,15 +3969,19 @@ void VulkanRenderTargetCache::NotifyMotionDraw() {
   // frame's first draw does. The serial is updated even when the framebuffer is
   // already listed, because the composite's precedence must follow the last draw
   // into each framebuffer, not the first.
-  const uint64_t frame = command_processor_.GetCurrentFrame();
+  const uint64_t frame = command_processor_.motion_guide_frame();
   const uint64_t serial = ++motion_draw_serial_;
   framebuffer->motion_last_draw_serial = serial;
   if (framebuffer->motion_draw_frame != frame) {
     framebuffer->motion_draw_frame = frame;
     framebuffer->motion_draw_count = 0;
+    framebuffer->motion_history_draw_count = 0;
     motion_frame_framebuffers_.push_back(framebuffer);
   }
   ++framebuffer->motion_draw_count;
+  if (history_valid) {
+    ++framebuffer->motion_history_draw_count;
+  }
 }
 
 void VulkanRenderTargetCache::SetMotionGuideSceneDraw(bool scene_draw) {
@@ -4289,7 +4309,7 @@ void VulkanRenderTargetCache::MaybeClearMotionAttachment(const Framebuffer* fram
   // the frame (transfers, texture loads) re-enters here, and its earlier motion
   // must survive that; a new frame must not inherit the previous one, because w is
   // the validity flag and an unwritten pixel has to be invalid.
-  const uint64_t frame = command_processor_.GetCurrentFrame();
+  const uint64_t frame = command_processor_.motion_guide_frame();
   if (framebuffer->motion_cleared_frame == frame) {
     return;
   }

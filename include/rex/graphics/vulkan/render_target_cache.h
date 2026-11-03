@@ -157,6 +157,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // measurement log: it says whether a small valid region comes from a pass that
     // received only a few draws or from most of a pass's draws writing nothing.
     mutable uint32_t motion_draw_count = 0;
+    // Of those, the draws that had a readable previous-frame clip block. A frame
+    // with many motion draws and few history draws is the signature of placement
+    // loss, not of a missing pass: the shader writes the invalid encoding for
+    // every draw without history.
+    mutable uint32_t motion_history_draw_count = 0;
     // The resolve's descriptor set for this image view, allocated from the cache's
     // pool the first time this framebuffer is resolved and never rewritten: a
     // descriptor set still bound by an earlier submission may be executing, so a
@@ -317,12 +322,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void MaybeClearMotionAttachment(const Framebuffer* framebuffer);
   // Called by the command processor for every draw that will write the guide, so
   // the frame-end composite knows which framebuffers hold this frame's motion.
-  void NotifyMotionDraw();
+  void NotifyMotionDraw(bool history_valid);
   // Whether any framebuffer received a motion-writing draw this frame, and thus
   // whether ResolveMotionGuideFrame has anything to composite. Lets the command
   // processor avoid opening a submission for an empty frame; false while the guide
   // is off, because NotifyMotionDraw records nothing then.
   bool motion_guide_frame_pending() const { return !motion_frame_framebuffers_.empty(); }
+  // Presented-frame number of the field currently in the output buffer, or
+  // UINT64_MAX when the last frame produced none. A consumer must compare this
+  // with the current guide frame before reading: the buffer is not cleared on a
+  // frame with nothing to composite, so a stale field is still there.
+  uint64_t motion_guide_output_frame() const { return motion_guide_output_frame_; }
 
   // Phase 2 motion guide resolve - the guide's single-sample, 1000x600 form.
   // A frame's scene is split across render pass keys, so it is written into
@@ -1398,6 +1408,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // submission completes; any earlier fence would read a buffer the GPU has not
   // finished writing.
   uint64_t motion_guide_pending_submission_ = 0;
+  // Presented-frame number of the field currently in the output buffer, or
+  // UINT64_MAX when the last frame produced none (the buffer is not cleared then).
+  uint64_t motion_guide_output_frame_ = UINT64_MAX;
   uint32_t motion_guide_dump_frames_done_ = 0;
   // Bounded logging: a few lines show how many framebuffers the composite
   // resolved and the first attachment's extent and sample count per run, and

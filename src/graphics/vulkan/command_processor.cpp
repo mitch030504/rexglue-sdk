@@ -2196,6 +2196,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   std::memset(closed_frame_submissions_, 0, sizeof(closed_frame_submissions_));
   frame_completed_ = 0;
   frame_current_ = 1;
+  motion_presented_frame_ = 1;
   frame_open_ = false;
 
   for (const auto& semaphore : submissions_in_flight_semaphores_) {
@@ -2377,6 +2378,17 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // The guide's frame id advances on every swap attempt, including the early
+  // returns below (no presenter, failed BeginSubmission, null swap texture). If it
+  // only followed frame_current_, a swap that did not close the frame would leave
+  // the next frame's draws sharing the previous id: the clear would be skipped
+  // (motion_cleared_frame == frame) and the framebuffers would not be re-added to
+  // the composite list. A scope guard is used because the resolve below must run
+  // with the id the draws were stamped with.
+  struct MotionFrameAdvance {
+    uint64_t* frame;
+    ~MotionFrameAdvance() { ++*frame; }
+  } motion_frame_advance{&motion_presented_frame_};
   // Motion-guide frame end. This is ExecutePacketType3_XE_SWAP's Vulkan side, and
   // the only instant at which the guide is complete: one frame's scene is split
   // across render pass keys (several framebuffers, each with its own attachment),
@@ -3773,22 +3785,38 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
       ++it;
     }
   }
+  // The frame that just ended was laid out up to this mark. Report it before it is
+  // recomputed; `layout_end` is how close the arena came to its half.
+  const uint32_t previous_layout_end = motion_frame_slot_cursor_;
+  // Preserved blocks keep their offsets; recompute the mark from the blocks that
+  // survived the erase so a culled block at the top frees its tail. This is what
+  // makes placement independent of draw order: the mark is a property of the live
+  // set, not of how many blocks happened to be drawn first this frame.
+  uint32_t live_layout_end = 0;
+  for (const auto& entry : motion_clip_blocks_) {
+    const MotionClipBlock& block = entry.second;
+    live_layout_end = std::max(live_layout_end, block.slot_offset + block.capacity);
+  }
   // Report the frame that just ended, before its counters are cleared. The frame
   // is the allocator's stamp, not marker.frame: it must match the parity and the
   // blocks' last_frame exactly, and the CPU swap count can be ahead of the GPU.
   if (motion_frame_ != UINT64_MAX) {
     REXLOG_INFO(
         "motion_guide frame={} blocks={} realloc={} index_set_changed={} clamped={} keys={} "
-        "draws={} missing={} stale={} no_variant={} no_bounds={} no_viewport={} history={}",
+        "draws={} missing={} stale={} no_variant={} no_bounds={} no_viewport={} history={} "
+        "new={} moved={} layout_end={} live_end={}",
         motion_frame_, motion_clip_blocks_.size(), motion_frame_reallocated_,
         motion_frame_index_set_changed_, motion_frame_clamped_, motion_frame_keys_,
         motion_frame_draws_, motion_frame_missing_, motion_frame_stale_,
         motion_frame_no_variant_, motion_frame_no_bounds_, motion_frame_no_viewport_,
-        motion_frame_history_);
+        motion_frame_history_, motion_frame_new_blocks_, motion_frame_moved_blocks_,
+        previous_layout_end, live_layout_end);
   }
   motion_frame_ = frame;
   motion_parity_ = uint32_t(frame & 1);
-  motion_frame_slot_cursor_ = 0;
+  motion_frame_slot_cursor_ = live_layout_end;
+  motion_frame_new_blocks_ = 0;
+  motion_frame_moved_blocks_ = 0;
 
   // The guest projection carries the temporal-upscaler jitter (the projection hook
   // modifies the guest matrix), so both stored clips include their frame's jitter and
@@ -3917,26 +3945,36 @@ bool VulkanCommandProcessor::AllocateMotionClipBlock(uint64_t key, uint32_t draw
     // An index outside the written window stores nothing; a draw that had to be
     // clipped can never have complete history, so it is also reported separately.
     const bool clamped = required_span > needed_capacity;
+    // Placement is a property of the block, not of what was drawn before it this
+    // frame. A block that still fits its previous window keeps its previous offset,
+    // so its previous half stays readable no matter which blocks were culled or
+    // added around it. New or grown blocks are placed above every preserved block
+    // (the cursor is the live layout end), so they cannot overlap a range another
+    // block still needs for history. This replaces the old
+    // `previous_offset == cursor` rule, which lost history for every block after
+    // the first culled/added draw.
     const bool reallocated =
         reused && (new_index_min != previous_index_min || needed_capacity > previous_capacity);
     uint32_t capacity = previous_capacity;
     if (needed_capacity > capacity) {
       capacity = needed_capacity;
     }
-    // Keep the previous offset when the layout still lines up, so the same block
-    // is at the same slot in both halves and its history stays readable. A shifted
-    // layout loses history for every block after the shift, which is safe because
-    // validity is all-or-nothing.
-    const uint32_t offset = (reused && previous_offset == motion_frame_slot_cursor_)
-                                ? previous_offset
-                                : motion_frame_slot_cursor_;
-    if (uint64_t(motion_frame_slot_cursor_) + capacity > kMotionClipSlotsPerHalf) {
+    const bool keep_offset = reused && !reallocated;
+    const uint32_t offset = keep_offset ? previous_offset : motion_frame_slot_cursor_;
+    if (uint64_t(offset) + capacity > kMotionClipSlotsPerHalf) {
       // Writing past the half would alias the other parity's blocks. Dropping all
       // history is the only alternative that cannot produce wrong motion.
       ResetMotionClipAllocator(MotionClipInvalidationReason::kArenaFull);
       continue;
     }
-    motion_frame_slot_cursor_ += capacity;
+    if (!keep_offset) {
+      motion_frame_slot_cursor_ = offset + capacity;
+      if (reused) {
+        ++motion_frame_moved_blocks_;
+      } else {
+        ++motion_frame_new_blocks_;
+      }
+    }
 
     // All-or-nothing: the previous half is readable only if this exact block was
     // written last frame, the layout kept its offset, the block still covers the
@@ -4550,7 +4588,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // than a plausible garbage vector.
     system_constants_.motion_key_valid = (motion_keyed && motion_vertex_variant) ? 1 : 0;
     if (system_constants_.motion_key_valid && motion_clip_draw.clip_base != UINT32_MAX) {
-      render_target_cache_->NotifyMotionDraw();
+      render_target_cache_->NotifyMotionDraw(motion_clip_draw.prev_clip_base != UINT32_MAX);
     }
     system_constants_.motion_clip_base = motion_clip_draw.clip_base;
     system_constants_.motion_prev_clip_base = motion_clip_draw.prev_clip_base;

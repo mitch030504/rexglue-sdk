@@ -1477,7 +1477,8 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   // frame-end resolve time a HUD, composition or full-screen effect would erase the
   // scene underneath. The pipeline keeps the attachment (the pass interface is
   // fixed) and only masks its components off.
-  description_out.motion_guide_write = motion_guide_write ? 1u : 0u;
+  description_out.motion_guide_write =
+      (motion_guide_write && render_pass_key.motion_attachment_used) ? 1u : 0u;
 
   // Phase 2 motion guide: the guide's fragment output location is a property of
   // the render pass, not of the shader - it is the guide's subpass colour
@@ -1695,6 +1696,16 @@ bool VulkanPipelineCache::ArePipelineRequirementsMet(const PipelineDescription& 
 
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       command_processor_.GetVulkanDevice()->properties();
+
+  // A stored pipeline can carry the guide attachment from a run/device that
+  // supported five colour attachments. On a device that does not, the stored
+  // description must be refused here, or the render pass/pipeline is created with
+  // colorAttachmentCount = 5 and fails validation. The guide can only be active on
+  // the host render target path, so the interlock flag is false for this check.
+  if (description.render_pass_key.motion_attachment_used &&
+      !command_processor_.GetVulkanDevice()->SupportsMotionGuide(false)) {
+    return false;
+  }
 
   if (!device_properties.geometryShader &&
       description.geometry_shader != PipelineGeometryShader::kNone) {

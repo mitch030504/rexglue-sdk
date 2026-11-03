@@ -155,6 +155,12 @@ class VulkanCommandProcessor : public CommandProcessor {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  // The guide's own presented-frame number: it advances on every IssueSwap, not
+  // only when the swap closes a frame, so a failed swap cannot leave the next
+  // frame's draws sharing a frame id with the previous field (which would skip the
+  // clear and the re-add to the composite list). Equal to GetCurrentFrame() in the
+  // normal path.
+  uint64_t motion_guide_frame() const { return motion_presented_frame_; }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -611,6 +617,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
+  // Advanced unconditionally at the end of every IssueSwap (see motion_guide_frame).
+  uint64_t motion_presented_frame_ = 1;
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};
@@ -639,10 +647,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t motion_frame_ = UINT64_MAX;
   // Half the current frame writes; the other half was written by frame - 1.
   uint32_t motion_parity_ = 0;
-  // Slots reserved so far in the current frame's layout. Reset every frame, so a
-  // stable draw order and a stable capacity reproduce the previous layout and
-  // keep each block at its previous offset.
+  // Slots reserved so far in the current frame's layout. This is a high-water
+  // mark, not a per-frame bump start: preserved blocks keep the offset they had
+  // last frame, and only new or grown blocks are placed at the mark. At rotation
+  // the mark is recomputed from the blocks that survived (see AdvanceMotionFrame),
+  // so a culled block at the top frees its tail for reuse and the arena does not
+  // ratchet permanently upward.
   uint32_t motion_frame_slot_cursor_ = 0;
+  // Placement outcome for the frame, logged at rotation: stable placement turns
+  // `history` into a measure of real correspondence rather than of draw order.
+  uint32_t motion_frame_new_blocks_ = 0;
+  uint32_t motion_frame_moved_blocks_ = 0;
   bool motion_arena_barrier_pending_ = false;
   // Mirrors render_target_cache_'s sticky scene predicate so the once-per-change
   // log can name the transition without querying it.
