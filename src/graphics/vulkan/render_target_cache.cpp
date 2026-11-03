@@ -1553,8 +1553,11 @@ void VulkanRenderTargetCache::MaybeRunWritebackProbe(VulkanSharedMemory& shared_
     // so the writeback changes the scene instead of preserving it.
     command_buffer.CmdVkCopyBuffer(probe_pattern_buffer_, probe_scratch_buffer_, 1, &region);
   } else {
-    region.srcOffset = 0;
-    // Keep the copy-back source.
+    region.srcOffset = address;
+    // Identity mode: the copy-back source is the resolved range at `address`, so
+    // the round trip reproduces exactly those bytes. Offset 0 is guest address
+    // 0, not the start of the resolve, and copying from it compared the
+    // write-back against unrelated memory.
     command_buffer.CmdVkCopyBuffer(shared_memory.buffer(), probe_scratch_buffer_, 1, &region);
   }
 
@@ -1812,9 +1815,11 @@ void VulkanRenderTargetCache::MaybeRunDepthProbe(VulkanSharedMemory& shared_memo
   if (REXCVAR_GET(depth_probe_source) == 0) {
     // Guest source: the guest's own depth resolve. Measured in Chapter 1
     // gameplay, it fires every frame at exactly 1000x600 in kD24S8, and it is
-    // the only surface that carries the scene depth there - the host depth
-    // render targets in the same frames are at most 520 px wide, so the host
-    // path can never see the scene in gameplay.
+    // the source validated against an independent capture. The host path is not
+    // excluded by its size - the scene's 13-tile 2x depth target is 1040 px
+    // wide, a full-width target rather than a reduced effect one - only
+    // untested, because no host dump has been taken yet. This stays the default
+    // until one is.
     if (!resolve_info.IsCopyingDepth()) {
       // The normal case for this source: most resolves are colour. Not logged -
       // the bounded depth_resolve inventory in Resolve already answers whether
@@ -3313,17 +3318,19 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
         if (candidate) {
           const RenderTargetKey& candidate_key = candidate->key();
           if (candidate_key.is_depth) {
-            // Pitch is in 32bpp EDRAM tiles of 80 samples; an N-sample surface
-            // stores N samples per pixel, so the pixel width is samples >> msaa.
-            const uint32_t candidate_width_pixels =
-                (candidate_key.pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >>
-                uint32_t(candidate_key.msaa_samples);
+            // Widths must use the renderer's own tile-to-pixel convention, not a
+            // "samples per pixel" halving: 2x MSAA doubles only the sample
+            // height, so a tile is still 80 px wide and a 13-tile 2x target is
+            // 1040 px, not 520. Halving at 2x both misreported the target width
+            // and let a narrower 1x effect target win the "widest" comparison
+            // against the scene.
+            const uint32_t candidate_width_pixels = RenderTargetKey::GetWidth(
+                candidate_key.pitch_tiles_at_32bpp, candidate_key.msaa_samples);
             uint32_t current_width_pixels = 0;
             if (depth_probe_target_) {
               const RenderTargetKey& current_key = depth_probe_target_->key();
-              current_width_pixels =
-                  (current_key.pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples) >>
-                  uint32_t(current_key.msaa_samples);
+              current_width_pixels = RenderTargetKey::GetWidth(current_key.pitch_tiles_at_32bpp,
+                                                               current_key.msaa_samples);
             }
             if (candidate_width_pixels > current_width_pixels) {
               depth_probe_target_ = candidate;

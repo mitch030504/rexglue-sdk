@@ -852,12 +852,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // - 0 (default): the guest's own 1000x600 kD24S8 depth resolve. At the depth
   //   resolve the resolved range is copied out of guest memory into a device
   //   local staging buffer and then into a host-visible readback buffer, and the
-  //   tiled 32-bit words are detiled and decoded on the CPU. This is the only
-  //   seam that carries scene depth in gameplay: measured, the widest host depth
-  //   render target in a Chapter 1 gameplay frame is 520 px.
+  //   tiled 32-bit words are detiled and decoded on the CPU. This is the seam
+  //   validated against an independent capture; the host path is not excluded by
+  //   its size (the scene's 13-tile 2x depth target is 1040 px wide), only
+  //   untested, because no host dump has been taken.
   // - 1: the host depth render target at the colour resolve, read with a compute
-  //   shader (one MSAA sample). Works only where a 1000-pixel-wide depth surface
-  //   exists, such as the hub.
+  //   shader (one MSAA sample). A candidate, not a proven source: it has never
+  //   been dumped, and the only retained host dump was a half-cleared buffer.
   // Copy-out only for both: neither source writes the depth image, guest memory
   // or the EDRAM buffer; the host source restores its usage triple exactly.
   void MaybeRunDepthProbe(VulkanSharedMemory& shared_memory,

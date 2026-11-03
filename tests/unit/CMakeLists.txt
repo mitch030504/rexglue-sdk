@@ -1,6 +1,7 @@
 # Unit Tests for ReXGlue core components
 
 add_executable(unit_tests
+    graphics/render_target_key_test.cpp
     graphics/trace_marker_test.cpp
     test_memory.cpp
     audio/guest_audio_stretch_test.cpp
