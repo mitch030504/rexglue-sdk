@@ -683,6 +683,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(minStorageBufferOffsetAlignment)
   XE_UI_VULKAN_LIMIT(maxFramebufferWidth)
   XE_UI_VULKAN_LIMIT(maxFramebufferHeight)
+  XE_UI_VULKAN_LIMIT(maxColorAttachments)
   XE_UI_VULKAN_ENUM_LIMIT(framebufferColorSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(framebufferDepthSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(framebufferStencilSampleCounts, SampleCountFlags)
@@ -695,6 +696,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
+
+  // The motion guide adds a fifth colour attachment. Both limits are above the
+  // Vulkan 1.0 minimum of 4, so an unsupported device is reported once here and
+  // the guide is expected to stay inactive rather than fail a render pass.
+  if (!device->SupportsMotionGuide()) {
+    REXLOG_INFO(
+        "Motion guide inactive: needs {} colour attachments and fragment combined output "
+        "resources, device reports {} and {}",
+        VulkanDevice::kMotionGuideColorAttachments, device->properties_.maxColorAttachments,
+        device->properties_.maxFragmentCombinedOutputResources);
+  }
 
   if (with_gpu_emulation) {
     XE_UI_VULKAN_FEATURE(robustBufferAccess)

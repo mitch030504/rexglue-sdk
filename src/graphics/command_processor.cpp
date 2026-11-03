@@ -952,6 +952,9 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
     if (auto marker = TraceMarker::Parse(words)) {
       OnTraceMarker(*marker);
+      // Only kBegin opens a draw window. kMotion is a point record naming a draw
+      // for the motion guide; it must not change the draw accounting, so it is
+      // logged with the other kinds and otherwise ignored here until consumed.
       if (marker->kind == TraceMarker::kBegin &&
           (!trace_marker_active_ || trace_marker_frame_ != marker->frame)) {
         trace_marker_active_ = true;

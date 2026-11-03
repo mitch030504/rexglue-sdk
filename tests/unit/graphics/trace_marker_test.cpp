@@ -22,6 +22,16 @@ TEST_CASE("PM4 diagnostic marker requires an exact supported payload", "[graphic
   words[1] = 1;
   words[2] = 0;
   CHECK_FALSE(TraceMarker::Parse(words));
-  words[2] = 5;
+  // kMotion uses the same six words: `node` holds the low half of the key and
+  // `geometry` the high half, so parsing must accept it unchanged.
+  words[2] = TraceMarker::kMotion;
+  auto motion = TraceMarker::Parse(words);
+  REQUIRE(motion);
+  CHECK(motion->kind == TraceMarker::kMotion);
+  CHECK(motion->frame == 1200);
+  CHECK(motion->node == 0xB9222A04);
+  CHECK(motion->geometry == 0xB90EB070);
+  // One past the highest kind is not a record this version can interpret.
+  words[2] = TraceMarker::kMotion + 1;
   CHECK_FALSE(TraceMarker::Parse(words));
 }

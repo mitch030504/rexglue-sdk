@@ -76,6 +76,8 @@ class VulkanDevice {
     VkDeviceSize minStorageBufferOffsetAlignment = 256;
     uint32_t maxFramebufferWidth = 4096;
     uint32_t maxFramebufferHeight = 4096;
+    // Vulkan 1.0 requires at least 4; the motion guide needs a 5th colour target.
+    uint32_t maxColorAttachments = 4;
     VkSampleCountFlags framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     VkSampleCountFlags framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     VkSampleCountFlags framebufferStencilSampleCounts =
@@ -176,6 +178,19 @@ class VulkanDevice {
   // Some supported functionality is enabled conditionally based on the
   // `with_swapchain` and `with_gpu_emulation` options.
   const Properties& properties() const { return properties_; }
+
+  // Colour attachments a motion-guide pass needs: the guest's four plus the
+  // guide's own. Vulkan 1.0 guarantees only 4 for maxColorAttachments and
+  // maxFragmentCombinedOutputResources, so a conformant device may not fit it.
+  static constexpr uint32_t kMotionGuideColorAttachments = 5;
+
+  // Whether a 5-attachment pass is possible on this device. Callers must report
+  // this as an inactive reason, not assert: the requirement is above the Vulkan
+  // minimum, and the motion guide is optional.
+  bool SupportsMotionGuide() const {
+    return properties_.maxColorAttachments >= kMotionGuideColorAttachments &&
+           properties_.maxFragmentCombinedOutputResources >= kMotionGuideColorAttachments;
+  }
 
   // Enabled extensions not fully covered by the device properties and optional
   // feature flags in the `Properties` structure (primarily those adding API
