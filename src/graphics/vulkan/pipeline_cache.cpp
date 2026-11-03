@@ -1098,8 +1098,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
     VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, bool motion_guide_write,
+    VkPipeline& pipeline_out, const PipelineLayoutProvider*& pipeline_layout_out,
+    void** pipeline_handle_out) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -1134,7 +1135,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   PipelineDescription description;
   if (!GetCurrentStateDescription(vertex_shader, pixel_shader, primitive_processing_result,
                                   normalized_depth_control, normalized_color_mask, render_pass_key,
-                                  description)) {
+                                  motion_guide_write, description)) {
     REXGPU_ERROR(
         "VulkanPipelineCache: GetCurrentStateDescription failed "
         "(guest_prim={}, host_prim={}, host_vs_type={}, tess_mode={}, host_reset={}, "
@@ -1433,7 +1434,7 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     const VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, bool motion_guide_write,
     PipelineDescription& description_out) const {
   description_out.Reset();
 
@@ -1471,6 +1472,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
          pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
   }
   description_out.render_pass_key = render_pass_key;
+  // A draw with no motion key shares the pass and the shader with scene draws but
+  // must not write the guide: its fragment value is the invalid encoding, and at
+  // frame-end resolve time a HUD, composition or full-screen effect would erase the
+  // scene underneath. The pipeline keeps the attachment (the pass interface is
+  // fixed) and only masks its components off.
+  description_out.motion_guide_write = motion_guide_write ? 1u : 0u;
 
   // Phase 2 motion guide: the guide's fragment output location is a property of
   // the render pass, not of the shader - it is the guide's subpass colour
@@ -3522,8 +3529,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       VkPipelineColorBlendAttachmentState& motion_blend_attachment =
           color_blend_attachments[motion_attachment_index];
       motion_blend_attachment.blendEnable = VK_FALSE;
-      motion_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+      // Non-keyed draws (HUD, composition, full-screen effects) share this pass and
+      // shader but have no motion to contribute; their fragment writes the invalid
+      // encoding, so leaving the mask on would erase the scene at frame-end resolve
+      // time. A keyed draw with no history still writes explicitly, which is what
+      // invalidates its own coverage instead of inheriting another object's motion.
+      motion_blend_attachment.colorWriteMask =
+          description.motion_guide_write
+              ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                 VK_COLOR_COMPONENT_A_BIT)
+              : 0;
       color_blend_state.attachmentCount = motion_attachment_index + 1;
     } else {
       color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);

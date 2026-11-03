@@ -4391,7 +4391,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                           primitive_processing_result, normalized_depth_control,
                                           normalized_color_mask,
                                           render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
+                                          motion_keyed, pipeline, pipeline_layout_provider,
+                                          &pipeline_handle)) {
     return draw_fail("configure_pipeline");
   }
   bool pipeline_is_placeholder = false;

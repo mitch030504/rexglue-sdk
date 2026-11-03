@@ -91,8 +91,9 @@ class VulkanPipelineCache {
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, bool motion_guide_write,
+      VkPipeline& pipeline_out, const PipelineLayoutProvider*& pipeline_layout_out,
+      void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
@@ -196,12 +197,18 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
     uint32_t sample_rate_shading : 1;                    // 10
+    // Whether this draw writes the pass's motion-guide attachment. The pass and
+    // the shader are shared by scene draws, the HUD and full-screen effects, so the
+    // attachment exists for all of them; a draw with no motion key must leave the
+    // guide untouched instead of overwriting scene motion with its invalid value.
+    // Part of the pipeline, not the shader: it only changes the guide's write mask.
+    uint32_t motion_guide_write : 1;  // 11
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20261103;
     PipelineDescription() {
       Reset();
     }
@@ -339,7 +346,7 @@ class VulkanPipelineCache {
       const VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, bool motion_guide_write,
       PipelineDescription& description_out) const;
 
   // Whether the pipeline for the given description is supported by the device.

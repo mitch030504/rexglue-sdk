@@ -153,6 +153,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // one must not keep the precedence of its earlier draw. mutable: bookkeeping for
     // the frame, not the framebuffer's identity.
     mutable uint64_t motion_last_draw_serial = 0;
+    // Motion-writing draws recorded into this framebuffer this frame. Only for the
+    // measurement log: it says whether a small valid region comes from a pass that
+    // received only a few draws or from most of a pass's draws writing nothing.
+    mutable uint32_t motion_draw_count = 0;
     // The resolve's descriptor set for this image view, allocated from the cache's
     // pool the first time this framebuffer is resolved and never rewritten: a
     // descriptor set still bound by an earlier submission may be executing, so a

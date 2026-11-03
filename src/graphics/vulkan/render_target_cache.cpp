@@ -2607,11 +2607,22 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // Read once: both the per-dumped-frame logging below and the dump itself need it,
   // and a cvar read inside a rejected run would only add noise.
   const std::string dump_prefix = REXCVAR_GET(motion_dump);
+  const int32_t dump_first_frame = REXCVAR_GET(motion_dump_frame);
+  const uint32_t dump_frame_count = uint32_t(REXCVAR_GET(motion_dump_frames));
+  // A measurement run must be explainable per dumped frame. A fixed four-line
+  // budget is consumed by the first frames of a 520 s run, which are menus, so every
+  // frame inside the dump window is also logged. candidates vs framebuffers names
+  // which guard dropped a pass; guest_frame is the counter the clip history rotates
+  // on, while frame is the presented count the dump is gated by, and they differ.
+  const bool dump_window = !dump_prefix.empty() &&
+                           (dump_first_frame < 0 || frame >= uint32_t(dump_first_frame)) &&
+                           motion_guide_dump_frames_done_ < dump_frame_count;
   // Bounded, reason-tagged refusal log, like the probes': normal lifecycle stops
   // (a pending dump) are the resolve working as designed and are not logged, so
-  // the budget survives for a real refusal.
-  auto skip = [this, frame](const char* reason) {
-    if (motion_guide_skipped_logs_ < 8) {
+  // the budget survives for a real refusal. The dump window is exempt because a
+  // silently dropped candidate there is the measurement's own subject.
+  auto skip = [this, frame, dump_window](const char* reason) {
+    if (motion_guide_skipped_logs_ < 8 || (dump_window && motion_guide_skipped_logs_ < 200)) {
       ++motion_guide_skipped_logs_;
       REXGPU_INFO("motion_resolve skip frame={} reason={}", frame, reason);
     }
@@ -2659,6 +2670,20 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // have contributed last frame's field.
   const size_t candidate_count = framebuffers.size();
   for (const Framebuffer* framebuffer : framebuffers) {
+    // Every dumped frame's candidate state, so a pass that is dropped or has no
+    // keyed draws on some frames is explained by its own fields (which frame it was
+    // drawn in, whether it was cleared, why it cannot be sampled, how many motion
+    // draws it received) instead of by a reason line that only says one guard fired.
+    if (dump_window) {
+      REXGPU_INFO(
+          "motion_resolve candidate frame={} fb={} draw_frame={} cleared_frame={} image={} "
+          "view={} samples={} extent={}x{} serial={} draws={}",
+          frame, static_cast<const void*>(framebuffer), framebuffer->motion_draw_frame,
+          framebuffer->motion_cleared_frame, framebuffer->motion_image ? 1 : 0,
+          framebuffer->motion_view ? 1 : 0, uint32_t(framebuffer->motion_samples),
+          framebuffer->host_extent.width, framebuffer->host_extent.height,
+          framebuffer->motion_last_draw_serial, framebuffer->motion_draw_count);
+    }
     if (framebuffer->motion_draw_frame != frame64) {
       // The entry outlived the frame it was recorded for: the previous swap could
       // not record a composite (no submission), and the attachment may already
@@ -2759,16 +2784,6 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     return;
   }
 
-  const int32_t dump_first_frame = REXCVAR_GET(motion_dump_frame);
-  const uint32_t dump_frame_count = uint32_t(REXCVAR_GET(motion_dump_frames));
-  // A measurement run must be explainable per dumped frame. A fixed four-line
-  // budget is consumed by the first frames of a 520 s run, which are menus, so every
-  // frame inside the dump window is also logged. candidates vs framebuffers names
-  // which guard dropped a pass; guest_frame is the counter the clip history rotates
-  // on, while frame is the presented count the dump is gated by, and they differ.
-  const bool dump_window = !dump_prefix.empty() &&
-                           (dump_first_frame < 0 || frame >= uint32_t(dump_first_frame)) &&
-                           motion_guide_dump_frames_done_ < dump_frame_count;
   if (motion_guide_resolve_logs_ < 4 || dump_window) {
     ++motion_guide_resolve_logs_;
     // The attachment may be wider than the scene and is 2x MSAA; both are stated
@@ -3943,8 +3958,10 @@ void VulkanRenderTargetCache::NotifyMotionDraw() {
   framebuffer->motion_last_draw_serial = serial;
   if (framebuffer->motion_draw_frame != frame) {
     framebuffer->motion_draw_frame = frame;
+    framebuffer->motion_draw_count = 0;
     motion_frame_framebuffers_.push_back(framebuffer);
   }
+  ++framebuffer->motion_draw_count;
 }
 
 void VulkanRenderTargetCache::SetMotionGuideSceneDraw(bool scene_draw) {
