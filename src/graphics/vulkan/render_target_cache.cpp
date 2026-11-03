@@ -2597,6 +2597,16 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   }
   const uint64_t frame64 = command_processor_.GetCurrentFrame();
   const uint32_t frame = uint32_t(frame64);
+  // Composite in last-draw order. The list is first-touch order, but keep_existing
+  // is last-dispatch-wins: a pass re-entered after another pass would otherwise keep
+  // the precedence of its earlier draw and lose motion it wrote later.
+  std::sort(framebuffers.begin(), framebuffers.end(),
+            [](const Framebuffer* a, const Framebuffer* b) {
+              return a->motion_last_draw_serial < b->motion_last_draw_serial;
+            });
+  // Read once: both the per-dumped-frame logging below and the dump itself need it,
+  // and a cvar read inside a rejected run would only add noise.
+  const std::string dump_prefix = REXCVAR_GET(motion_dump);
   // Bounded, reason-tagged refusal log, like the probes': normal lifecycle stops
   // (a pending dump) are the resolve working as designed and are not logged, so
   // the budget survives for a real refusal.
@@ -2644,12 +2654,25 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // dispatch overwrites the output.
   const Framebuffer* first_resolved = nullptr;
   uint32_t resolved_count = 0;
+  // Size before any refusal: the difference from resolved_count names which guard
+  // dropped a pass, and a candidate that was never cleared is the one that would
+  // have contributed last frame's field.
+  const size_t candidate_count = framebuffers.size();
   for (const Framebuffer* framebuffer : framebuffers) {
     if (framebuffer->motion_draw_frame != frame64) {
       // The entry outlived the frame it was recorded for: the previous swap could
       // not record a composite (no submission), and the attachment may already
       // have been cleared or reused by this frame. Drop it rather than hand NR a
       // field of mixed frames.
+      continue;
+    }
+    if (framebuffer->motion_cleared_frame != frame64) {
+      // A draw was recorded but the pass was never entered (the draw failed or was
+      // skipped before EnterRenderPass), so this attachment was never cleared for
+      // this frame and still holds the previous frame's motion. The old per-seam
+      // resolve had this guard; without it the first dispatch would overwrite the
+      // whole composite with last frame's field.
+      skip("not_cleared");
       continue;
     }
     if (framebuffer->motion_image == VK_NULL_HANDLE || framebuffer->motion_view == VK_NULL_HANDLE) {
@@ -2736,7 +2759,17 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     return;
   }
 
-  if (motion_guide_resolve_logs_ < 4) {
+  const int32_t dump_first_frame = REXCVAR_GET(motion_dump_frame);
+  const uint32_t dump_frame_count = uint32_t(REXCVAR_GET(motion_dump_frames));
+  // A measurement run must be explainable per dumped frame. A fixed four-line
+  // budget is consumed by the first frames of a 520 s run, which are menus, so every
+  // frame inside the dump window is also logged. candidates vs framebuffers names
+  // which guard dropped a pass; guest_frame is the counter the clip history rotates
+  // on, while frame is the presented count the dump is gated by, and they differ.
+  const bool dump_window = !dump_prefix.empty() &&
+                           (dump_first_frame < 0 || frame >= uint32_t(dump_first_frame)) &&
+                           motion_guide_dump_frames_done_ < dump_frame_count;
+  if (motion_guide_resolve_logs_ < 4 || dump_window) {
     ++motion_guide_resolve_logs_;
     // The attachment may be wider than the scene and is 2x MSAA; both are stated
     // so a dump that shows a crop or a repeated pixel can be explained from the
@@ -2744,26 +2777,25 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
     // split into - more than one means the composite had to fill holes, and it is
     // the number that used to be 1 by luck of whichever seam resolved first.
     REXGPU_INFO(
-        "motion_resolve frame={} framebuffers={} scene={}x{} first_attachment={}x{} samples={} "
-        "bytes={}",
-        frame, resolved_count, kMotionGuideWidth, kMotionGuideHeight,
-        first_resolved->host_extent.width, first_resolved->host_extent.height,
-        uint32_t(first_resolved->motion_samples), uint64_t(kMotionGuideBytes));
+        "motion_resolve frame={} guest_frame={} framebuffers={} candidates={} scene={}x{} "
+        "first_attachment={}x{} samples={} bytes={}",
+        frame, command_processor_.guest_frame_count(), resolved_count, uint32_t(candidate_count),
+        kMotionGuideWidth, kMotionGuideHeight, first_resolved->host_extent.width,
+        first_resolved->host_extent.height, uint32_t(first_resolved->motion_samples),
+        uint64_t(kMotionGuideBytes));
   }
 
   // The dump is a separate, bounded decision: the resolve itself runs every frame
   // the guide is active because NR consumes its buffer, while the copy-out exists
   // only for a measurement run. It is recorded after every dispatch, so the file
   // is the composite and not just the first pass's field.
-  const std::string dump_prefix = REXCVAR_GET(motion_dump);
   if (dump_prefix.empty() || motion_guide_readback_buffer_ == VK_NULL_HANDLE) {
     return;
   }
-  const int32_t dump_first_frame = REXCVAR_GET(motion_dump_frame);
   if (dump_first_frame >= 0 && frame < uint32_t(dump_first_frame)) {
     return;
   }
-  if (motion_guide_dump_frames_done_ >= uint32_t(REXCVAR_GET(motion_dump_frames))) {
+  if (motion_guide_dump_frames_done_ >= dump_frame_count) {
     return;
   }
   if (motion_guide_pending_) {
@@ -2791,6 +2823,7 @@ void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   command_processor_.SubmitBarriers(true);
   motion_guide_pending_ = true;
   motion_guide_pending_frame_ = frame;
+  motion_guide_pending_submission_ = command_processor_.GetCurrentSubmission();
   ++motion_guide_dump_frames_done_;
 }
 
@@ -2798,8 +2831,17 @@ void VulkanRenderTargetCache::VerifyMotionGuideDump() {
   if (!motion_guide_pending_) {
     return;
   }
+  if (command_processor_.GetCompletedSubmission() < motion_guide_pending_submission_) {
+    // A different submission's fence advanced. The copy is still queued, so reading
+    // now would return a partially written buffer - the failure mode that made the
+    // host depth probe's dump look like data. Keep it pending; a later completion
+    // event will consume it.
+    return;
+  }
   motion_guide_pending_ = false;
   if (motion_guide_readback_buffer_ == VK_NULL_HANDLE || motion_guide_readback_mapped_ == nullptr) {
+    REXGPU_WARN("motion_dump: readback unavailable, frame={} dropped",
+                motion_guide_pending_frame_);
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -3888,12 +3930,17 @@ void VulkanRenderTargetCache::NotifyMotionDraw() {
     // also what keeps a guide-off run from touching it at all.
     return;
   }
-  // Record the framebuffer once per frame, in first-draw order: the scene of one
-  // frame is split across render pass keys, and each key has its own framebuffer
-  // and guide attachment. The stamp is the guest frame the resolve will composite
-  // for, so a second draw - or a re-entered pass - in the same frame does not add a
-  // duplicate dispatch, while the next frame's first draw does.
+  // Record the framebuffer once per frame, and stamp the draw order on every
+  // motion-writing draw: the scene of one frame is split across render pass keys,
+  // and each key has its own framebuffer and guide attachment. The stamp is the
+  // guest frame the resolve will composite for, so a second draw - or a re-entered
+  // pass - in the same frame does not add a duplicate dispatch, while the next
+  // frame's first draw does. The serial is updated even when the framebuffer is
+  // already listed, because the composite's precedence must follow the last draw
+  // into each framebuffer, not the first.
   const uint64_t frame = command_processor_.GetCurrentFrame();
+  const uint64_t serial = ++motion_draw_serial_;
+  framebuffer->motion_last_draw_serial = serial;
   if (framebuffer->motion_draw_frame != frame) {
     framebuffer->motion_draw_frame = frame;
     motion_frame_framebuffers_.push_back(framebuffer);

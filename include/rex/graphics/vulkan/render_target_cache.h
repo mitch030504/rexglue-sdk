@@ -147,6 +147,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // draw add it again. mutable: recording a draw updates frame bookkeeping, not
     // the framebuffer's identity.
     mutable uint64_t motion_draw_frame = UINT64_MAX;
+    // Draw order of this framebuffer's most recent motion-writing draw this frame.
+    // The composite dispatches in this order, not first-touch order: the shader's
+    // keep_existing is last-dispatch-wins, so a framebuffer re-entered after another
+    // one must not keep the precedence of its earlier draw. mutable: bookkeeping for
+    // the frame, not the framebuffer's identity.
+    mutable uint64_t motion_last_draw_serial = 0;
     // The resolve's descriptor set for this image view, allocated from the cache's
     // pool the first time this framebuffer is resolved and never rewritten: a
     // descriptor set still bound by an earlier submission may be executing, so a
@@ -1371,15 +1377,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // the allocator and log once per frame for an error that cannot resolve itself.
   bool motion_guide_resources_failed_ = false;
   // Framebuffers that received a motion-writing draw this frame, in first-draw
-  // order. This vector is the frame's gate: the resolve composites exactly these
-  // and nothing else, and ResolveMotionGuideFrame takes and clears it, so the next
-  // frame starts empty. Cleared with the resolve resources as well, because a
-  // cache clear destroys the framebuffers these point to.
+  // order (sorted by motion_last_draw_serial before the composite). This vector is
+  // the frame's gate: the resolve composites exactly these and nothing else, and
+  // ResolveMotionGuideFrame takes and clears it, so the next frame starts empty.
+  // Cleared with the resolve resources as well, because a cache clear destroys the
+  // framebuffers these point to.
   std::vector<const Framebuffer*> motion_frame_framebuffers_;
+  // Monotonic across frames: only used to order one frame's list, so a reset is
+  // unnecessary and wrap-around would take centuries.
+  uint64_t motion_draw_serial_ = 0;
   // No dump while the previous one still needs its CPU write, so the single
   // readback buffer is never overwritten before the GPU has finished with it.
   bool motion_guide_pending_ = false;
   uint32_t motion_guide_pending_frame_ = 0;
+  // Submission the copy-out was recorded in. The host read is only valid once that
+  // submission completes; any earlier fence would read a buffer the GPU has not
+  // finished writing.
+  uint64_t motion_guide_pending_submission_ = 0;
   uint32_t motion_guide_dump_frames_done_ = 0;
   // Bounded logging: a few lines show how many framebuffers the composite
   // resolved and the first attachment's extent and sample count per run, and
