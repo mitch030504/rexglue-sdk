@@ -96,6 +96,17 @@ constexpr uint32_t kColourProbeHeight = 600;
 constexpr VkDeviceSize kColourProbeBytes =
     VkDeviceSize(kColourProbeWidth) * VkDeviceSize(kColourProbeHeight) * 4u;
 
+// The motion guide resolve reads the same authored 1000x600 scene rectangle, one
+// MSAA sample, and packs RGBA16F as two half-float pairs in a uvec2 - eight bytes
+// per pixel, the exact byte layout of the dump the neural renderer's analyzer
+// reads. The attachment is at the host pass extent, which is wider than the scene
+// and holds other EDRAM data outside it, so this is a crop of the attachment's
+// top-left corner, never a scale.
+constexpr uint32_t kMotionGuideWidth = 1000;
+constexpr uint32_t kMotionGuideHeight = 600;
+constexpr VkDeviceSize kMotionGuideBytes =
+    VkDeviceSize(kMotionGuideWidth) * VkDeviceSize(kMotionGuideHeight) * 8u;
+
 // Matches the push constant block built into the depth probe compute shader.
 struct DepthProbePushConstants {
   uint32_t width;
@@ -199,6 +210,23 @@ REXCVAR_DEFINE_STRING(colour_probe_dump, "", "GPU/Vulkan",
                       "RGBA8 scene rectangle to <prefix><frame>.bin.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_STRING(motion_dump, "", "GPU/Vulkan",
+                      "Development: if non-empty, the motion guide resolve copies its 1000x600 "
+                      "RGBA16F scene rectangle to <prefix>m<frame>.bin - 4800000 bytes, row-major "
+                      "[y][x], top-left first, no header. The m<frame>.bin name is what "
+                      "tools/motion_guide_analyze.py keys on. Does not enable neural rendering.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(motion_dump_frame, -1, "GPU/Vulkan",
+                     "Development: first guest frame the motion guide dump starts at; -1 dumps the "
+                     "first frame the guide resolves on. Stop is bounded by motion_dump_frames.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(motion_dump_frames, 1, "GPU/Vulkan",
+                     "Development: number of guest frames the motion guide dump writes before it "
+                     "stops on its own, so the log and the disk cannot flood.")
+    .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 // DEFINE_string(
 //     render_target_path_vulkan, "",
 //     "Render target emulation path to use on Vulkan.\n"
@@ -227,6 +255,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/host_depth_store_2xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/host_depth_store_4xmsaa_cs.h"
+#include "../shaders/vulkan_spirv/motion_resolve_cs.h"
 #include "../shaders/vulkan_spirv/passthrough_position_xy_vs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_cs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_scaled_cs.h"
@@ -1231,6 +1260,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   DestroyWritebackProbeBuffers();
   DestroyDepthProbeResources();
   DestroyColourProbeResources();
+  DestroyMotionGuideResources();
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          resolve_fsi_clear_64bpp_pipeline_);
@@ -1369,6 +1399,12 @@ void VulkanRenderTargetCache::ClearCache() {
   depth_probe_target_ = nullptr;
   depth_probe_target_frame_ = UINT64_MAX;
 
+  // The resolve's descriptor sets reference the guide views just destroyed with
+  // the framebuffers, so the pool, pipeline and buffers go too; the next resolve
+  // recreates them. Released here rather than with the common ClearCache because
+  // those views are already gone.
+  DestroyMotionGuideResources();
+
   RenderTargetCache::ClearCache();
 }
 
@@ -1378,6 +1414,7 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
   VerifyWritebackProbe();
   VerifyDepthProbe();
   VerifyColourProbe();
+  VerifyMotionGuideDump();
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -2525,6 +2562,451 @@ void VulkanRenderTargetCache::VerifyColourProbe() {
   }
 }
 
+void VulkanRenderTargetCache::MaybeResolveMotionGuide() {
+  // Guide off is the default, and everything below either allocates or records
+  // commands, so this is deliberately the first check: a guide-off run executes
+  // none of this.
+  if (!motion_guide_enabled()) {
+    return;
+  }
+  const Framebuffer* const framebuffer = last_update_framebuffer_;
+  if (framebuffer == nullptr || framebuffer->motion_image == VK_NULL_HANDLE ||
+      framebuffer->motion_view == VK_NULL_HANDLE || framebuffer->motion_draws_this_frame == 0) {
+    // The seam is also reached from passes without a guest attachment, and those
+    // get no guide attachment at all, so there is nothing to read.
+    return;
+  }
+  const uint64_t frame64 = command_processor_.GetCurrentFrame();
+  const uint32_t frame = uint32_t(frame64);
+  // Bounded, reason-tagged refusal log, like the probes': normal lifecycle stops
+  // (the per-frame dedupe, a pending dump) are the resolve working as designed and
+  // are not logged, so the budget survives for a real refusal.
+  auto skip = [this, frame](const char* reason) {
+    if (motion_guide_skipped_logs_ < 8) {
+      ++motion_guide_skipped_logs_;
+      REXGPU_INFO("motion_resolve skip frame={} reason={}", frame, reason);
+    }
+  };
+
+  // One resolve per guest frame. A frame resolves 1000x600 several times, and the
+  // guide is complete once the scene pass has ended; more dispatches would only
+  // re-read the same attachment.
+  if (motion_guide_last_frame_ == frame) {
+    return;
+  }
+  // The clear stamp is written when the framebuffer's pass is entered, so it also
+  // answers "has this frame drawn into the guide yet". If it has not, the
+  // attachment still holds an earlier frame's vectors, and resolving would hand NR
+  // a stale field. This is what skips the frame's resolves that happen before the
+  // scene pass, whatever extent they resolve.
+  if (framebuffer->motion_cleared_frame != frame64) {
+    skip("guide_not_written_this_frame");
+    return;
+  }
+  // texelFetch on a sampler2DMS reads any multisampled attachment (2x on this
+  // title, 4x when 2x is emulated as 4x) with an explicit sample index, but a 1x
+  // image cannot be bound to it at all. The scene pass cannot be 1x here, so this
+  // is a guard against a 1x pass being the current one at the seam.
+  if (framebuffer->motion_samples == VK_SAMPLE_COUNT_1_BIT) {
+    skip("single_sample_guide");
+    return;
+  }
+  // The scene is a crop of the attachment's top-left corner, so the attachment has
+  // to contain it. A smaller pass would be fetched out of bounds and return
+  // zeroes, which would read as an empty scene instead of a refused resolve.
+  if (framebuffer->host_extent.width < kMotionGuideWidth ||
+      framebuffer->host_extent.height < kMotionGuideHeight) {
+    skip("attachment_smaller_than_scene");
+    return;
+  }
+  // (x, y) is the guest pixel grid. At a draw resolution scale the attachment is
+  // larger and this crop would cover only the scene's top-left quarter rather than
+  // all of it, so it is refused instead of quietly quartering the guide. The
+  // intended target is scale 1; a scaled resolve would need a strided or scaled
+  // fetch, which is a different shader.
+  if (IsDrawResolutionScaled()) {
+    skip("resolution_scaled");
+    return;
+  }
+
+  if (!EnsureMotionGuideResources() || !EnsureMotionGuideDescriptorSet(*framebuffer)) {
+    return;
+  }
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // The guide is a render pass attachment that every pass loads and stores in
+  // COLOR_ATTACHMENT_OPTIMAL, so that is the only layout it has between passes
+  // and the only layout the next frame's render pass accepts. Sampling it and
+  // putting it back exactly there means nothing outside this function has to know
+  // it was read, and no render target's usage triple is involved - the guide is
+  // not a guest render target.
+  const VkImageSubresourceRange motion_subresource_range =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT);
+  command_processor_.PushImageMemoryBarrier(
+      framebuffer->motion_image, motion_subresource_range,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  // Flushed before the dispatch is recorded: SubmitBarriers emits the pending
+  // barriers at the current position in the deferred command stream, so a barrier
+  // pushed now and flushed later would land after the dispatch it orders.
+  command_processor_.SubmitBarriers(true);
+
+  command_processor_.BindExternalComputePipeline(motion_guide_pipeline_);
+  const VkDescriptorSet descriptor_set = framebuffer->motion_descriptor_set;
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         motion_guide_pipeline_layout_, 0, 1, &descriptor_set, 0,
+                                         nullptr);
+  // One dispatch for the whole scene: 125x75 groups of 8x8 exactly cover
+  // 1000x600, and the shader still bounds-checks because the group size is a
+  // shader constant, not a property of the buffer.
+  command_buffer.CmdVkDispatch((kMotionGuideWidth + 7u) / 8u, (kMotionGuideHeight + 7u) / 8u, 1);
+
+  command_processor_.PushImageMemoryBarrier(
+      framebuffer->motion_image, motion_subresource_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  // Emitted now rather than with the next probe's barriers, so the image is back
+  // in the layout the next render pass loads from even if nothing else is recorded
+  // before the pass is entered.
+  command_processor_.SubmitBarriers(true);
+
+  motion_guide_last_frame_ = frame;
+  if (motion_guide_resolve_logs_ < 4) {
+    ++motion_guide_resolve_logs_;
+    // The attachment may be wider than the scene and is 2x MSAA; both are stated
+    // so a dump that shows a crop or a repeated pixel can be explained from the
+    // log instead of guessed at.
+    REXGPU_INFO(
+        "motion_resolve frame={} scene={}x{} attachment={}x{} samples={} bytes={}", frame,
+        kMotionGuideWidth, kMotionGuideHeight, framebuffer->host_extent.width,
+        framebuffer->host_extent.height, uint32_t(framebuffer->motion_samples),
+        uint64_t(kMotionGuideBytes));
+  }
+
+  // The dump is a separate, bounded decision: the resolve itself runs every frame
+  // the guide is active because NR consumes its buffer, while the copy-out exists
+  // only for a measurement run.
+  const std::string dump_prefix = REXCVAR_GET(motion_dump);
+  if (dump_prefix.empty() || motion_guide_readback_buffer_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const int32_t dump_first_frame = REXCVAR_GET(motion_dump_frame);
+  if (dump_first_frame >= 0 && frame < uint32_t(dump_first_frame)) {
+    return;
+  }
+  if (motion_guide_dump_frames_done_ >= uint32_t(REXCVAR_GET(motion_dump_frames))) {
+    return;
+  }
+  if (motion_guide_pending_) {
+    // The single readback buffer has not been written on the CPU yet; recording
+    // another copy would overwrite it before the GPU finished with the previous
+    // one.
+    return;
+  }
+
+  // Copy out to the host-visible buffer. Nothing here writes the guide, guest
+  // memory or the EDRAM buffer, so MarkEdramBufferModified must not be called -
+  // that would claim ownership of data this resolve never produced.
+  command_processor_.PushBufferMemoryBarrier(
+      motion_guide_output_buffer_, 0, kMotionGuideBytes, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+  VkBufferCopy copy_region = {};
+  copy_region.size = kMotionGuideBytes;
+  command_buffer.CmdVkCopyBuffer(motion_guide_output_buffer_, motion_guide_readback_buffer_, 1,
+                                 &copy_region);
+  // Host visibility for the write in CompletedSubmissionUpdated.
+  command_processor_.PushBufferMemoryBarrier(
+      motion_guide_readback_buffer_, 0, kMotionGuideBytes, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+  motion_guide_pending_ = true;
+  motion_guide_pending_frame_ = frame;
+  ++motion_guide_dump_frames_done_;
+}
+
+void VulkanRenderTargetCache::VerifyMotionGuideDump() {
+  if (!motion_guide_pending_) {
+    return;
+  }
+  motion_guide_pending_ = false;
+  if (motion_guide_readback_buffer_ == VK_NULL_HANDLE || motion_guide_readback_mapped_ == nullptr) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // The GPU wrote the readback buffer, so the host copy is only valid after
+  // invalidation.
+  VkMappedMemoryRange mapped_range = {};
+  mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  mapped_range.memory = motion_guide_readback_memory_;
+  mapped_range.offset = 0;
+  mapped_range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+
+  // Raw dump, no header and no conversion: the bytes are the shader's packed
+  // half-float pairs, row-major [y][x] from the top-left, which is exactly what
+  // tools/motion_guide_analyze.py reads. The `m` in the file name is appended here,
+  // not expected from the user, so the analyzer's m<frame>.bin pattern holds
+  // whatever prefix is configured (a directory, for instance).
+  std::string dump_path = REXCVAR_GET(motion_dump);
+  dump_path += 'm';
+  dump_path += std::to_string(motion_guide_pending_frame_);
+  dump_path += ".bin";
+  std::FILE* const dump_file = std::fopen(dump_path.c_str(), "wb");
+  if (!dump_file) {
+    REXGPU_WARN("motion_dump: can't write {}", dump_path);
+    return;
+  }
+  const size_t written =
+      std::fwrite(motion_guide_readback_mapped_, 1, size_t(kMotionGuideBytes), dump_file);
+  std::fclose(dump_file);
+  if (written != size_t(kMotionGuideBytes)) {
+    REXGPU_WARN("motion_dump: short write {} of {} bytes to {}", written,
+                uint64_t(kMotionGuideBytes), dump_path);
+    return;
+  }
+  // One line per dump, bounded by motion_dump_frames, so a run's log is a short
+  // list of exactly what was written.
+  REXGPU_INFO("motion_dump frame={} bytes={} path={}", motion_guide_pending_frame_,
+              uint64_t(kMotionGuideBytes), dump_path);
+}
+
+bool VulkanRenderTargetCache::EnsureMotionGuideResources() {
+  if (motion_guide_resources_failed_) {
+    return false;
+  }
+  if (motion_guide_pipeline_ != VK_NULL_HANDLE &&
+      motion_guide_pipeline_layout_ != VK_NULL_HANDLE &&
+      motion_guide_sampler_ != VK_NULL_HANDLE &&
+      motion_guide_descriptor_set_layout_ != VK_NULL_HANDLE &&
+      motion_guide_descriptor_set_pool_ && motion_guide_output_buffer_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // A failure releases whatever was already created and is remembered, so a
+  // device that cannot support the resolve is not asked again every frame.
+  auto fail = [this](const char* what) {
+    REXGPU_ERROR("VulkanRenderTargetCache: failed to create the motion guide resolve {}", what);
+    DestroyMotionGuideResources();
+    motion_guide_resources_failed_ = true;
+    return false;
+  };
+
+  // The resolve output: exactly the 1000x600 scene rectangle's RGBA16F bytes,
+  // written by the compute shader and read by the dump copy (and by NR later).
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, kMotionGuideBytes,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, motion_guide_output_buffer_,
+          motion_guide_output_memory_)) {
+    return fail("output buffer");
+  }
+  // Only when a dump was requested at initialization: a guide-only run allocates
+  // nothing host-visible and maps nothing.
+  if (!REXCVAR_GET(motion_dump).empty()) {
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, kMotionGuideBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, motion_guide_readback_buffer_,
+            motion_guide_readback_memory_)) {
+      return fail("readback buffer");
+    }
+    if (dfn.vkMapMemory(device, motion_guide_readback_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &motion_guide_readback_mapped_) != VK_SUCCESS) {
+      motion_guide_readback_mapped_ = nullptr;
+      return fail("readback buffer mapping");
+    }
+  }
+
+  // Set 0, binding 0: the guide as a combined image sampler - the shader is
+  // written as sampler2DMS, whose multisample sample operand cannot be expressed
+  // through a bare sampled image - and binding 1: the packed output.
+  VkDescriptorSetLayoutBinding motion_bindings[2] = {};
+  motion_bindings[0].binding = 0;
+  motion_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  motion_bindings[0].descriptorCount = 1;
+  motion_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  motion_bindings[0].pImmutableSamplers = nullptr;
+  motion_bindings[1].binding = 1;
+  motion_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  motion_bindings[1].descriptorCount = 1;
+  motion_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  motion_bindings[1].pImmutableSamplers = nullptr;
+  VkDescriptorSetLayoutCreateInfo motion_set_layout_create_info;
+  motion_set_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  motion_set_layout_create_info.pNext = nullptr;
+  motion_set_layout_create_info.flags = 0;
+  motion_set_layout_create_info.bindingCount = uint32_t(rex::countof(motion_bindings));
+  motion_set_layout_create_info.pBindings = motion_bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &motion_set_layout_create_info, nullptr,
+                                      &motion_guide_descriptor_set_layout_) != VK_SUCCESS) {
+    motion_guide_descriptor_set_layout_ = VK_NULL_HANDLE;
+    return fail("descriptor set layout");
+  }
+
+  // One sampler for every framebuffer. texelFetch ignores filtering, addressing
+  // and LOD selection, so its state is never consulted; nearest and clamp-to-edge
+  // only make that explicit.
+  VkSamplerCreateInfo motion_sampler_create_info;
+  motion_sampler_create_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  motion_sampler_create_info.pNext = nullptr;
+  motion_sampler_create_info.flags = 0;
+  motion_sampler_create_info.magFilter = VK_FILTER_NEAREST;
+  motion_sampler_create_info.minFilter = VK_FILTER_NEAREST;
+  motion_sampler_create_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  motion_sampler_create_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  motion_sampler_create_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  motion_sampler_create_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  motion_sampler_create_info.mipLodBias = 0.0f;
+  motion_sampler_create_info.anisotropyEnable = VK_FALSE;
+  motion_sampler_create_info.maxAnisotropy = 1.0f;
+  motion_sampler_create_info.compareEnable = VK_FALSE;
+  motion_sampler_create_info.compareOp = VK_COMPARE_OP_NEVER;
+  motion_sampler_create_info.minLod = 0.0f;
+  motion_sampler_create_info.maxLod = 0.0f;
+  motion_sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+  motion_sampler_create_info.unnormalizedCoordinates = VK_FALSE;
+  if (dfn.vkCreateSampler(device, &motion_sampler_create_info, nullptr, &motion_guide_sampler_) !=
+      VK_SUCCESS) {
+    motion_guide_sampler_ = VK_NULL_HANDLE;
+    return fail("sampler");
+  }
+
+  // One descriptor set per framebuffer, allocated on first use: the set binds that
+  // framebuffer's guide view, and a view cannot be swapped in a set that an
+  // earlier submission may still be executing.
+  VkDescriptorPoolSize motion_pool_sizes[2] = {};
+  motion_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  motion_pool_sizes[0].descriptorCount = 1;
+  motion_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  motion_pool_sizes[1].descriptorCount = 1;
+  motion_guide_descriptor_set_pool_ = std::make_unique<ui::vulkan::SingleLayoutDescriptorSetPool>(
+      vulkan_device, 16, uint32_t(rex::countof(motion_pool_sizes)), motion_pool_sizes,
+      motion_guide_descriptor_set_layout_);
+
+  // Nothing about the resolve varies per frame or per framebuffer - the scene
+  // rectangle, the sample index and the output stride are the shader's own
+  // constants - so there are no push constants and one pipeline serves every pass
+  // the guide is attached to.
+  VkPipelineLayoutCreateInfo motion_pipeline_layout_create_info;
+  motion_pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  motion_pipeline_layout_create_info.pNext = nullptr;
+  motion_pipeline_layout_create_info.flags = 0;
+  motion_pipeline_layout_create_info.setLayoutCount = 1;
+  motion_pipeline_layout_create_info.pSetLayouts = &motion_guide_descriptor_set_layout_;
+  motion_pipeline_layout_create_info.pushConstantRangeCount = 0;
+  motion_pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  if (dfn.vkCreatePipelineLayout(device, &motion_pipeline_layout_create_info, nullptr,
+                                 &motion_guide_pipeline_layout_) != VK_SUCCESS) {
+    motion_guide_pipeline_layout_ = VK_NULL_HANDLE;
+    return fail("pipeline layout");
+  }
+  motion_guide_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, motion_guide_pipeline_layout_, shaders::motion_resolve_cs,
+      sizeof(shaders::motion_resolve_cs));
+  if (motion_guide_pipeline_ == VK_NULL_HANDLE) {
+    return fail("pipeline");
+  }
+  return true;
+}
+
+bool VulkanRenderTargetCache::EnsureMotionGuideDescriptorSet(const Framebuffer& framebuffer) {
+  if (framebuffer.motion_descriptor_set != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (!motion_guide_descriptor_set_pool_ || motion_guide_sampler_ == VK_NULL_HANDLE ||
+      motion_guide_output_buffer_ == VK_NULL_HANDLE ||
+      framebuffer.motion_view == VK_NULL_HANDLE) {
+    return false;
+  }
+  const size_t set_index = motion_guide_descriptor_set_pool_->Allocate();
+  if (set_index == SIZE_MAX) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: failed to allocate the motion guide resolve descriptor set");
+    // Remembered as a resource failure: the pool could not grow, and asking again
+    // every frame would only log the same error again.
+    motion_guide_resources_failed_ = true;
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const VkDescriptorSet descriptor_set = motion_guide_descriptor_set_pool_->Get(set_index);
+  VkDescriptorImageInfo motion_image_info = {};
+  motion_image_info.sampler = motion_guide_sampler_;
+  motion_image_info.imageView = framebuffer.motion_view;
+  motion_image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorBufferInfo motion_buffer_info = {};
+  motion_buffer_info.buffer = motion_guide_output_buffer_;
+  motion_buffer_info.offset = 0;
+  motion_buffer_info.range = kMotionGuideBytes;
+  VkWriteDescriptorSet motion_descriptor_writes[2] = {};
+  motion_descriptor_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  motion_descriptor_writes[0].pNext = nullptr;
+  motion_descriptor_writes[0].dstSet = descriptor_set;
+  motion_descriptor_writes[0].dstBinding = 0;
+  motion_descriptor_writes[0].dstArrayElement = 0;
+  motion_descriptor_writes[0].descriptorCount = 1;
+  motion_descriptor_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  motion_descriptor_writes[0].pImageInfo = &motion_image_info;
+  motion_descriptor_writes[0].pBufferInfo = nullptr;
+  motion_descriptor_writes[0].pTexelBufferView = nullptr;
+  motion_descriptor_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  motion_descriptor_writes[1].pNext = nullptr;
+  motion_descriptor_writes[1].dstSet = descriptor_set;
+  motion_descriptor_writes[1].dstBinding = 1;
+  motion_descriptor_writes[1].dstArrayElement = 0;
+  motion_descriptor_writes[1].descriptorCount = 1;
+  motion_descriptor_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  motion_descriptor_writes[1].pImageInfo = nullptr;
+  motion_descriptor_writes[1].pBufferInfo = &motion_buffer_info;
+  motion_descriptor_writes[1].pTexelBufferView = nullptr;
+  // Written once, before this set is ever bound: a set still in use by an earlier
+  // submission must not be updated, which is why a framebuffer gets its own.
+  dfn.vkUpdateDescriptorSets(device, uint32_t(rex::countof(motion_descriptor_writes)),
+                             motion_descriptor_writes, 0, nullptr);
+  framebuffer.motion_descriptor_set = descriptor_set;
+  return true;
+}
+
+void VulkanRenderTargetCache::DestroyMotionGuideResources() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (motion_guide_readback_memory_ != VK_NULL_HANDLE &&
+      motion_guide_readback_mapped_ != nullptr) {
+    dfn.vkUnmapMemory(device, motion_guide_readback_memory_);
+  }
+  motion_guide_readback_mapped_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         motion_guide_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         motion_guide_readback_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         motion_guide_output_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_guide_output_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, motion_guide_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         motion_guide_pipeline_layout_);
+  // The pool owns the per-framebuffer descriptor sets and must be released before
+  // the layout it was created from. Every caller also destroys the framebuffers
+  // whose views those sets referenced.
+  motion_guide_descriptor_set_pool_.reset();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         motion_guide_descriptor_set_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, motion_guide_sampler_);
+  motion_guide_pending_ = false;
+  motion_guide_last_frame_ = UINT32_MAX;
+  // A fresh start: this runs on Shutdown and ClearCache, so the next resolve
+  // recreates everything - which is also how a device loss is recovered from.
+  motion_guide_resources_failed_ = false;
+}
+
 bool VulkanRenderTargetCache::EnsureDepthProbeResources() {
   if (depth_probe_buffer_ != VK_NULL_HANDLE && depth_probe_readback_buffer_ != VK_NULL_HANDLE &&
       depth_probe_readback_mapped_ != nullptr &&
@@ -3202,6 +3684,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
             // memory, before the composition and HUD passes touch it.
             MaybeRunColourProbe(shared_memory, resolve_info, draw_resolution_scaled);
           }
+          if (motion_guide_enabled()) {
+            // Same seam, motion side: the scene pass that wrote the guide has
+            // ended and the HUD has not been drawn yet. The guide is not guest
+            // memory, so this does not depend on which address was resolved.
+            MaybeResolveMotionGuide();
+          }
         }
       }
     }
@@ -3296,9 +3784,11 @@ bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
   // exactly one line and a repeated call says nothing new.
   if (is_enabled != was_enabled) {
     if (is_enabled) {
-      REXGPU_INFO("motion_guide active: attachment={} of {} format={}",
-                  kMotionGuideColorAttachmentIndex, kMotionGuideColorAttachmentCount,
-                  uint32_t(kMotionGuideAttachmentFormat));
+      // No attachment index here: the guide has no fixed one, it follows the used
+      // guest colour targets of each pass. The capacity is what the device had to
+      // support for the feature to be active at all.
+      REXGPU_INFO("motion_guide active: max_color_attachments={} format={}",
+                  kMotionGuideColorAttachmentCount, uint32_t(kMotionGuideAttachmentFormat));
     } else {
       // An inactive reason has to be nameable, not silent: either the backend
       // cannot carry a fifth attachment at all or this device cannot use the
@@ -3311,6 +3801,13 @@ bool VulkanRenderTargetCache::SetMotionGuideEnabled(bool enabled) {
     }
   }
   return is_enabled;
+}
+
+void VulkanRenderTargetCache::NotifyMotionDraw() {
+  if (last_update_framebuffer_ != nullptr &&
+      last_update_framebuffer_->motion_view != VK_NULL_HANDLE) {
+    ++last_update_framebuffer_->motion_draws_this_frame;
+  }
 }
 
 void VulkanRenderTargetCache::SetMotionGuideSceneDraw(bool scene_draw) {
@@ -3439,21 +3936,21 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
             depth_and_color_render_targets[4]->key().GetColorFormat();
       }
 
-      // Phase 2 motion guide: the guide is a fifth colour attachment, so it is
-      // only added to a pass that already has a guest attachment - with none,
-      // host_extent is the no-attachment fallback and the guide image would be
-      // allocated at that size for a draw that cannot write fragments. The phase
-      // predicate is deliberately not guessed here: the same attachments and the
-      // same shaders serve the scene, the HUD and full-screen effects, so the
-      // command processor, which owns the frame's phase, sets it. Everything else
-      // (guide disabled, no format support, the interlock path) keeps this bit
-      // clear, and therefore keeps every key, render pass and framebuffer exactly
-      // as it was before the guide existed.
-      // The guide attachment belongs to the four-colour-target scene pass. The
-      // command processor's phase flag toggles per batch, so it cannot decide a
-      // pass key; the target shape can, and it is also what makes the fragment
-      // output location (4) equal to the subpass attachment index.
-      if (motion_guide_enabled() && (render_pass_key.depth_and_color_used & 0x1E) == 0x1E) {
+      // Phase 2 motion guide: the guide is a colour attachment appended after the
+      // used guest ones, so any colour target can host it - it does not need all
+      // four. The measured scene pass has exactly one (depth_and_color_used 0x02
+      // or 0x03), which is why a four-colour gate left the guide uncreated and the
+      // resolve without an image to read. The phase predicate is deliberately not
+      // guessed here: the same attachments and the same shaders serve the scene,
+      // the HUD and full-screen effects, so the command processor, which owns the
+      // frame's phase, sets the per-draw validity. Depth-only passes have no
+      // fragment colour to append to, and transfer passes render ownership
+      // transfers, not guide pixels; both keep the bit clear.
+      // Everything else (guide disabled, no format support, the interlock path)
+      // also keeps this bit clear, and therefore keeps every key, render pass and
+      // framebuffer exactly as it was before the guide existed.
+      if (motion_guide_enabled() && (render_pass_key.depth_and_color_used & 0x1E) != 0 &&
+          !render_pass_key.color_rts_use_transfer_formats) {
         render_pass_key.motion_attachment_used = 1;
       }
 
@@ -3569,9 +4066,21 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     *stencil_attachment = *depth_attachment;
   }
 
+  // Phase 2 motion guide: in a guide-bearing pass the used guest colours are
+  // written compacted from index 0, and the guide takes the slot right after
+  // them, so its colour attachment index - which is also its fragment output
+  // location - is the number of used guest colours (GetMotionGuideSubpassIndex).
+  // Without the guide the guest layout stays sparse exactly as before.
+  const bool motion_attachment_used = key.motion_attachment_used &&
+                                      last_update_framebuffer_ != nullptr &&
+                                      last_update_framebuffer_->motion_view != VK_NULL_HANDLE;
   uint32_t color_attachment_count = 0;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-    VkRenderingAttachmentInfo& color_attachment = color_attachments[i];
+    uint32_t color_attachment_index =
+        motion_attachment_used
+            ? rex::bit_count((key.depth_and_color_used >> 1) & ((uint32_t(1) << i) - 1))
+            : i;
+    VkRenderingAttachmentInfo& color_attachment = color_attachments[color_attachment_index];
     std::memset(&color_attachment, 0, sizeof(VkRenderingAttachmentInfo));
     if ((key.depth_and_color_used & (1 << (1 + i))) && rts[1 + i]) {
       const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[1 + i]);
@@ -3585,21 +4094,19 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       color_attachment.clearValue = {};
-      color_attachment_count = i + 1;
+      color_attachment_count = color_attachment_index + 1;
     }
   }
 
-  // Phase 2 motion guide: the guide is location 4 even when a guest colour target
-  // below it is unused, because a fragment output location cannot be renumbered -
-  // the uncovered entries stay zeroed, which dynamic rendering treats as an unused
-  // attachment. The view comes from the framebuffer the pass was actually built
-  // with, so it always matches the render pass's fifth attachment.
-  if (key.motion_attachment_used && last_update_framebuffer_ != nullptr &&
-      last_update_framebuffer_->motion_view != VK_NULL_HANDLE) {
-    assert_true(color_attachment_capacity > kMotionGuideColorAttachmentIndex);
-    if (color_attachment_capacity > kMotionGuideColorAttachmentIndex) {
-      VkRenderingAttachmentInfo& motion_attachment =
-          color_attachments[kMotionGuideColorAttachmentIndex];
+  // The guide is written at GetMotionGuideSubpassIndex, the same index the render
+  // pass references and the SPIR-V output is decorated with; colour_count + 1
+  // entries are covered. The view comes from the framebuffer the pass was actually
+  // built with, so it always matches the render pass's appended attachment.
+  if (motion_attachment_used) {
+    const uint32_t motion_attachment_index = GetMotionGuideSubpassIndex(key);
+    assert_true(color_attachment_capacity > motion_attachment_index);
+    if (color_attachment_capacity > motion_attachment_index) {
+      VkRenderingAttachmentInfo& motion_attachment = color_attachments[motion_attachment_index];
       std::memset(&motion_attachment, 0, sizeof(VkRenderingAttachmentInfo));
       motion_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
       motion_attachment.pNext = nullptr;
@@ -3614,7 +4121,7 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       motion_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       motion_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       motion_attachment.clearValue = {};
-      color_attachment_count = kMotionGuideColorAttachmentCount;
+      color_attachment_count = motion_attachment_index + 1;
     }
   }
   *color_attachment_count_out = color_attachment_count;
@@ -3636,15 +4143,20 @@ void VulkanRenderTargetCache::MaybeClearMotionAttachment(const Framebuffer* fram
     return;
   }
   framebuffer->motion_cleared_frame = frame;
+  framebuffer->motion_draws_this_frame = 0;
 
   // vkCmdClearAttachments, not an image clear: the pass is already open here, and
   // a transfer or clear command would be illegal outside a subpass. The index is
-  // the subpass colour attachment index (the same 4 in a dynamic rendering colour
-  // attachment array), not the framebuffer attachment index. All zeroes means
-  // xy = 0 NDC, z = 0 clip w, w = 0 validity.
+  // the subpass colour attachment index - the guide's slot among the colour
+  // references, GetMotionGuideSubpassIndex, which is colour_count and therefore
+  // also the fragment output location - not the framebuffer attachment index,
+  // which additionally counts the compacted guest attachments and depth. It is
+  // captured with the pass in motion_subpass_index so the clear and the SPIR-V
+  // decoration cannot disagree. All zeroes means xy = 0 NDC, z = 0 clip w, w = 0
+  // validity.
   VkClearAttachment clear_attachment;
   clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  clear_attachment.colorAttachment = kMotionGuideColorAttachmentIndex;
+  clear_attachment.colorAttachment = framebuffer->motion_subpass_index;
   clear_attachment.clearValue.color.float32[0] = 0.0f;
   clear_attachment.clearValue.color.float32[1] = 0.0f;
   clear_attachment.clearValue.color.float32[2] = 0.0f;
@@ -3711,15 +4223,30 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
       key.color_2_view_format,
       key.color_3_view_format,
   };
+  // The attachment descriptions above are already the used guest targets,
+  // compacted (depth first), and their indices do not depend on the guide. A
+  // guide-bearing pass compacts the subpass colour references too and appends the
+  // guide, because the guide's reference index - which is also its fragment output
+  // location - is colour_count; a guide-off pass keeps the sparse layout that the
+  // guest shader output locations were written for, exactly as before.
+  const bool motion_attachment_used = key.motion_attachment_used;
+  const uint32_t depth_attachment_count = key.depth_and_color_used & 0b1;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-    VkAttachmentReference& color_attachment = color_attachments[i];
-    color_attachment.layout = VulkanRenderTarget::kColorDrawLayout;
     uint32_t attachment_bit = uint32_t(1) << (1 + i);
     if (!(key.depth_and_color_used & attachment_bit)) {
-      color_attachment.attachment = VK_ATTACHMENT_UNUSED;
+      if (!motion_attachment_used) {
+        VkAttachmentReference& color_attachment = color_attachments[i];
+        color_attachment.layout = VulkanRenderTarget::kColorDrawLayout;
+        color_attachment.attachment = VK_ATTACHMENT_UNUSED;
+      }
       continue;
     }
     uint32_t attachment_index = rex::bit_count(key.depth_and_color_used & (attachment_bit - 1));
+    // Used guest colours are the compacted description index minus depth, so the
+    // guide can take the slot immediately after them.
+    VkAttachmentReference& color_attachment =
+        color_attachments[motion_attachment_used ? attachment_index - depth_attachment_count : i];
+    color_attachment.layout = VulkanRenderTarget::kColorDrawLayout;
     color_attachment.attachment = attachment_index;
     VkAttachmentDescription& attachment = attachments[attachment_index];
     attachment.flags = 0;
@@ -3736,20 +4263,18 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     attachment.finalLayout = VulkanRenderTarget::kColorDrawLayout;
   }
 
-  // Phase 2 motion guide: described after the guest attachments, so their indices
-  // - and therefore every existing attachment reference and framebuffer view - are
-  // untouched, but referenced as colour attachment 4, so the fragment output
-  // location is fixed. The sample count is the pass's own, never the guest's: it
-  // has to match the render pass's other attachments, and under 2x-as-4x those
-  // are 4x. LOAD rather than CLEAR because a pass can be resumed within a frame;
-  // MaybeClearMotionAttachment establishes the w = 0 start of the frame.
-  VkAttachmentReference& motion_attachment =
-      color_attachments[kMotionGuideColorAttachmentIndex];
-  motion_attachment.attachment = VK_ATTACHMENT_UNUSED;
-  motion_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  if (key.motion_attachment_used) {
-    const uint32_t motion_attachment_index = rex::bit_count(key.depth_and_color_used);
-    VkAttachmentDescription& attachment = attachments[motion_attachment_index];
+  // Phase 2 motion guide: described after every used guest attachment, and
+  // referenced at GetMotionGuideSubpassIndex (colour_count), so the fragment
+  // output location - set from the same formula in the pipeline description - and
+  // this colour reference are the same number by construction. The sample count is
+  // the pass's own, never the guest's: it has to match the render pass's other
+  // attachments, and under 2x-as-4x those are 4x. LOAD rather than CLEAR because a
+  // pass can be resumed within a frame; MaybeClearMotionAttachment establishes the
+  // w = 0 start of the frame.
+  if (motion_attachment_used) {
+    const uint32_t motion_description_index = GetMotionGuideDescriptionIndex(key);
+    const uint32_t motion_subpass_index = GetMotionGuideSubpassIndex(key);
+    VkAttachmentDescription& attachment = attachments[motion_description_index];
     attachment.flags = 0;
     attachment.format = kMotionGuideAttachmentFormat;
     attachment.samples = samples;
@@ -3759,7 +4284,9 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
     attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    motion_attachment.attachment = motion_attachment_index;
+    VkAttachmentReference& motion_reference = color_attachments[motion_subpass_index];
+    motion_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    motion_reference.attachment = motion_description_index;
   }
 
   VkAttachmentReference depth_stencil_attachment;
@@ -3771,10 +4298,11 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.inputAttachmentCount = 0;
   subpass.pInputAttachments = nullptr;
+  // Used guest colour references (highest index plus one, sparse, when the guide
+  // is absent) plus the guide at GetMotionGuideSubpassIndex when it is present.
   subpass.colorAttachmentCount =
-      key.motion_attachment_used
-          ? kMotionGuideColorAttachmentCount
-          : uint32_t(32 - rex::lzcnt(uint32_t(key.depth_and_color_used >> 1)));
+      motion_attachment_used ? GetMotionGuideSubpassIndex(key) + 1
+                             : uint32_t(32 - rex::lzcnt(uint32_t(key.depth_and_color_used >> 1)));
   subpass.pColorAttachments = color_attachments;
   subpass.pResolveAttachments = nullptr;
   subpass.pDepthStencilAttachment =
@@ -4409,6 +4937,11 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   if (render_pass_key.depth_and_color_used & (1 << 4)) {
     key.color_3_base_tiles = depth_and_color_render_targets[4]->key().base_tiles;
   }
+  if (motion_guide_enabled() && motion_guide_pass_logs_ < 12) {
+    ++motion_guide_pass_logs_;
+    REXGPU_INFO("motion_guide pass used={:02X} motion={} pitch={}", uint32_t(render_pass_key.depth_and_color_used),
+                uint32_t(render_pass_key.motion_attachment_used), pitch_tiles_at_32bpp);
+  }
   auto it = framebuffers_.find(key);
   if (it != framebuffers_.end()) {
     return &it->second;
@@ -4441,8 +4974,13 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     }
     attachments[attachment_count++] = attachment;
   }
-  // The guest attachments keep their positions: the guide is appended after them,
-  // matching the description and reference it has in the render pass.
+  // The guest views keep their compacted positions at the front of the framebuffer
+  // - the guide is appended after them, at GetMotionGuideDescriptionIndex, matching
+  // the render pass's attachment description order. The views appended so far must
+  // therefore end exactly at that index before the guide view is added below.
+  if (render_pass_key.motion_attachment_used) {
+    assert_true(attachment_count == GetMotionGuideDescriptionIndex(render_pass_key));
+  }
 
   VkFramebufferCreateInfo framebuffer_create_info;
   framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -4545,7 +5083,9 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   }
 
   // The attachment count is taken after the guide has been appended, so it always
-  // equals the render pass's attachmentCount.
+  // equals the render pass's attachmentCount. The guide's subpass colour index is
+  // recorded with the framebuffer because the clear must use the same number the
+  // pass and the fragment shader were built with.
   framebuffer_create_info.attachmentCount = attachment_count;
   framebuffer_create_info.width = host_extent.width;
   framebuffer_create_info.height = host_extent.height;
@@ -4573,6 +5113,8 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   new_framebuffer.motion_image = motion_image;
   new_framebuffer.motion_memory = motion_memory;
   new_framebuffer.motion_view = motion_view;
+  new_framebuffer.motion_subpass_index = GetMotionGuideSubpassIndex(render_pass_key);
+  new_framebuffer.motion_samples = GetHostRenderTargetsSampleCount(render_pass_key);
   return &new_framebuffer;
 }
 

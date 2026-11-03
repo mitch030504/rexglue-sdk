@@ -677,6 +677,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Draws whose block had a complete, unchanged previous-frame index set - the
   // only draws that can produce non-zero motion this frame.
   uint32_t motion_frame_history_ = 0;
+  // Projection jitter of frame - 1 minus this frame, in guest-NDC units, applied to
+  // every draw of the frame. The guest projection carries the jitter, so the stored
+  // clips include it and the fragment must subtract the difference.
+  float motion_jitter_ndc_[2] = {0.0f, 0.0f};
   uint32_t motion_frame_reallocated_ = 0;
   uint32_t motion_frame_index_set_changed_ = 0;
   uint32_t motion_frame_clamped_ = 0;

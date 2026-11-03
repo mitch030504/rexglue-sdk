@@ -38,6 +38,7 @@
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/ui/temporal_jitter.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
@@ -3766,6 +3767,33 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
   motion_frame_ = frame;
   motion_parity_ = uint32_t(frame & 1);
   motion_frame_slot_cursor_ = 0;
+
+  // The guest projection carries the temporal-upscaler jitter (the projection hook
+  // modifies the guest matrix), so both stored clips include their frame's jitter and
+  // the fragment must subtract the difference in guest-NDC units. The hook's own flip
+  // switch is honoured so the guide matches what was rendered. Inactive upscaler means
+  // no jitter and zero here, which is a known no-op.
+  float jitter_x = 0.0f, jitter_y = 0.0f, prev_jitter_x = 0.0f, prev_jitter_y = 0.0f;
+  uint32_t render_width = 0, render_height = 0;
+  if (frame > 0 && rex::ui::temporal::IsActive(render_width, render_height) &&
+      render_width && render_height) {
+    rex::ui::temporal::JitterForFrame(frame, jitter_x, jitter_y);
+    rex::ui::temporal::JitterForFrame(frame - 1, prev_jitter_x, prev_jitter_y);
+    const int32_t flip = REXCVAR_QUERY(int32_t, temporal_jitter_flip);
+    if (flip & 1) {
+      jitter_x = -jitter_x;
+      prev_jitter_x = -prev_jitter_x;
+    }
+    if (flip & 2) {
+      jitter_y = -jitter_y;
+      prev_jitter_y = -prev_jitter_y;
+    }
+    motion_jitter_ndc_[0] = (jitter_x - prev_jitter_x) * 2.0f / float(render_width);
+    motion_jitter_ndc_[1] = (jitter_y - prev_jitter_y) * 2.0f / float(render_height);
+  } else {
+    motion_jitter_ndc_[0] = 0.0f;
+    motion_jitter_ndc_[1] = 0.0f;
+  }
   motion_frame_keys_ = 0;
   motion_frame_draws_ = 0;
   motion_frame_missing_ = 0;
@@ -3966,17 +3994,10 @@ void VulkanCommandProcessor::UpdateMotionSceneConstants(
             ndc_scale +
         0.5f;
   }
-  // Deliberately zero, see the report: the fragment stage subtracts
-  // motion_jitter_uv from NDC motion, so the field must be the difference between
-  // the current and the previous frame's projection jitter in guest-NDC units and
-  // with the scene-UV Y sign. That difference has not been measured for the guide
-  // (the upscaler's own sign is measured separately, rex::ui::temporal::
-  // JitterForFrame + temporal_jitter_flip). Zero is a known no-op; a guessed sign
-  // is not. The resolve stage must call rex::ui::temporal::JitterForFrame for the
-  // current and the previous frame and supply
-  // (jitter_current - jitter_previous) * 2 / viewport_extent, Y matching scene_uv.
-  system_constants_.motion_jitter_uv[0] = 0.0f;
-  system_constants_.motion_jitter_uv[1] = 0.0f;
+  // Per-frame difference computed at rotation with the projection hook's flip
+  // switch; see AdvanceMotionFrame. Zero while no temporal upscaler is active.
+  system_constants_.motion_jitter_uv[0] = motion_jitter_ndc_[0];
+  system_constants_.motion_jitter_uv[1] = motion_jitter_ndc_[1];
 }
 
 void VulkanCommandProcessor::OnTraceMarker(const TraceMarker& marker) {
@@ -4505,6 +4526,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // variant can have written or read the arena; a mismatch writes zero rather
     // than a plausible garbage vector.
     system_constants_.motion_key_valid = (motion_keyed && motion_vertex_variant) ? 1 : 0;
+    if (system_constants_.motion_key_valid && motion_clip_draw.clip_base != UINT32_MAX) {
+      render_target_cache_->NotifyMotionDraw();
+    }
     system_constants_.motion_clip_base = motion_clip_draw.clip_base;
     system_constants_.motion_prev_clip_base = motion_clip_draw.prev_clip_base;
     system_constants_.motion_index_min = motion_clip_draw.index_min;

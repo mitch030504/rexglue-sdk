@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 13;
+    static constexpr uint32_t kVersion = 14;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -101,6 +101,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // stub variant shares this bit and is distinguished by a system constant,
       // so both variants are one pipeline key each.
       uint32_t motion_guide : 1;
+      // Phase 2 motion guide: the guide's fragment output location, which is its
+      // subpass colour attachment reference index - the number of used guest
+      // colour targets, because the guide follows the compacted guest attachments.
+      // It depends on the pass, not on the shader, so the pipeline description
+      // fills it from the render pass key; 3 bits cover colour counts 0...4.
+      uint32_t motion_guide_output_location : 3;
     } pixel;
     uint64_t value = 0;
 

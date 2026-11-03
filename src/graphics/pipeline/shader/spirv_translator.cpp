@@ -3205,14 +3205,18 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     }
     output_fragment_motion_ = spv::NoResult;
     if (shader_modification.pixel.motion_guide) {
-      // Phase 2 motion guide: its own colour attachment after the guest render
-      // targets, so the fragment output location is the subpass attachment
-      // index.
+      // Phase 2 motion guide: its own colour attachment after the used guest render
+      // targets, so the fragment output location is the subpass colour reference
+      // index, which the pipeline description took from the pass key: colour_count,
+      // the number of used guest colour targets (the same formula the render pass,
+      // the blend state, the clear and the dynamic rendering array use). A fixed
+      // index would point at nothing on the one-colour scene pass.
       assert_true(!is_depth_only_fragment_shader_);
       output_fragment_motion_ = builder_->createVariable(
           spv::NoPrecision, spv::StorageClassOutput, type_float4_, "xe_out_fragment_motion");
-      builder_->addDecoration(output_fragment_motion_, spv::DecorationLocation,
-                              int(xenos::kMaxColorRenderTargets));
+      builder_->addDecoration(
+          output_fragment_motion_, spv::DecorationLocation,
+          int(shader_modification.pixel.motion_guide_output_location));
       builder_->addDecoration(output_fragment_motion_, spv::DecorationInvariant);
       main_interface_.push_back(output_fragment_motion_);
     }

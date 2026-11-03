@@ -85,12 +85,31 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // previous-frame index set and the fragment wrote a vector, 0 elsewhere
   // (including the per-frame clear). Single-sample by the time NR sees it.
   static constexpr VkFormat kMotionGuideAttachmentFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-  // The guide is always the fifth colour attachment (fragment output location 4
-  // in the subpass, index 4 in a dynamic rendering colour attachment array), so
-  // its location is the same whether the draw uses one guest colour target or
-  // four. It is appended after the used guest attachments in the render pass and
-  // framebuffer attachment lists, which therefore keep their existing indices.
-  static constexpr uint32_t kMotionGuideColorAttachmentIndex = xenos::kMaxColorRenderTargets;
+  // The guide is appended after every attachment the pass already uses, and the
+  // guest attachments are compacted (depth first if used, then the used colour
+  // targets in order), so its index is a function of the pass rather than a
+  // constant. A fixed index would be dead on the scene pass, which uses one
+  // colour target (depth_and_color_used 0x02 or 0x03), not four. Both formulas
+  // below are the only ways the guide may be named; every site that builds a
+  // pass, framebuffer, blend state, attachment array or clear uses them, so the
+  // index cannot drift from the objects that were created with the key.
+  //
+  // Subpass colour attachment reference index: the number of used guest colour
+  // targets, because the guide is referenced right after the compacted guest
+  // colours. This is also the guide's fragment output location and the
+  // vkCmdClearAttachments.colorAttachment index. 0x02 -> 1, 0x03 -> 1,
+  // 0x1E -> 4 (the old constant, now just one case of the formula).
+  static constexpr uint32_t GetMotionGuideSubpassIndex(RenderPassKey key) {
+    return rex::bit_count(uint32_t(key.depth_and_color_used >> 1));
+  }
+  // Render pass and framebuffer attachment description index: after all used
+  // guest attachments, depth included. 0x02 -> 1, 0x03 -> 2, 0x1E -> 5.
+  static constexpr uint32_t GetMotionGuideDescriptionIndex(RenderPassKey key) {
+    return rex::bit_count(uint32_t(key.depth_and_color_used));
+  }
+  // Capacity only, never an index: the most colour attachments any pass can have
+  // (four guest targets plus the guide), used for the dynamic rendering array and
+  // the subpass reference array. The guide's own index comes from the key.
   static constexpr uint32_t kMotionGuideColorAttachmentCount = xenos::kMaxColorRenderTargets + 1;
 
   struct Framebuffer {
@@ -108,6 +127,29 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VkImage motion_image = VK_NULL_HANDLE;
     VkDeviceMemory motion_memory = VK_NULL_HANDLE;
     VkImageView motion_view = VK_NULL_HANDLE;
+    // Subpass colour attachment index of the guide in this framebuffer's render
+    // pass (GetMotionGuideSubpassIndex of the key the pass was built from). It is
+    // also the fragment output location and the index vkCmdClearAttachments
+    // takes, so it is captured with the pass instead of recomputed at the clear.
+    uint32_t motion_subpass_index = 0;
+    // Host sample count the image was created with - the same value the render
+    // pass was built with, recorded here because the resolve can only bind the
+    // image to a sampler2DMS when it really is multisampled, and the key it came
+    // from is not available at the resolve seam.
+    VkSampleCountFlagBits motion_samples = VK_SAMPLE_COUNT_1_BIT;
+    // Motion-writing draws issued into this framebuffer in the current frame,
+    // reset when the pass is first entered. The resolve only takes a framebuffer
+    // that actually received draws: the frame's first 1000x600 colour seam is the
+    // clear before the scene, and resolving that attachment yields an empty field.
+    mutable uint32_t motion_draws_this_frame = 0;
+    // The resolve's descriptor set for this image view, allocated from the cache's
+    // pool the first time this framebuffer is resolved and never rewritten: a
+    // descriptor set still bound by an earlier submission may be executing, so a
+    // per-view set is the only safe way to bind a view that changes with the
+    // framebuffer. Invalidated with the pool (Shutdown, ClearCache), which also
+    // destroys every framebuffer. mutable: it caches a GPU binding for a view that
+    // is already part of this framebuffer, not the framebuffer's identity.
+    mutable VkDescriptorSet motion_descriptor_set = VK_NULL_HANDLE;
     // Guest frame number the guide was last cleared on entry to its pass. A pass
     // may be ended and resumed within one frame (transfers, texture loads), and a
     // resume must not erase the motion written before the interruption, so the
@@ -162,14 +204,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
   // Colour attachments of the last successful update, for dynamic rendering.
-  // When the pass key has motion_attachment_used, a fifth entry for the motion
-  // guide is written at kMotionGuideColorAttachmentIndex (4) and the count becomes
-  // kMotionGuideColorAttachmentCount (5); indices below 4 may be a hole, which
-  // dynamic rendering treats as an unused attachment, because only the guide's
-  // location is fixed. The caller must therefore provide capacity for 5 entries,
-  // and color_attachment_capacity says how many it has - a caller that only has
-  // room for the four guest targets gets a count of at most 4 instead of an
-  // out-of-bounds write.
+  // The used guest colour targets are written compacted from index 0 - the same
+  // order the render pass's colour references and blend states use - and a pass
+  // with motion_attachment_used appends the motion guide at
+  // GetMotionGuideSubpassIndex, making the count colour_count + 1 (at most
+  // kMotionGuideColorAttachmentCount). The caller must provide capacity for
+  // kMotionGuideColorAttachmentCount entries, and color_attachment_capacity says
+  // how many it has; a caller with less room gets the guide omitted rather than
+  // an out-of-bounds write.
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
                                          uint32_t color_attachment_capacity,
                                          uint32_t* color_attachment_count_out,
@@ -258,6 +300,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // only clear allowed inside a pass. A framebuffer without a guide, and a second
   // entry into the same framebuffer in the same frame, do nothing.
   void MaybeClearMotionAttachment(const Framebuffer* framebuffer);
+  // Called by the command processor for every draw that will write the guide, so
+  // the resolve can tell a pass that received motion from a cleared pass.
+  void NotifyMotionDraw();
 
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
@@ -1009,6 +1054,41 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // pipeline key (a non-multisampled image has no sample operand to fetch from).
   VkPipeline GetDepthProbePipeline(uint32_t host_sample_count_log2);
 
+  // Phase 2 motion guide resolve - the guide's single-sample, 1000x600 form.
+  // The attachment is written by the scene draws at the host pass extent (wider
+  // than the scene, and multisampled), which is not what the neural renderer
+  // consumes; one compute dispatch at the pre-HUD resolve seam fetches sample 0 of
+  // exactly the scene rectangle (x, y) - a crop of the attachment's top-left
+  // corner, never a scale - and packs it as 1000*600 RGBA16F into a device-local
+  // buffer. Sample 0, not a resolve: there is no image resolve or copy command
+  // anywhere in this path, and the depth guide reads the same sample.
+  // Called only while the guide is active and the last updated framebuffer has a
+  // guide, at most once per guest frame, and only after that framebuffer's guide
+  // was entered this frame (a framebuffer that has not been drawn into yet still
+  // holds the previous frame's vectors). The image is transitioned
+  // COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY -> COLOR_ATTACHMENT_OPTIMAL
+  // around the dispatch, which is the layout every render pass with the guide
+  // expects at both ends, so it is the only state the image ever has between
+  // passes and no other subsystem's layout tracking is involved.
+  void MaybeResolveMotionGuide();
+  // Writes the pending dump as `<prefix>m<frame>.bin`, exactly 4800000 bytes of
+  // RGBA16F little-endian, row-major [y][x], top-left origin, with no header - the
+  // contract tools/motion_guide_analyze.py reads. The `m` is appended here, not
+  // expected from the prefix, so the analyzer's file-name pattern always holds.
+  // Called from CompletedSubmissionUpdated, so the mapped readback is only read
+  // after the GPU finished writing it.
+  void VerifyMotionGuideDump();
+  // Lazily created on the first resolve, freed by Shutdown and ClearCache, and
+  // recreated on the next resolve after that - which is also how a device loss is
+  // recovered from, since the cache is shut down and initialized again. A failure
+  // is remembered so a device that cannot support the resolve is not asked on
+  // every frame.
+  bool EnsureMotionGuideResources();
+  // Allocates and writes the per-framebuffer descriptor set on first use. Only
+  // the framebuffer's mutable cache field is modified.
+  bool EnsureMotionGuideDescriptorSet(const Framebuffer& framebuffer);
+  void DestroyMotionGuideResources();
+
   // Phase 2 motion guide state (see the public API). The format support is a
   // device fact from Initialize; the request is the command processor's; the
   // guide is only active when both hold and the host render target path is in
@@ -1240,6 +1320,48 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // refusal logs before the probe window opens.
   uint32_t colour_probe_resolve_logs_ = 0;
   bool colour_probe_alloc_failed_logged_ = false;
+
+  // Phase 2 motion guide resolve.
+  // Set 0 - the sampled guide (combined image sampler: the shader is written as
+  // sampler2DMS, and a bare sampled image cannot carry the multisample sample
+  // operand through GLSL) and the packed output storage buffer.
+  VkDescriptorSetLayout motion_guide_descriptor_set_layout_ = VK_NULL_HANDLE;
+  // One sampler for every framebuffer: texelFetch ignores filtering, addressing
+  // and LOD, so its state is never consulted - it exists only because a combined
+  // image sampler binding requires one.
+  VkSampler motion_guide_sampler_ = VK_NULL_HANDLE;
+  // One descriptor set per framebuffer (Framebuffer::motion_descriptor_set), grown
+  // on demand.
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
+      motion_guide_descriptor_set_pool_;
+  VkPipelineLayout motion_guide_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline motion_guide_pipeline_ = VK_NULL_HANDLE;
+  // Device-local 1000*600 RGBA16F output of the resolve, read by NR later and
+  // copied out for a dump; plus the host-visible copy the dump is written from,
+  // which exists only when motion_dump was set at initialization.
+  VkBuffer motion_guide_output_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory motion_guide_output_memory_ = VK_NULL_HANDLE;
+  VkBuffer motion_guide_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory motion_guide_readback_memory_ = VK_NULL_HANDLE;
+  void* motion_guide_readback_mapped_ = nullptr;
+  // A creation failure is not retried: retrying inside every resolve would churn
+  // the allocator and log once per frame for an error that cannot resolve itself.
+  bool motion_guide_resources_failed_ = false;
+  // One resolve per guest frame, and no dump while the previous one still needs
+  // its CPU write, so the single readback buffer is never overwritten before the
+  // GPU has finished with it.
+  uint32_t motion_guide_last_frame_ = UINT32_MAX;
+  bool motion_guide_pending_ = false;
+  uint32_t motion_guide_pending_frame_ = 0;
+  uint32_t motion_guide_dump_frames_done_ = 0;
+  // Bounded logging: a few lines show the resolve's extent, attachment extent and
+  // sample count per run, and every refusal reason is nameable at most once, so a
+  // resolve that never fires is explainable from the log instead of silent.
+  uint32_t motion_guide_resolve_logs_ = 0;
+  uint32_t motion_guide_skipped_logs_ = 0;
+  // Bounded one-shot log of the pass keys the guide sees, so an attachment that is
+  // never created can be explained (which target shape the scene actually uses).
+  uint32_t motion_guide_pass_logs_ = 0;
 
   // For pixel (fragment) shader interlock.
 

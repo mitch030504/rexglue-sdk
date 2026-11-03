@@ -1031,24 +1031,30 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
   // expand are excluded - the motion variant has no stage to forward its
   // interpolators through. The interpolator count is the same one the vertex
   // side uses, so a fragment motion variant always has its vertex counterpart.
-  const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
-  bool motion_guide_primitive_supported =
-      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kPointList &&
-      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList &&
-      vgt_draw_initiator.prim_type != xenos::PrimitiveType::kQuadList &&
-      !(xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
-        regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
-            xenos::VGTOutputPath::kTessellationEnable);
+  // Shader-static criteria only. Translations are cached per modification, so
+  // deciding this from the current draw's primitive type permanently locks a shader
+  // first seen in a point/quad draw to the non-motion variant; the pipeline
+  // description reconciles a pixel variant whose vertex counterpart lacks the bit.
   uint32_t motion_guide_interpolator_count = rex::bit_count(interpolator_mask);
   uint32_t motion_guide_input_location_count = 3 + (modification.pixel.param_gen_point ? 1 : 0);
   modification.pixel.motion_guide =
-      uint32_t(motion_guide_primitive_supported &&
-               render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      uint32_t(render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
                command_processor_.motion_guide_enabled() &&
                motion_guide_interpolator_count + motion_guide_input_location_count <=
                    xenos::kMaxInterpolators &&
                (motion_guide_interpolator_count + motion_guide_input_location_count) * 4 <=
                    command_processor_.GetVulkanDevice()->properties().maxFragmentInputComponents);
+  if (modification.pixel.motion_guide) {
+    // The command processor translates this variant before the render target
+    // cache has been updated for the draw, so the pass - and with it the guide's
+    // colour attachment index - is not known yet. Keep the historic location after
+    // the four guest targets as the default: it is a valid interface for the
+    // eagerly translated module (never two outputs at one location), and
+    // GetCurrentStateDescription replaces it with the pass's actual
+    // GetMotionGuideSubpassIndex for every pipeline that draws. Only a pass using
+    // all four guest colours keeps this default as its final location.
+    modification.pixel.motion_guide_output_location = xenos::kMaxColorRenderTargets;
+  }
 
   return modification;
 }
@@ -1139,6 +1145,26 @@ bool VulkanPipelineCache::ConfigurePipeline(
         uint32_t(primitive_processing_result.tessellation_mode),
         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
     return false;
+  }
+  if (pixel_shader != nullptr &&
+      description.pixel_shader_modification != pixel_shader->modification()) {
+    // The description carries the guide's output location taken from the pass, so
+    // its pixel modification differs from the one the command processor translated
+    // for this draw. Translations are keyed by the modification and the pipeline is
+    // created from the description's translation, so the pass-specific variant has
+    // to exist before TryGetPipelineCreationArgumentsForDescription looks it up -
+    // otherwise every motion pipeline would fail as a missing translation.
+    VulkanShader::VulkanTranslation* pixel_shader_for_description =
+        static_cast<VulkanShader::VulkanTranslation*>(
+            pixel_shader->shader().GetOrCreateTranslation(description.pixel_shader_modification));
+    if (!pixel_shader_for_description ||
+        !EnsureShadersTranslated(vertex_shader, pixel_shader_for_description)) {
+      REXGPU_ERROR(
+          "VulkanPipelineCache: failed to translate the motion guide pass variant "
+          "(render_pass_key=0x{:08X})",
+          render_pass_key.key);
+      return false;
+    }
   }
   if (last_pipeline_ && last_pipeline_->first == description) {
     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
@@ -1428,6 +1454,15 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     description_out.pixel_shader_modification = pixel_shader->modification();
     SpirvShaderTranslator::Modification pixel_shader_modification(
         description_out.pixel_shader_modification);
+    // The pixel motion variant reads interpolators the vertex stage must write. A
+    // draw whose vertex shader has no motion variant (point/rectangle/quad-list
+    // expansion, tessellation, memexport) must not use the pixel variant, or the
+    // pipeline interface would reference unwritten inputs.
+    if (!vertex_shader_modification.vertex.motion_guide &&
+        pixel_shader_modification.pixel.motion_guide) {
+      pixel_shader_modification.pixel.motion_guide = 0;
+      description_out.pixel_shader_modification = pixel_shader_modification.value;
+    }
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
     description_out.sample_rate_shading =
         !pixel_shader->shader().writes_depth() &&
@@ -1436,6 +1471,24 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
          pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
   }
   description_out.render_pass_key = render_pass_key;
+
+  // Phase 2 motion guide: the guide's fragment output location is a property of
+  // the render pass, not of the shader - it is the guide's subpass colour
+  // attachment reference index (GetMotionGuideSubpassIndex), which is also the
+  // index vkCmdClearAttachments takes - so it is taken from the key here, where
+  // the pass is known, rather than from the shader translation. It is part of the
+  // pixel shader modification, and therefore of this pipeline's key and of the
+  // translation lookup, so the SPIR-V variant carries the location of exactly the
+  // pass it will draw into. The vertex side has no pass-dependent output.
+  if (description_out.pixel_shader_hash) {
+    SpirvShaderTranslator::Modification pixel_shader_modification(
+        description_out.pixel_shader_modification);
+    if (pixel_shader_modification.pixel.motion_guide) {
+      pixel_shader_modification.pixel.motion_guide_output_location =
+          VulkanRenderTargetCache::GetMotionGuideSubpassIndex(render_pass_key);
+      description_out.pixel_shader_modification = pixel_shader_modification.value;
+    }
+  }
 
   bool tessellated = primitive_processing_result.IsTessellated();
   PipelineGeometryShader geometry_shader = PipelineGeometryShader::kNone;
@@ -3411,8 +3464,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       uint32_t color_rt_index;
       while (rex::bit_scan_forward(color_rts_remaining, &color_rt_index)) {
         color_rts_remaining &= ~(uint32_t(1) << color_rt_index);
+        // A blend attachment state is indexed by the subpass colour reference it
+        // belongs to. In a guide-bearing pass the guest colours are referenced
+        // compacted (the guide follows them), so the state must be placed at the
+        // compacted index, not at the guest render target index. Guide off keeps
+        // the original sparse placement untouched.
+        uint32_t color_blend_index =
+            description.render_pass_key.motion_attachment_used
+                ? rex::bit_count(color_rts_used & ((uint32_t(1) << color_rt_index) - 1))
+                : color_rt_index;
         VkPipelineColorBlendAttachmentState& color_blend_attachment =
-            color_blend_attachments[color_rt_index];
+            color_blend_attachments[color_blend_index];
         const PipelineRenderTarget& color_rt = description.render_targets[color_rt_index];
         if (color_rt.src_color_blend_factor != PipelineBlendFactor::kOne ||
             color_rt.dst_color_blend_factor != PipelineBlendFactor::kZero ||
@@ -3435,19 +3497,23 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         color_blend_attachment.colorWriteMask = VkColorComponentFlags(color_rt.color_write_mask);
       }
     }
-    // The motion guide is transient data rather than guest colour, so it is
-    // never blended and always writes all four components. The pass key, not the
-    // pixel shader modification, is what says the subpass has the fifth
-    // attachment: the same pass also runs draws whose shader is not the motion
-    // variant, and their blend state must still cover all five. Its attachment
-    // index matches the fragment output location.
+    // The motion guide is transient data rather than guest colour, so it is never
+    // blended and always writes all four components. The pass key, not the pixel
+    // shader modification, is what says the subpass has the guide: the same pass
+    // also runs draws whose shader is not the motion variant, and their blend state
+    // must still cover it. Its attachment index is the number of used guest colour
+    // targets (GetMotionGuideSubpassIndex), the same number as its subpass colour
+    // reference, fragment output location and clear index; colour_count + 1 states
+    // then cover the compacted guest colours and the guide.
     if (description.render_pass_key.motion_attachment_used) {
+      const uint32_t motion_attachment_index =
+          VulkanRenderTargetCache::GetMotionGuideSubpassIndex(description.render_pass_key);
       VkPipelineColorBlendAttachmentState& motion_blend_attachment =
-          color_blend_attachments[xenos::kMaxColorRenderTargets];
+          color_blend_attachments[motion_attachment_index];
       motion_blend_attachment.blendEnable = VK_FALSE;
       motion_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-      color_blend_state.attachmentCount = xenos::kMaxColorRenderTargets + 1;
+      color_blend_state.attachmentCount = motion_attachment_index + 1;
     } else {
       color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);
     }
@@ -3490,25 +3556,36 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     pipeline_rendering_create_info.pNext = nullptr;
     pipeline_rendering_create_info.viewMask = 0;
 
-    uint32_t color_attachment_count = 0;
     const auto& key = description.render_pass_key;
+    const bool motion_attachment_used = key.motion_attachment_used;
+    uint32_t color_attachment_count = 0;
     xenos::ColorRenderTargetFormat color_formats[] = {
         key.color_0_view_format, key.color_1_view_format, key.color_2_view_format,
         key.color_3_view_format};
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      if (key.depth_and_color_used & (1 << (1 + i))) {
-        color_attachment_formats[i] = render_target_cache_.GetColorVulkanFormat(color_formats[i]);
-        color_attachment_count = i + 1;
+      if (!(key.depth_and_color_used & (1 << (1 + i)))) {
+        continue;
       }
+      // In a guide-bearing pass the used guest colours are described compacted, at
+      // the same subpass colour index the pass and the blend states use, because
+      // the guide takes the slot after them.
+      uint32_t color_attachment_index =
+          motion_attachment_used
+              ? rex::bit_count((key.depth_and_color_used >> 1) & ((uint32_t(1) << i) - 1))
+              : i;
+      color_attachment_formats[color_attachment_index] =
+          render_target_cache_.GetColorVulkanFormat(color_formats[i]);
+      color_attachment_count = color_attachment_index + 1;
     }
     // The dynamic rendering path must describe the same attachment set as the
-    // VkRenderingInfo the pass builds: the guide is always attachment 4, so the
-    // count covers the unused guest slots below it exactly like the render pass
-    // path does.
-    if (key.motion_attachment_used) {
-      color_attachment_formats[xenos::kMaxColorRenderTargets] =
+    // VkRenderingInfo the pass builds: the guide is at GetMotionGuideSubpassIndex
+    // (colour_count), so the count is colour_count + 1, not a fixed five.
+    if (motion_attachment_used) {
+      const uint32_t motion_attachment_index =
+          VulkanRenderTargetCache::GetMotionGuideSubpassIndex(key);
+      color_attachment_formats[motion_attachment_index] =
           VulkanRenderTargetCache::kMotionGuideAttachmentFormat;
-      color_attachment_count = xenos::kMaxColorRenderTargets + 1;
+      color_attachment_count = motion_attachment_index + 1;
     }
     pipeline_rendering_create_info.colorAttachmentCount = color_attachment_count;
     pipeline_rendering_create_info.pColorAttachmentFormats =
