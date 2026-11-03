@@ -3668,6 +3668,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   };
 
+  // Phase 2 motion guide: take this draw's key once, at entry. Taking it after the
+  // primitive processing (as this did) leaked it to the next draw when this one
+  // produced no vertices, and a retry iteration would clear it to "invalid" for a
+  // draw that had one. The local is applied to the system constants on every
+  // iteration below.
+  const bool motion_keyed = motion_pending_valid_;
+  const uint64_t motion_key = motion_pending_key_;
+  motion_pending_key_ = 0;
+  motion_pending_valid_ = false;
+  if (motion_seen_) {
+    ++motion_frame_draws_;
+    if (!motion_keyed) ++motion_frame_missing_;
+  }
+
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
@@ -4029,26 +4043,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
 
-  // Phase 2 motion guide: take the key the kMotion marker left for this draw and
-  // put it in the system constants. A draw without a key must not inherit the
-  // previous draw's, so the fields are always written and `valid` distinguishes
-  // them; the UBO is only re-uploaded when the value actually changes.
+  // Phase 2 motion guide: apply the key taken at IssueDraw entry. A draw without a
+  // key must not inherit the previous draw's, so the fields are always written and
+  // `valid` distinguishes them. The guide is a development feature and the key is
+  // per draw, so the UBO is re-uploaded whenever the guide is active rather than
+  // tracking equality that a retry iteration could have already written.
   if (motion_seen_) {
-    const bool keyed = motion_pending_valid_;
-    const uint64_t key = motion_pending_key_;
-    motion_pending_key_ = 0;
-    motion_pending_valid_ = false;
-    ++motion_frame_draws_;
-    if (!keyed) ++motion_frame_missing_;
-    if (system_constants_.motion_key_low != uint32_t(key) ||
-        system_constants_.motion_key_high != uint32_t(key >> 32) ||
-        system_constants_.motion_key_valid != uint32_t(keyed ? 1 : 0)) {
-      system_constants_.motion_key_low = uint32_t(key);
-      system_constants_.motion_key_high = uint32_t(key >> 32);
-      system_constants_.motion_key_valid = keyed ? 1 : 0;
-      current_constant_buffers_up_to_date_ &=
-          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
-    }
+    system_constants_.motion_key_low = uint32_t(motion_key);
+    system_constants_.motion_key_high = uint32_t(motion_key >> 32);
+    system_constants_.motion_key_valid = motion_keyed ? 1 : 0;
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
   }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
