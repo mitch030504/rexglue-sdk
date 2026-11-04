@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+#include <rex/ui/dlss5_amd.h>
 #include <rex/ui/vulkan/device.h>
 #include "ui/dlss_runtime.h"
 #include "ui/xess_runtime.h"
@@ -294,6 +295,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 #endif
 
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  // DLSS 5 NR (AMD) needs Vulkan 1.3 plus three device extensions. The
+  // feature structs are only linked when the extensions are actually enabled;
+  // a missing one becomes an inactive reason, never a device-creation failure.
+  bool ext_KHR_cooperative_matrix = false;
+  bool ext_EXT_shader_float8 = false;
+  bool ext_KHR_workgroup_memory_explicit_layout = false;
+  const bool dlss5_amd_requested =
+      dlss5_amd::Selected() && properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+      vulkan_instance->api_version() >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+  if (dlss5_amd::Selected() &&
+      (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) ||
+       vulkan_instance->api_version() < VK_MAKE_API_VERSION(0, 1, 3, 0))) {
+    dlss5_amd::SetDeviceUnsupported("Vulkan 1.3 is required for DLSS 5 NR (AMD)");
+  }
+  if (dlss5_amd_requested) {
+    requested_extensions.emplace("VK_KHR_cooperative_matrix", &ext_KHR_cooperative_matrix);
+    requested_extensions.emplace("VK_EXT_shader_float8", &ext_EXT_shader_float8);
+    requested_extensions.emplace("VK_KHR_workgroup_memory_explicit_layout",
+                                 &ext_KHR_workgroup_memory_explicit_layout);
+  }
+#endif
+
   std::vector<const char*> enabled_extensions;
   {
     uint32_t supported_extension_count = 0;
@@ -381,15 +405,28 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
-#if defined(REX_HAS_XESS) && REX_HAS_XESS
-  // Not otherwise used; only linked for the features XeSS asks for.
+  // One Vulkan 1.1 feature struct for the whole device chain. XeSS and DLSS 5
+  // NR (AMD) both need it; two instances would violate the sType uniqueness
+  // rule for pNext chains.
   VulkanFeatures<VkPhysicalDeviceVulkan11Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
-      xess_features_1_1;
+      features_1_1;
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
   VulkanFeatures<VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT>
       xess_features_EXT_mutable_descriptor_type;
   bool xess_mutable_descriptor_type_linked = false;
+#endif
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  VulkanFeatures<VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>
+      features_KHR_cooperative_matrix;
+  VulkanFeatures<VkPhysicalDeviceShaderFloat8FeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT>
+      features_EXT_shader_float8;
+  VulkanFeatures<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>
+      features_KHR_workgroup_memory_explicit_layout;
 #endif
 
   if (get_physical_device_properties2_supported) {
@@ -434,13 +471,36 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
 #if defined(REX_HAS_XESS) && REX_HAS_XESS
     if (xess_requested) {
-      xess_features_1_1.Link(supported_features_2, device_create_info);
+      features_1_1.Link(supported_features_2, device_create_info);
       if (std::find_if(enabled_extensions.begin(), enabled_extensions.end(), [](const char* name) {
             return std::strcmp(name, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) == 0;
           }) != enabled_extensions.end()) {
         xess_features_EXT_mutable_descriptor_type.Link(supported_features_2, device_create_info);
         xess_mutable_descriptor_type_linked = true;
       }
+    }
+#endif
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+    if (dlss5_amd_requested) {
+      if (ext_KHR_cooperative_matrix) {
+        features_KHR_cooperative_matrix.Link(supported_features_2, device_create_info);
+      }
+      if (ext_EXT_shader_float8) {
+        features_EXT_shader_float8.Link(supported_features_2, device_create_info);
+      }
+      if (ext_KHR_workgroup_memory_explicit_layout) {
+        features_KHR_workgroup_memory_explicit_layout.Link(supported_features_2,
+                                                           device_create_info);
+      }
+      // One Vulkan 1.1 struct for the chain; the XeSS block above may have
+      // linked it already when both features are enabled.
+#if defined(REX_HAS_XESS) && REX_HAS_XESS
+      if (!xess_requested) {
+        features_1_1.Link(supported_features_2, device_create_info);
+      }
+#else
+      features_1_1.Link(supported_features_2, device_create_info);
+#endif
     }
 #endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
@@ -860,7 +920,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                   &supported_features_2.features, 0, sizeof(VkPhysicalDeviceFeatures));
             break;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
-            merge(&xess_features_1_1.enabled, in, &xess_features_1_1.supported, kBoolsOffset,
+            merge(&features_1_1.enabled, in, &features_1_1.supported, kBoolsOffset,
                   sizeof(VkPhysicalDeviceVulkan11Features));
             break;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
@@ -896,6 +956,124 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
     } else {
       REXLOG_WARN("XeSS: couldn't get its required Vulkan device features");
+    }
+  }
+#endif
+
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  // Check the requested feature set after the supported bits are known, before
+  // vkCreateDevice. Missing capabilities become a named inactive reason; the
+  // device is still created and the game renders normally.
+  if (dlss5_amd_requested) {
+    std::string dlss5_reason;
+    auto fail = [&dlss5_reason](const char* what) {
+      if (dlss5_reason.empty()) {
+        dlss5_reason = what;
+      }
+    };
+    if (!ext_KHR_cooperative_matrix) {
+      fail("missing device extension VK_KHR_cooperative_matrix");
+    }
+    if (!ext_EXT_shader_float8) {
+      fail("missing device extension VK_EXT_shader_float8");
+    }
+    if (!ext_KHR_workgroup_memory_explicit_layout) {
+      fail("missing device extension VK_KHR_workgroup_memory_explicit_layout");
+    }
+    if (!features_KHR_cooperative_matrix.supported.cooperativeMatrix) {
+      fail("cooperativeMatrix is not supported");
+    }
+    if (!features_EXT_shader_float8.supported.shaderFloat8 ||
+        !features_EXT_shader_float8.supported.shaderFloat8CooperativeMatrix) {
+      fail("shaderFloat8/shaderFloat8CooperativeMatrix are not supported");
+    }
+    if (!features_KHR_workgroup_memory_explicit_layout.supported
+             .workgroupMemoryExplicitLayout ||
+        !features_KHR_workgroup_memory_explicit_layout.supported
+             .workgroupMemoryExplicitLayout8BitAccess ||
+        !features_KHR_workgroup_memory_explicit_layout.supported
+             .workgroupMemoryExplicitLayout16BitAccess) {
+      fail("workgroup memory explicit layout 8/16-bit access is not supported");
+    }
+    if (!features_1_1.supported.storageBuffer16BitAccess) {
+      fail("storageBuffer16BitAccess is not supported");
+    }
+    if (!features_1_2.supported.storageBuffer8BitAccess ||
+        !features_1_2.supported.shaderFloat16 || !features_1_2.supported.shaderInt8 ||
+        !features_1_2.supported.vulkanMemoryModel) {
+      fail("8-bit storage, float16/int8 or the Vulkan memory model is not supported");
+    }
+    if (!features_1_3.supported.subgroupSizeControl ||
+        !features_1_3.supported.synchronization2) {
+      fail("subgroupSizeControl or synchronization2 is not supported");
+    }
+
+    VkPhysicalDeviceSubgroupSizeControlProperties dlss5_subgroup{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceProperties2 dlss5_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    dlss5_properties.pNext = &dlss5_subgroup;
+    ifn.vkGetPhysicalDeviceProperties2(physical_device, &dlss5_properties);
+    if (dlss5_subgroup.minSubgroupSize > 32 || dlss5_subgroup.maxSubgroupSize < 32 ||
+        !(dlss5_subgroup.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+      fail("32-lane compute subgroups are unavailable");
+    }
+
+    bool matrix_ok = false;
+    const auto get_matrix_properties =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+            ifn.vkGetInstanceProcAddr(vulkan_instance->instance(),
+                                      "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+    if (get_matrix_properties) {
+      uint32_t count = 0;
+      if (get_matrix_properties(physical_device, &count, nullptr) == VK_SUCCESS && count) {
+        std::vector<VkCooperativeMatrixPropertiesKHR> properties_list(
+            count, VkCooperativeMatrixPropertiesKHR{
+                       VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        if (get_matrix_properties(physical_device, &count, properties_list.data()) ==
+            VK_SUCCESS) {
+          for (const VkCooperativeMatrixPropertiesKHR& matrix : properties_list) {
+            if (matrix.MSize == 16 && matrix.NSize == 16 && matrix.KSize == 16 &&
+                matrix.scope == VK_SCOPE_SUBGROUP_KHR &&
+                matrix.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                matrix.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                matrix.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                matrix.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                !matrix.saturatingAccumulation) {
+              matrix_ok = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!matrix_ok) {
+      fail("e4m3 16x16x16 fp32 subgroup cooperative matrix is not reported");
+    }
+
+    if (!dlss5_reason.empty()) {
+      dlss5_amd::SetDeviceUnsupported(dlss5_reason);
+      REXLOG_WARN("DLSS 5 NR (AMD) inactive: {}", dlss5_reason);
+    } else {
+      features_KHR_cooperative_matrix.enabled.cooperativeMatrix = VK_TRUE;
+      features_EXT_shader_float8.enabled.shaderFloat8 = VK_TRUE;
+      features_EXT_shader_float8.enabled.shaderFloat8CooperativeMatrix = VK_TRUE;
+      features_KHR_workgroup_memory_explicit_layout.enabled.workgroupMemoryExplicitLayout =
+          VK_TRUE;
+      features_KHR_workgroup_memory_explicit_layout.enabled
+          .workgroupMemoryExplicitLayout8BitAccess = VK_TRUE;
+      features_KHR_workgroup_memory_explicit_layout.enabled
+          .workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
+      features_KHR_workgroup_memory_explicit_layout.enabled
+          .workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
+      features_1_1.enabled.storageBuffer16BitAccess = VK_TRUE;
+      features_1_2.enabled.storageBuffer8BitAccess = VK_TRUE;
+      features_1_2.enabled.shaderFloat16 = VK_TRUE;
+      features_1_2.enabled.shaderInt8 = VK_TRUE;
+      features_1_2.enabled.vulkanMemoryModel = VK_TRUE;
+      features_1_3.enabled.subgroupSizeControl = VK_TRUE;
+      features_1_3.enabled.synchronization2 = VK_TRUE;
+      REXLOG_INFO("DLSS 5 NR (AMD): device features enabled");
     }
   }
 #endif

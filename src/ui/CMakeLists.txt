@@ -17,6 +17,7 @@ set(REXUI_CORE_SOURCES
     ffx_runtime.cpp
     xess_runtime.cpp
     dlss_runtime.cpp
+    dlss5_amd_runtime.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -169,6 +170,13 @@ if(REXGLUE_USE_VULKAN)
         GPUOpen::VulkanMemoryAllocator
         spirv-tools-headers
     )
+endif()
+
+if(TARGET rex::dlss5_amd)
+    set_source_files_properties(dlss5_amd_runtime.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${REXGLUE_DLSS5_AMD_INCLUDE_DIR}")
+    target_link_libraries(rexui PRIVATE rex::dlss5_amd)
+    target_compile_definitions(rexui PRIVATE REX_HAS_DLSS5_AMD=1)
 endif()
 
 # Platform-specific dependencies

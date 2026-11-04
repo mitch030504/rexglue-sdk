@@ -39,6 +39,7 @@
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/ui/motion_contract.h>
+#include <rex/ui/dlss5_amd_vulkan.h>
 #include <rex/ui/temporal_jitter.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -1984,11 +1985,19 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // DLSS 5 NR (AMD): validate the assets and, when the device enabled the
+  // required feature set, construct the runtime (weight upload and pipelines).
+  // No frame is recorded here; a failure is reported in the status and the
+  // normal rendering path is untouched.
+  rex::ui::dlss5_amd::InitializeAssets();
+  rex::ui::dlss5_amd::InitializeRuntime(*vulkan_device, 1920, 1080);
+
   return true;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  rex::ui::dlss5_amd::Shutdown();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 

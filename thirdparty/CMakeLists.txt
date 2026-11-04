@@ -236,6 +236,11 @@ include(${PROJECT_SOURCE_DIR}/cmake/rexglue_xess.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss.cmake)
 
 #=============================================================================
+# DLSS 5 neural rendering on AMD (native Vulkan, fetched on demand)
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss5_amd.cmake)
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
