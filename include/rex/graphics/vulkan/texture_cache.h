@@ -89,6 +89,13 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
+  // Host VkFormat of the view bound for this fetch constant (from the guest
+  // texture's host format pair), or VK_FORMAT_UNDEFINED when there is no valid
+  // binding. The guest path never stores the view format on the texture, but
+  // diagnostics like the composition seam gate need it to reason about the
+  // fetch's color domain (UNORM vs SRGB etc.).
+  VkFormat GetActiveBindingViewFormat(uint32_t fetch_constant_index, bool is_signed) const;
+
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,

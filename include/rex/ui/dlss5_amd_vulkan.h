@@ -30,6 +30,8 @@ void ReportRecordedFrame(bool applied, float gpu_ms);
 // Development seam gate: when a substitute image is loaded and
 // dlss5_amd_mode != 0, the composition draw that samples the scene source
 // (base page 0x11C6F) uses this 1920x1080 view instead of the guest texture.
+// The substitute image is created UNORM; SubstituteView() returns the UNORM or
+// the SRGB reinterpret of it, selected by the dlss5_amd_view cvar.
 bool SubstituteEnabled();
 bool SubstituteForFrame(uint64_t frame);
 VkImageView SubstituteView();

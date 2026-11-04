@@ -52,6 +52,13 @@ REXCVAR_DEFINE_INT32(dlss5_amd_frame, -1, "GPU",
                      "Development: only substitute on this guest frame; -1 = every frame.")
     .range(-1, 1000000000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(dlss5_amd_view, 1, "GPU",
+                     "Development: view format used for the substitute image - 0 = "
+                     "R8G8B8A8_UNORM (domain-identical to the guest composition fetch, which "
+                     "is UNORM end-to-end), 1 = R8G8B8A8_SRGB (legacy). The image itself is "
+                     "always created UNORM so both views are legal reinterprets.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
 namespace {
@@ -68,7 +75,10 @@ std::unique_ptr<nr::Runtime> g_runtime;
 #endif
 VkImage g_substitute_image = VK_NULL_HANDLE;
 VkDeviceMemory g_substitute_memory = VK_NULL_HANDLE;
-VkImageView g_substitute_view = VK_NULL_HANDLE;
+// Both reinterprets of the one UNORM image, created together at upload; the
+// active one is picked per dlss5_amd_view in SubstituteView().
+VkImageView g_substitute_view_unorm = VK_NULL_HANDLE;
+VkImageView g_substitute_view_srgb = VK_NULL_HANDLE;
 VkDevice g_substitute_device = VK_NULL_HANDLE;
 PFN_vkDestroyImageView g_substitute_destroy_view = nullptr;
 PFN_vkDestroyImage g_substitute_destroy_image = nullptr;
@@ -302,7 +312,7 @@ const Status& GetStatus() {
 }
 
 bool SubstituteEnabled() {
-  return g_substitute_view != VK_NULL_HANDLE && REXCVAR_GET(dlss5_amd_mode) != 0;
+  return g_substitute_view_unorm != VK_NULL_HANDLE && REXCVAR_GET(dlss5_amd_mode) != 0;
 }
 
 bool SubstituteForFrame(uint64_t frame) {
@@ -311,7 +321,9 @@ bool SubstituteForFrame(uint64_t frame) {
 }
 
 VkImageView SubstituteView() {
-  return g_substitute_view;
+  // dlss5_amd_view is kInitOnly and both views are created at upload, so this
+  // is a pure selection between the UNORM and SRGB reinterpret of the image.
+  return REXCVAR_GET(dlss5_amd_view) == 0 ? g_substitute_view_unorm : g_substitute_view_srgb;
 }
 
 void SetDeviceUnsupported(const std::string& reason) {
@@ -391,7 +403,10 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
 
   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   image_info.imageType = VK_IMAGE_TYPE_2D;
-  image_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+  // UNORM image so that both the UNORM and the SRGB view below are legal
+  // reinterprets of the same texels; the guest chain is UNORM end-to-end, so
+  // the raw bytes are stored verbatim and only the view picks the domain.
+  image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
   image_info.extent = {kWidth, kHeight, 1};
   image_info.mipLevels = 1;
   image_info.arrayLayers = 1;
@@ -495,12 +510,20 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
     return false;
   }
 
+  // Two views of the one UNORM image: UNORM is domain-identical to the guest
+  // composition fetch (no gamma PWL anywhere on the guest path), SRGB inserts
+  // a decode the guest never applies. dlss5_amd_view picks the active one.
   VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view_info.image = g_substitute_image;
   view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view_info.format = VK_FORMAT_R8G8B8A8_SRGB;
   view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  if (dfn.vkCreateImageView(device.device(), &view_info, nullptr, &g_substitute_view) !=
+  view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  if (dfn.vkCreateImageView(device.device(), &view_info, nullptr, &g_substitute_view_unorm) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  view_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+  if (dfn.vkCreateImageView(device.device(), &view_info, nullptr, &g_substitute_view_srgb) !=
       VK_SUCCESS) {
     return false;
   }
@@ -508,7 +531,10 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
   g_substitute_destroy_view = dfn.vkDestroyImageView;
   g_substitute_destroy_image = dfn.vkDestroyImage;
   g_substitute_free_memory = dfn.vkFreeMemory;
-  REXLOG_INFO("DLSS 5 NR (AMD): substitute image loaded from {} (1920x1080 RGBA8)", path);
+  const bool view_unorm = REXCVAR_GET(dlss5_amd_view) == 0;
+  REXLOG_INFO("DLSS 5 NR (AMD): substitute image loaded from {} (1920x1080 RGBA8 UNORM image, "
+              "active view {})",
+              path, view_unorm ? "R8G8B8A8_UNORM" : "R8G8B8A8_SRGB");
   return true;
 }
 }  // namespace
@@ -645,9 +671,13 @@ void Shutdown() {
   g_runtime.reset();
 #endif
   if (g_substitute_device != VK_NULL_HANDLE) {
-    if (g_substitute_view != VK_NULL_HANDLE) {
-      g_substitute_destroy_view(g_substitute_device, g_substitute_view, nullptr);
-      g_substitute_view = VK_NULL_HANDLE;
+    if (g_substitute_view_unorm != VK_NULL_HANDLE) {
+      g_substitute_destroy_view(g_substitute_device, g_substitute_view_unorm, nullptr);
+      g_substitute_view_unorm = VK_NULL_HANDLE;
+    }
+    if (g_substitute_view_srgb != VK_NULL_HANDLE) {
+      g_substitute_destroy_view(g_substitute_device, g_substitute_view_srgb, nullptr);
+      g_substitute_view_srgb = VK_NULL_HANDLE;
     }
     if (g_substitute_image != VK_NULL_HANDLE) {
       g_substitute_destroy_image(g_substitute_device, g_substitute_image, nullptr);

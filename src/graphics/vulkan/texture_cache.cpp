@@ -671,6 +671,19 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
   }
 }
 
+VkFormat VulkanTextureCache::GetActiveBindingViewFormat(uint32_t fetch_constant_index,
+                                                        bool is_signed) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return VK_FORMAT_UNDEFINED;
+  }
+  // The view bound by GetActiveBindingOrNullImageView is created with this
+  // format (see VulkanTexture::GetView), so report the pair entry directly
+  // instead of storing the format on every texture.
+  const HostFormatPair& host_format_pair = GetHostFormatPair(binding->key);
+  return (is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned).format;
+}
+
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
