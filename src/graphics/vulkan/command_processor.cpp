@@ -7145,6 +7145,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       if (image_view != VK_NULL_HANDLE && nr_substitute &&
           register_file_->GetTextureFetch(texture_binding.fetch_constant).base_address ==
               0x11C6Fu) {
+        const xenos::xe_gpu_texture_fetch_t fetch =
+            register_file_->GetTextureFetch(texture_binding.fetch_constant);
+        static bool nr_substitute_logged = false;
+        if (!nr_substitute_logged) {
+          nr_substitute_logged = true;
+          REXGPU_INFO(
+              "nr_substitute fetch={} fmt={} sign={}/{}/{}/{} swizzle={:03X} dim={} tiled={} "
+              "signed={}",
+              texture_binding.fetch_constant, uint32_t(fetch.format), uint32_t(fetch.sign_x),
+              uint32_t(fetch.sign_y), uint32_t(fetch.sign_z), uint32_t(fetch.sign_w),
+              fetch.swizzle, uint32_t(fetch.dimension), fetch.tiled ? 1 : 0,
+              texture_binding.is_signed ? 1 : 0);
+        }
         image_view = rex::ui::dlss5_amd::SubstituteView();
       }
       descriptor_image_info.imageView = image_view;
