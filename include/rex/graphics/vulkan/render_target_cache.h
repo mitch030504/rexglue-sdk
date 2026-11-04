@@ -1090,9 +1090,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // on the CPU and dumped as a 1000x600 row-major RGBA8 rectangle. Read-only with
   // respect to guest memory: nothing is written back and no ownership is claimed.
   void MaybeRunColourProbe(VulkanSharedMemory& shared_memory,
-                           const draw_util::ResolveInfo& resolve_info,
-                           bool draw_resolution_scaled);
+                           const draw_util::ResolveInfo& resolve_info, bool draw_resolution_scaled);
   void VerifyColourProbe();
+  // Development-only seam availability log (cvar motion_seam_probe, off by
+  // default). At every 1000x600 pre-HUD colour resolve, reports the resolve's
+  // address/index and each framebuffer in the frame's composite list with its
+  // draw/clear stamps, extent and readiness. No GPU work, no guest-memory read.
+  void MaybeLogMotionSeam(const draw_util::ResolveInfo& resolve_info);
   void DestroyColourProbeResources();
   // Shared by the guest depth source and the colour probe. Lazily created from the
   // first resolved range and refused rather than resized if a later range is
@@ -1364,6 +1368,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t colour_probe_resolve_logs_ = 0;
   bool colour_probe_alloc_failed_logged_ = false;
 
+  // Development-only motion-guide seam log. Counts the 1000x600 resolves within
+  // a frame so the output can name the one that is the finished scene, and
+  // bounds the run by frames and total lines.
+  uint32_t motion_seam_resolve_frame_ = UINT32_MAX;
+  uint32_t motion_seam_resolve_index_ = 0;
+  uint32_t motion_seam_frames_done_ = 0;
+  uint32_t motion_seam_log_lines_ = 0;
+
   // Phase 2 motion guide resolve.
   // Set 0 - the sampled guide (combined image sampler: the shader is written as
   // sampler2DMS, and a bare sampled image cannot carry the multisample sample
@@ -1375,8 +1387,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkSampler motion_guide_sampler_ = VK_NULL_HANDLE;
   // One descriptor set per framebuffer (Framebuffer::motion_descriptor_set), grown
   // on demand.
-  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool>
-      motion_guide_descriptor_set_pool_;
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> motion_guide_descriptor_set_pool_;
   VkPipelineLayout motion_guide_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline motion_guide_pipeline_ = VK_NULL_HANDLE;
   // Device-local 1000*600 RGBA16F output of the resolve, read by NR later and

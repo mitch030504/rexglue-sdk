@@ -219,6 +219,24 @@ REXCVAR_DEFINE_STRING(colour_probe_dump, "", "GPU/Vulkan",
                       "RGBA8 scene rectangle to <prefix><frame>.bin.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(motion_seam_probe, false, "GPU/Vulkan",
+                    "Development: log the motion guide's state at every 1000x600 pre-HUD colour "
+                    "resolve. Reports the resolve address/index and, for each framebuffer in the "
+                    "frame's motion list, its extent, sample count, draw/clear frame stamps and "
+                    "ready flag. Proves whether the guide is complete before HUD without doing "
+                    "any GPU work. Does not enable neural rendering.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(motion_seam_probe_frame, -1, "GPU/Vulkan",
+                     "Development: first guest frame for the motion seam log; -1 logs any frame. "
+                     "Stop is bounded by motion_seam_probe_frames.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(motion_seam_probe_frames, 8, "GPU/Vulkan",
+                     "Development: number of guest frames the motion seam log runs for before it "
+                     "stops on its own, so the log cannot flood.")
+    .range(1, 120)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_STRING(motion_dump, "", "GPU/Vulkan",
                       "Development: if non-empty, the motion guide resolve copies its 1000x600 "
                       "RGBA16F scene rectangle to <prefix>m<frame>.bin - 4800000 bytes, row-major "
@@ -2576,6 +2594,75 @@ void VulkanRenderTargetCache::VerifyColourProbe() {
   }
 }
 
+void VulkanRenderTargetCache::MaybeLogMotionSeam(const draw_util::ResolveInfo& resolve_info) {
+  if (!motion_guide_enabled() || !motion_guide_frame_pending()) {
+    return;
+  }
+  if (resolve_info.IsCopyingDepth()) {
+    return;
+  }
+  if (resolve_info.coordinate_info.width_div_8 != (kMotionGuideWidth / 8u) ||
+      resolve_info.height_div_8 != (kMotionGuideHeight / 8u)) {
+    return;
+  }
+  const uint32_t frame = uint32_t(command_processor_.GetCurrentFrame());
+  const int32_t first_frame = REXCVAR_GET(motion_seam_probe_frame);
+  if (first_frame >= 0 && frame < uint32_t(first_frame)) {
+    return;
+  }
+  // Count the 1000x600 resolves within a frame so a consumer can name the one
+  // that carries the finished scene. The first resolve of a frame is index 0;
+  // the frame budget is consumed there, so a window of 8 means 8 guest frames.
+  if (motion_seam_resolve_frame_ != frame) {
+    motion_seam_resolve_frame_ = frame;
+    motion_seam_resolve_index_ = 0;
+  }
+  const uint32_t index = motion_seam_resolve_index_++;
+  if (index == 0) {
+    if (motion_seam_frames_done_ >= uint32_t(REXCVAR_GET(motion_seam_probe_frames))) {
+      return;
+    }
+    ++motion_seam_frames_done_;
+  }
+  const uint64_t guide_frame = command_processor_.motion_guide_frame();
+  if (motion_frame_framebuffers_.empty()) {
+    if (motion_seam_log_lines_ < 128) {
+      ++motion_seam_log_lines_;
+      REXGPU_INFO(
+          "motion_seam frame={} index={} addr={:08X} bytes={} guide_frame={} "
+          "framebuffers=0",
+          frame, index, resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+          guide_frame);
+    }
+    return;
+  }
+  for (const Framebuffer* framebuffer : motion_frame_framebuffers_) {
+    if (motion_seam_log_lines_ >= 128) {
+      return;
+    }
+    ++motion_seam_log_lines_;
+    // Same readiness predicate ResolveMotionGuideFrame applies, minus the
+    // allocation of a descriptor set: the field is available at this instant if
+    // this framebuffer was drawn and cleared for the current guide frame, is
+    // multisampled, and contains the whole scene rectangle.
+    const bool ready = framebuffer->motion_draw_frame == guide_frame &&
+                       framebuffer->motion_cleared_frame == guide_frame &&
+                       framebuffer->motion_image != VK_NULL_HANDLE &&
+                       framebuffer->motion_view != VK_NULL_HANDLE &&
+                       framebuffer->motion_samples != VK_SAMPLE_COUNT_1_BIT &&
+                       framebuffer->host_extent.width >= kMotionGuideWidth &&
+                       framebuffer->host_extent.height >= kMotionGuideHeight;
+    REXGPU_INFO(
+        "motion_seam frame={} index={} addr={:08X} bytes={} guide_frame={} fb={} draw_frame={} "
+        "cleared_frame={} samples={} extent={}x{} draws={} history_draws={} ready={}",
+        frame, index, resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+        guide_frame, static_cast<const void*>(framebuffer), framebuffer->motion_draw_frame,
+        framebuffer->motion_cleared_frame, uint32_t(framebuffer->motion_samples),
+        framebuffer->host_extent.width, framebuffer->host_extent.height,
+        framebuffer->motion_draw_count, framebuffer->motion_history_draw_count, ready ? 1 : 0);
+  }
+}
+
 void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // Guide off is the default, and everything below either allocates or records
   // commands, so this is deliberately the first check: a guide-off run executes
@@ -3830,6 +3917,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
             // 1000x600 colour resolve just wrote is the pre-HUD scene in guest
             // memory, before the composition and HUD passes touch it.
             MaybeRunColourProbe(shared_memory, resolve_info, draw_resolution_scaled);
+          }
+          if (REXCVAR_GET(motion_seam_probe)) {
+            // Availability only: report whether the guide is complete at this
+            // pre-HUD instant. The swap-time composite remains the only resolve,
+            // because this seam can run before the scene draws (the clear) and
+            // more than once per frame.
+            MaybeLogMotionSeam(resolve_info);
           }
           // The motion guide is deliberately not resolved here. This seam can run
           // before the scene draws (the clear), and one frame's scene is split
