@@ -241,6 +241,11 @@ include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss5_amd.cmake)
 
 #=============================================================================
+# OpenDLSS-NR standalone dlss5vk tool (native Vulkan, fetched on demand)
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_opendls_nr.cmake)
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")

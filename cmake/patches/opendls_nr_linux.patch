@@ -1,0 +1,287 @@
+diff --git a/src/kernels.cpp b/src/kernels.cpp
+index 62bb8c3..2991616 100644
+--- a/src/kernels.cpp
++++ b/src/kernels.cpp
+@@ -8,6 +8,8 @@
+ 
+ namespace nr {
+ 
++Kernels::Chain::Chain() = default;
++
+ namespace {
+ constexpr uint32_t F_RESIDUAL = 1, F_SCALE_RESIDUAL = 2, F_SILU = 8, F_QUANTIZE = 16,
+                    F_DUAL = 32, F_RESIDUAL_E4 = 64, F_BROADCAST_INPUT = 128, F_OUT_F32 = 256;
+@@ -205,11 +207,13 @@ void Kernels::dispatchLinear(VkCommandBuffer commands, VkPipeline pipeline,
+ }
+ 
+ bool Kernels::ptxGemmEnabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_GEMM") ? atoi(getenv("DLSS5VK_PTX_GEMM")) != 0 : true;
+   return enabled;
+ }
+ 
+ bool Kernels::ptxQkvEnabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_QKV") ? atoi(getenv("DLSS5VK_PTX_QKV")) != 0 : true;
+   return enabled;
+ }
+@@ -289,7 +293,8 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+   }
+   // Tall-tile PTX GEMM (gemmt_e4m3.py, 192-row tiles, partitions in the workgroup or one partition per split-K
+   // workgroup + a PTX reduce): the few-row stages (ViT / transitions), when the variant was generated.
+-  static const bool ptxGemmT = getenv("DLSS5VK_PTX_GEMMT") ? atoi(getenv("DLSS5VK_PTX_GEMMT")) != 0 : true;
++  static const bool ptxGemmT = OPEN_DLSSNR_PTX_ROUTE &&
++      (getenv("DLSS5VK_PTX_GEMMT") ? atoi(getenv("DLSS5VK_PTX_GEMMT")) != 0 : true);
+   if (ptxGemmT && ptxGemm && a.batches == 1 && !a.broadcastInput && a.N % 64 == 0 &&
+       (!a.residual || (a.scaleResidual && a.residual->format == Format::E4)) && a.partition != 0 &&   // (rows <= 384 without a partition: gemm2 is faster)
+       (a.rows + 191) / 192 <= 65535) {
+@@ -599,6 +604,7 @@ void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& proje
+ }
+ 
+ bool Kernels::ptxGemmVEnabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_GEMMV") ? atoi(getenv("DLSS5VK_PTX_GEMMV")) != 0 : true;
+   return enabled && ptxGemmEnabled();   // DLSS5VK_PTX_GEMM=0 turns off every PTX GEMM route
+ }
+@@ -617,6 +623,7 @@ uint32_t Kernels::vitGemmSignals(uint32_t rows, uint32_t N) {
+ }
+ 
+ bool Kernels::ptxBlock32Enabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_BLOCK32") ? atoi(getenv("DLSS5VK_PTX_BLOCK32")) != 0 : true;
+   return enabled;
+ }
+@@ -706,6 +713,8 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a)
+ }
+ 
+ Kernels::PtxKernel& Kernels::ptxKernel(const std::string& file, const std::string& entry) {
++  if (!OPEN_DLSSNR_PTX_ROUTE)
++    throw std::runtime_error("PTX kernel requested in an OPEN_DLSSNR_GLSL_ONLY build: " + ptxDirectory_ + "/" + file);
+   auto it = ptxKernels_.find(file);
+   if (it != ptxKernels_.end()) return it->second;
+   std::ifstream in(ptxDirectory_ + "/" + file);
+@@ -785,6 +794,7 @@ void Kernels::gemmMlp(VkCommandBuffer commands, const MlpArgs& a) {
+ }
+ 
+ bool Kernels::ptxFfnEnabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_FFN") ? atoi(getenv("DLSS5VK_PTX_FFN")) != 0 : true;
+   return enabled;
+ }
+@@ -909,6 +919,7 @@ void Kernels::windowAttend(VkCommandBuffer commands, const Activation& normalize
+ }
+ 
+ bool Kernels::ptxGlobalAttentionEnabled() {
++  if (!OPEN_DLSSNR_PTX_ROUTE) return false;   // OPEN_DLSSNR_GLSL_ONLY: no PTX route
+   static const bool enabled = getenv("DLSS5VK_PTX_ATTN") ? atoi(getenv("DLSS5VK_PTX_ATTN")) != 0 : true;
+   return enabled;
+ }
+diff --git a/src/kernels.h b/src/kernels.h
+index 472bd36..b63e52d 100644
+--- a/src/kernels.h
++++ b/src/kernels.h
+@@ -8,6 +8,14 @@
+ #include "nr_model.h"
+ #include "vk_context.h"
+ 
++// OPEN_DLSSNR_GLSL_ONLY (Linux port): compile out the PTX (VK_NV_cuda_kernel_launch) route —
++// every ptx*Enabled() reports false and ptxKernel() fails loud instead of probing for .ptx files.
++#ifdef OPEN_DLSSNR_GLSL_ONLY
++#define OPEN_DLSSNR_PTX_ROUTE 0
++#else
++#define OPEN_DLSSNR_PTX_ROUTE 1
++#endif
++
+ namespace nr {
+ 
+ enum class Format { E4, F16, F32 };
+@@ -182,6 +190,7 @@ class Kernels {
+   ChainTimeouts chainTimeouts() const;
+   void resetChainTimeouts();
+   struct Chain {
++    Chain();   // defined out-of-line: NSDMIs are not usable in default args inside the class (clang)
+     VkDeviceAddress waitRows = 0; uint32_t waitExpected = 0, waitShiftY = 0;   // window-row counters (attention output)
+     VkDeviceAddress waitBands = 0; uint32_t waitMul = 1, waitGroupRows = 64;   // row-band counters (FFN / projection output), signals per row group, the producer's rows per workgroup
+     VkDeviceAddress signal = 0;                                                // counters to increment
+diff --git a/src/nr_graph.cpp b/src/nr_graph.cpp
+index 5c8a2e1..f1fca28 100644
+--- a/src/nr_graph.cpp
++++ b/src/nr_graph.cpp
+@@ -347,7 +347,7 @@ void Graph::encodeFusedBlock(VkCommandBuffer commands, Temporaries& temps, const
+       kernels_.expertFfnPtx(commands, ffn, fc);
+       if (ffn.stateOut) capture(commands, "block-" + std::to_string(pendingProjection_.block), *ffn.stateOut);
+     } else if (options_.fusedBlocks && !options_.captureIntermediates) {
+-      static const bool ptxMlp = !getenv("DLSS5VK_NO_PTX_MLP");
++      static const bool ptxMlp = OPEN_DLSSNR_PTX_ROUTE && !getenv("DLSS5VK_NO_PTX_MLP");
+       Kernels::MlpArgs mlp;
+       mlp.input = &state; mlp.broadcastInput = true;
+       mlp.output = temps.ffnNarrow; mlp.rows = rows; mlp.K = channels; mlp.hidden = 128; mlp.nout = 32;
+diff --git a/src/nr_model.h b/src/nr_model.h
+index 867c97e..ee2f68e 100644
+--- a/src/nr_model.h
++++ b/src/nr_model.h
+@@ -1,6 +1,7 @@
+ // Model loading: manifest, packed E4M3 stage files and the host-side re-layout of the MMA-fragment-ordered
+ // weights into plain matrices that cooperative-matrix loads consume directly.
+ #pragma once
++#include <cstring>
+ #include <map>
+ #include <memory>
+ #include <string>
+diff --git a/src/vk_context.cpp b/src/vk_context.cpp
+index 5b02732..845a232 100644
+--- a/src/vk_context.cpp
++++ b/src/vk_context.cpp
+@@ -29,7 +29,11 @@ VkBool32 VKAPI_PTR onDebugMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severit
+ uint32_t Context::validationErrors() { return g_validationErrors.load(); }
+ 
+ Context::Context() {
++#ifdef _WIN32
+   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
++#else
++  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("libvulkan.so.1 unavailable");
++#endif
+ 
+   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+   app.pApplicationName = "dlss5-vulkan";
+@@ -71,6 +75,7 @@ Context::Context() {
+   if (!count) throw std::runtime_error("no Vulkan physical devices");
+   std::vector<VkPhysicalDevice> devices(count);
+   VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, devices.data()));
++  std::set<std::string> availableNames;   // of the device chosen below (re-enumerated after selection)
+   // Prefer a discrete device exposing FP8 cooperative matrices.
+   for (VkPhysicalDevice candidate : devices) {
+     uint32_t extensionCount = 0;
+@@ -79,14 +84,24 @@ Context::Context() {
+     vkEnumerateDeviceExtensionProperties(candidate, nullptr, &extensionCount, extensions.data());
+     bool coop = false, fp8 = false;
+     for (const auto& extension : extensions) {
++      availableNames.insert(extension.extensionName);
+       if (!strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) coop = true;
+       if (!strcmp(extension.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) fp8 = true;
+       if (getenv("DLSS5VK_LIST_EXTENSIONS") && (strstr(extension.extensionName, "cooperative") || strstr(extension.extensionName, "NV_")))
+         printf("  device extension: %s (v%u)\n", extension.extensionName, extension.specVersion);
+     }
+-    if (coop && fp8) { physical_ = candidate; break; }
++    if (coop && fp8) {
++      VkPhysicalDeviceProperties candidateProperties;
++      vkGetPhysicalDeviceProperties(candidate, &candidateProperties);
++      if (candidateProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { physical_ = candidate; break; }
++      if (!physical_) physical_ = candidate;   // the first capable device stays the fallback
++    }
+   }
+   if (!physical_) throw std::runtime_error("no device with VK_KHR_cooperative_matrix + VK_EXT_shader_float8");
++  availableNames.clear();   // the loop above collected every candidate's set; keep only the chosen device's
++  { uint32_t n = 0; vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
++    std::vector<VkExtensionProperties> exts(n); vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, exts.data());
++    for (auto& e : exts) availableNames.insert(e.extensionName); }
+   if (getenv("DLSS5VK_LIST_EXTENSIONS")) {
+     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cm2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV};
+     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+@@ -122,8 +137,11 @@ Context::Context() {
+   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
+   properties.pNext = &subgroup;
+   subgroup.pNext = &smBuiltins;
++  VkPhysicalDeviceShaderCorePropertiesAMD amdCore{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD};
++  if (availableNames.count(VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME)) { smBuiltins.pNext = &amdCore; }
+   vkGetPhysicalDeviceProperties2(physical_, &properties);
+-  smCount_ = smBuiltins.shaderSMCount;
++  smCount_ = smBuiltins.shaderSMCount ? smBuiltins.shaderSMCount : (amdCore.shaderEngineCount && amdCore.shaderArraysPerEngineCount && amdCore.computeUnitsPerShaderArray ? amdCore.shaderEngineCount * amdCore.shaderArraysPerEngineCount * amdCore.computeUnitsPerShaderArray : 1u);
++  if (smCount_ < 1) throw std::runtime_error("SM count unavailable: neither VK_NV_shader_sm_builtins nor VK_AMD_shader_core_properties reported it");
+   deviceName_ = properties.properties.deviceName;
+   timestampPeriod_ = properties.properties.limits.timestampPeriod;
+   maxSharedMemory_ = properties.properties.limits.maxComputeSharedMemorySize;
+@@ -150,7 +168,7 @@ Context::Context() {
+   queueInfo.queueCount = 1;
+   queueInfo.pQueuePriorities = &priority;
+ 
+-  DeviceRequirements req;
++  DeviceRequirements req(availableNames);
+   VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+   deviceInfo.pNext = &req.features;
+   deviceInfo.queueCreateInfoCount = 1;
+@@ -163,7 +181,11 @@ Context::Context() {
+ }
+ 
+ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex) {
++#ifdef _WIN32
+   if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("vulkan-1.dll unavailable");
++#else
++  if (volkInitialize() != VK_SUCCESS) throw std::runtime_error("libvulkan.so.1 unavailable");
++#endif
+   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
+   volkLoadInstance(instance_);
+   volkLoadDevice(device_);
+@@ -172,8 +194,14 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
+   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
+   properties.pNext = &subgroup;
+   subgroup.pNext = &smBuiltins;
++  VkPhysicalDeviceShaderCorePropertiesAMD amdCore{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD};
++  { uint32_t n=0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &n, nullptr);
++    std::vector<VkExtensionProperties> es(n); vkEnumerateDeviceExtensionProperties(physical, nullptr, &n, es.data());
++    bool hasAmd=false; for (auto&e:es) if (!strcmp(e.extensionName, VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME)) hasAmd=true;
++    if (hasAmd) smBuiltins.pNext = &amdCore; }
+   vkGetPhysicalDeviceProperties2(physical_, &properties);
+-  smCount_ = smBuiltins.shaderSMCount;
++  smCount_ = smBuiltins.shaderSMCount ? smBuiltins.shaderSMCount : (amdCore.shaderEngineCount && amdCore.shaderArraysPerEngineCount && amdCore.computeUnitsPerShaderArray ? amdCore.shaderEngineCount * amdCore.shaderArraysPerEngineCount * amdCore.computeUnitsPerShaderArray : 1u);
++  if (smCount_ < 1) throw std::runtime_error("SM count unavailable: neither VK_NV_shader_sm_builtins nor VK_AMD_shader_core_properties reported it");
+   deviceName_ = properties.properties.deviceName;
+   timestampPeriod_ = properties.properties.limits.timestampPeriod;
+   maxSharedMemory_ = properties.properties.limits.maxComputeSharedMemorySize;
+@@ -237,6 +265,32 @@ DeviceRequirements::DeviceRequirements() {
+                               VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME};
+ }
+ 
++namespace {
++// GLSL route on non-NVIDIA drivers: drop the NV-only extension requests and feature structs.
++void filterForAvailableExtensions(DeviceRequirements& req, const std::set<std::string>& available) {
++  std::vector<const char*> kept;
++  for (const char* ext : req.extensions) if (available.count(ext)) kept.push_back(ext);
++  req.extensions = kept;
++  const bool hasCuda = available.count(VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME) != 0;
++  const bool hasSm = available.count(VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME) != 0;
++  const bool hasCoop2 = available.count(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME) != 0;
++  // rebuild the pNext chain tail conditionally
++  VkPhysicalDeviceFeatures2& f = req.features;
++  VkBaseOutStructure** tail = (VkBaseOutStructure**)&f.pNext;
++  while (*tail) {
++    VkBaseOutStructure* node = (VkBaseOutStructure*)*tail;
++    if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV && !hasSm) { *tail = node->pNext; continue; }
++    if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV && !hasCoop2) { *tail = node->pNext; continue; }
++    tail = &node->pNext;
++  }
++  (void)hasCuda;
++}
++}  // namespace
++
++DeviceRequirements::DeviceRequirements(const std::set<std::string>& available) : DeviceRequirements() {
++  filterForAvailableExtensions(*this, available);
++}
++
+ void Context::initCommon() {
+   vkGetDeviceQueue(device_, queueFamily_, queueIndex_, &queue_);
+ 
+diff --git a/src/vk_context.h b/src/vk_context.h
+index 13a19e9..a1ed623 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -6,9 +6,11 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <cstring>
+ #include <cstdio>
+ #include <stdexcept>
+ #include <string>
++#include <set>
+ #include <vector>
+ 
+ #define VK_CHECK(expr)                                                                 \
+@@ -67,6 +69,7 @@ struct DeviceRequirements {
+   VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+   std::vector<const char*> extensions;
+   DeviceRequirements();                       // fills the chain (features.pNext -> ...) and the extension list
++  DeviceRequirements(const std::set<std::string>& availableExtensions);  // Linux/GLSL route: NV-only pieces only when present
+   void* pNextChain() { return features.pNext; }   // for a VkDeviceCreateInfo that carries VkPhysicalDeviceFeatures itself
+ };
+ 
