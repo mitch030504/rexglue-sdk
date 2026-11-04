@@ -22,6 +22,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/dlss5_amd.h>
+#include <rex/ui/fsr4.h>
 #include <rex/ui/vulkan/device.h>
 #include "ui/dlss_runtime.h"
 #include "ui/xess_runtime.h"
@@ -295,13 +296,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 #endif
 
-#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
-  // DLSS 5 NR (AMD) needs Vulkan 1.3 plus three device extensions. The
-  // feature structs are only linked when the extensions are actually enabled;
-  // a missing one becomes an inactive reason, never a device-creation failure.
+  // DLSS 5 NR (AMD) and FSR 4 (user-supplied vk .so) both need Vulkan 1.3 plus
+  // the FP8 / cooperative-matrix device extensions; FSR4's needs are a strict
+  // subset of the DLSS 5 set. The feature structs are only linked when the
+  // extensions are actually enabled; a missing one becomes an inactive reason,
+  // never a device-creation failure.
   bool ext_KHR_cooperative_matrix = false;
   bool ext_EXT_shader_float8 = false;
   bool ext_KHR_workgroup_memory_explicit_layout = false;
+  const bool fsr4_requested =
+      fsr4::Selected() && properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) &&
+      vulkan_instance->api_version() >= VK_MAKE_API_VERSION(0, 1, 3, 0);
+  if (fsr4::Selected() &&
+      (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) ||
+       vulkan_instance->api_version() < VK_MAKE_API_VERSION(0, 1, 3, 0))) {
+    fsr4::SetDeviceUnsupported("Vulkan 1.3 is required for FSR 4");
+  }
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   const bool dlss5_amd_requested =
       dlss5_amd::Selected() && properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) &&
       vulkan_instance->api_version() >= VK_MAKE_API_VERSION(0, 1, 3, 0);
@@ -310,13 +321,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
        vulkan_instance->api_version() < VK_MAKE_API_VERSION(0, 1, 3, 0))) {
     dlss5_amd::SetDeviceUnsupported("Vulkan 1.3 is required for DLSS 5 NR (AMD)");
   }
-  if (dlss5_amd_requested) {
+#else
+  const bool dlss5_amd_requested = false;
+#endif
+  // VK_KHR_workgroup_memory_explicit_layout stays DLSS 5-only.
+  const bool neural_requested = dlss5_amd_requested || fsr4_requested;
+  if (neural_requested) {
     requested_extensions.emplace("VK_KHR_cooperative_matrix", &ext_KHR_cooperative_matrix);
     requested_extensions.emplace("VK_EXT_shader_float8", &ext_EXT_shader_float8);
-    requested_extensions.emplace("VK_KHR_workgroup_memory_explicit_layout",
-                                 &ext_KHR_workgroup_memory_explicit_layout);
+    if (dlss5_amd_requested) {
+      requested_extensions.emplace("VK_KHR_workgroup_memory_explicit_layout",
+                                   &ext_KHR_workgroup_memory_explicit_layout);
+    }
   }
-#endif
 
   std::vector<const char*> enabled_extensions;
   {
@@ -417,7 +434,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       xess_features_EXT_mutable_descriptor_type;
   bool xess_mutable_descriptor_type_linked = false;
 #endif
-#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  // Shared by DLSS 5 NR (AMD) and FSR 4 (see the extension request above).
   VulkanFeatures<VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>
       features_KHR_cooperative_matrix;
@@ -427,7 +444,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>
       features_KHR_workgroup_memory_explicit_layout;
-#endif
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -480,15 +496,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       }
     }
 #endif
-#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
-    if (dlss5_amd_requested) {
+    if (neural_requested) {
       if (ext_KHR_cooperative_matrix) {
         features_KHR_cooperative_matrix.Link(supported_features_2, device_create_info);
       }
       if (ext_EXT_shader_float8) {
         features_EXT_shader_float8.Link(supported_features_2, device_create_info);
       }
-      if (ext_KHR_workgroup_memory_explicit_layout) {
+      if (dlss5_amd_requested && ext_KHR_workgroup_memory_explicit_layout) {
         features_KHR_workgroup_memory_explicit_layout.Link(supported_features_2,
                                                            device_create_info);
       }
@@ -502,7 +517,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_1_1.Link(supported_features_2, device_create_info);
 #endif
     }
-#endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
   }
@@ -960,15 +974,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 #endif
 
-#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   // Check the requested feature set after the supported bits are known, before
   // vkCreateDevice. Missing capabilities become a named inactive reason; the
   // device is still created and the game renders normally.
-  if (dlss5_amd_requested) {
-    std::string dlss5_reason;
-    auto fail = [&dlss5_reason](const char* what) {
-      if (dlss5_reason.empty()) {
-        dlss5_reason = what;
+  if (neural_requested) {
+    std::string neural_reason;
+    auto fail = [&neural_reason](const char* what) {
+      if (neural_reason.empty()) {
+        neural_reason = what;
       }
     };
     if (!ext_KHR_cooperative_matrix) {
@@ -977,7 +990,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (!ext_EXT_shader_float8) {
       fail("missing device extension VK_EXT_shader_float8");
     }
-    if (!ext_KHR_workgroup_memory_explicit_layout) {
+    if (dlss5_amd_requested && !ext_KHR_workgroup_memory_explicit_layout) {
       fail("missing device extension VK_KHR_workgroup_memory_explicit_layout");
     }
     if (!features_KHR_cooperative_matrix.supported.cooperativeMatrix) {
@@ -987,12 +1000,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         !features_EXT_shader_float8.supported.shaderFloat8CooperativeMatrix) {
       fail("shaderFloat8/shaderFloat8CooperativeMatrix are not supported");
     }
-    if (!features_KHR_workgroup_memory_explicit_layout.supported
-             .workgroupMemoryExplicitLayout ||
-        !features_KHR_workgroup_memory_explicit_layout.supported
-             .workgroupMemoryExplicitLayout8BitAccess ||
-        !features_KHR_workgroup_memory_explicit_layout.supported
-             .workgroupMemoryExplicitLayout16BitAccess) {
+    if (dlss5_amd_requested &&
+        (!features_KHR_workgroup_memory_explicit_layout.supported.workgroupMemoryExplicitLayout ||
+         !features_KHR_workgroup_memory_explicit_layout.supported
+              .workgroupMemoryExplicitLayout8BitAccess ||
+         !features_KHR_workgroup_memory_explicit_layout.supported
+              .workgroupMemoryExplicitLayout16BitAccess)) {
       fail("workgroup memory explicit layout 8/16-bit access is not supported");
     }
     if (!features_1_1.supported.storageBuffer16BitAccess) {
@@ -1051,21 +1064,30 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       fail("e4m3 16x16x16 fp32 subgroup cooperative matrix is not reported");
     }
 
-    if (!dlss5_reason.empty()) {
-      dlss5_amd::SetDeviceUnsupported(dlss5_reason);
-      REXLOG_WARN("DLSS 5 NR (AMD) inactive: {}", dlss5_reason);
+    if (!neural_reason.empty()) {
+      // Route the reason to the feature that solely requested it; with both selected the
+      // DLSS 5 NR (AMD) status carries it, as before.
+      if (fsr4_requested && !dlss5_amd_requested) {
+        fsr4::SetDeviceUnsupported(neural_reason);
+        REXLOG_WARN("FSR 4 inactive: {}", neural_reason);
+      } else {
+        dlss5_amd::SetDeviceUnsupported(neural_reason);
+        REXLOG_WARN("DLSS 5 NR (AMD) inactive: {}", neural_reason);
+      }
     } else {
       features_KHR_cooperative_matrix.enabled.cooperativeMatrix = VK_TRUE;
       features_EXT_shader_float8.enabled.shaderFloat8 = VK_TRUE;
       features_EXT_shader_float8.enabled.shaderFloat8CooperativeMatrix = VK_TRUE;
-      features_KHR_workgroup_memory_explicit_layout.enabled.workgroupMemoryExplicitLayout =
-          VK_TRUE;
-      features_KHR_workgroup_memory_explicit_layout.enabled
-          .workgroupMemoryExplicitLayout8BitAccess = VK_TRUE;
-      features_KHR_workgroup_memory_explicit_layout.enabled
-          .workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
-      features_KHR_workgroup_memory_explicit_layout.enabled
-          .workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
+      if (dlss5_amd_requested) {
+        features_KHR_workgroup_memory_explicit_layout.enabled.workgroupMemoryExplicitLayout =
+            VK_TRUE;
+        features_KHR_workgroup_memory_explicit_layout.enabled
+            .workgroupMemoryExplicitLayout8BitAccess = VK_TRUE;
+        features_KHR_workgroup_memory_explicit_layout.enabled
+            .workgroupMemoryExplicitLayout16BitAccess = VK_TRUE;
+        features_KHR_workgroup_memory_explicit_layout.enabled
+            .workgroupMemoryExplicitLayoutScalarBlockLayout = VK_FALSE;
+      }
       features_1_1.enabled.storageBuffer16BitAccess = VK_TRUE;
       features_1_2.enabled.storageBuffer8BitAccess = VK_TRUE;
       features_1_2.enabled.shaderFloat16 = VK_TRUE;
@@ -1073,10 +1095,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_1_2.enabled.vulkanMemoryModel = VK_TRUE;
       features_1_3.enabled.subgroupSizeControl = VK_TRUE;
       features_1_3.enabled.synchronization2 = VK_TRUE;
-      REXLOG_INFO("DLSS 5 NR (AMD): device features enabled");
+      REXLOG_INFO("{}: device features enabled",
+                  fsr4_requested && !dlss5_amd_requested ? "FSR 4" : "DLSS 5 NR (AMD)");
     }
   }
-#endif
 
   // Create the device.
 

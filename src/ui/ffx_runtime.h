@@ -8,6 +8,10 @@
  * DLL per graphics API, both exporting the same names, so a build with D3D12 and Vulkan loads the
  * right one at runtime instead.
  *
+ * On non-Windows, Get(Api::kVulkan) first tries a user-supplied provider .so
+ * (amd_fidelityfx_upscaler_vk.so, e.g. an fsr4-vk-style FSR 4.1.2 build) when the `fsr4` cvar is
+ * on, and falls back to the linked entry points on any failure (status: rex::ui::fsr4).
+ *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */

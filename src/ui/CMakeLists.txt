@@ -18,6 +18,7 @@ set(REXUI_CORE_SOURCES
     xess_runtime.cpp
     dlss_runtime.cpp
     dlss5_amd_runtime.cpp
+    fsr4_runtime.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -143,6 +144,12 @@ if(REXGLUE_ENABLE_DLSS AND REXGLUE_DLSS_LIBRARY)
     if(UNIX)
         target_link_libraries(rexui PRIVATE ${CMAKE_DL_LIBS})
     endif()
+endif()
+
+# ffx_runtime dlopens the user-supplied FSR 4 Vulkan provider .so (cvar fsr4)
+# on non-Windows builds.
+if(UNIX)
+    target_link_libraries(rexui PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

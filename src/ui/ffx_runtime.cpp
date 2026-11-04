@@ -12,9 +12,9 @@
 #include <mutex>
 
 #include <rex/logging.h>
+#include <rex/platform.h>
 
 #if defined(REX_FIDELITYFX_PREBUILT) && REX_FIDELITYFX_PREBUILT
-#include <rex/platform.h>
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -22,6 +22,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif !REX_PLATFORM_WIN32
+// Non-Windows source build: when the user asks for FSR 4 (cvar fsr4), the Vulkan entry points are
+// taken from a user-built provider .so instead of the linked FSR 3.1.4.
+#include <dlfcn.h>
+
+#include <filesystem>
+#include <string>
+
+#include <rex/ui/fsr4.h>
+
+#include "ui/fsr4_runtime.h"
 #endif
 
 namespace rex::ui::ffx {
@@ -78,6 +89,97 @@ const Functions* Get(Api api) {
 const Functions* GetAny() {
   const Functions* functions = Get(Api::kD3D12);
   return functions ? functions : Get(Api::kVulkan);
+}
+
+#elif !REX_PLATFORM_WIN32
+
+// The source build links one backend (FSR 3.1.4); its entry points accept only that backend's
+// contexts, and fail cleanly for the other.
+static const Functions kLinked = {ffxCreateContext, ffxDestroyContext, ffxConfigure, ffxQuery,
+                                  ffxDispatch};
+
+namespace {
+
+// ABI caveat: a 2.4.0-era provider .so (FSR 4.1.2) speaks the SDK 2.x ffxApi ABI, where
+// ffxCreateBackendVKDesc carries the device in a VkDeviceContext struct (see the
+// REX_FIDELITYFX_PREBUILT split in vulkan_presenter.cpp:323-330). This translation unit only
+// resolves the five entry points; switching the presenter's create-desc to the 2.4.0 ABI is a
+// later task (Track 4, T4.5). Until then the linked FSR 3.1.4 backend must keep serving dispatch,
+// and the provider is used for queries only.
+struct Loaded {
+  std::once_flag once;
+  Functions functions;
+  bool ok = false;
+};
+
+const Functions* LoadVulkanProvider(Loaded& loaded) {
+  std::call_once(loaded.once, [&] {
+    if (!rex::ui::fsr4::Selected()) {
+      return;
+    }
+    constexpr const char* kLibraryName = "amd_fidelityfx_upscaler_vk.so";
+    void* module = nullptr;
+    std::string loaded_from;
+    std::string searched;
+    std::string last_error;
+    dlerror();  // Clear any stale error.
+    // The executable directory first, then fsr4_data_path.
+    for (const std::filesystem::path& folder : rex::ui::fsr4::LibrarySearchPaths()) {
+      const std::filesystem::path candidate = folder / kLibraryName;
+      searched += candidate.string();
+      searched += ", ";
+      module = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL);
+      if (module) {
+        loaded_from = candidate.string();
+        break;
+      }
+      if (const char* error = dlerror()) {
+        last_error = error;
+      }
+    }
+    if (!module) {
+      rex::ui::fsr4::SetProviderUnavailable("cannot load " + std::string(kLibraryName) +
+                                            " (searched " + searched + ")" +
+                                            (last_error.empty() ? "" : ": " + last_error));
+      return;
+    }
+    Functions& f = loaded.functions;
+    f.CreateContext = reinterpret_cast<PfnFfxCreateContext>(dlsym(module, "ffxCreateContext"));
+    f.DestroyContext = reinterpret_cast<PfnFfxDestroyContext>(dlsym(module, "ffxDestroyContext"));
+    f.Configure = reinterpret_cast<PfnFfxConfigure>(dlsym(module, "ffxConfigure"));
+    f.Query = reinterpret_cast<PfnFfxQuery>(dlsym(module, "ffxQuery"));
+    f.Dispatch = reinterpret_cast<PfnFfxDispatch>(dlsym(module, "ffxDispatch"));
+    loaded.ok = f.CreateContext && f.DestroyContext && f.Configure && f.Query && f.Dispatch;
+    if (!loaded.ok) {
+      rex::ui::fsr4::SetProviderUnavailable(std::string(kLibraryName) +
+                                            " is missing API entry points");
+      dlclose(module);
+      return;
+    }
+    // The module stays loaded for the process lifetime: the provider owns Vulkan objects, so
+    // dlclose at exit would not be safe.
+    rex::ui::fsr4::SetProviderLoaded(loaded_from);
+    REXLOG_INFO("FidelityFX: using {} for Vulkan", loaded_from);
+  });
+  return loaded.ok ? &loaded.functions : nullptr;
+}
+
+}  // namespace
+
+const Functions* Get(Api api) {
+  static Loaded vulkan_provider;
+  if (api == Api::kVulkan) {
+    // The FSR 4 provider .so when fsr4 is on and loadable; any failure is recorded in
+    // rex::ui::fsr4::GetStatus() and falls back to the linked build below.
+    if (const Functions* functions = LoadVulkanProvider(vulkan_provider)) {
+      return functions;
+    }
+  }
+  return &kLinked;
+}
+
+const Functions* GetAny() {
+  return Get(Api::kVulkan);
 }
 
 #else
