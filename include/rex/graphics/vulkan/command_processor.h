@@ -29,6 +29,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/graphics/vulkan/motion_clip_arena.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -500,40 +501,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
   // Phase 2 motion guide clip arena (see the state block below).
-  struct MotionClipBlock {
-    // Offset of the block inside either half of the arena, in float4 slots. The
-    // same layout is used in both halves, so the previous frame's block is at the
-    // same offset in the other half.
-    uint32_t slot_offset;
-    // Size of the block in slots, and the gl_VertexIndex window it covers. Never
-    // shrinks: a stable draw keeps its offset and its history.
-    uint32_t capacity;
-    uint32_t index_min;
-    uint32_t index_max;
-    // Guest frame that last recorded clip data into this block, or UINT64_MAX if
-    // it has never been issued. Only a block written on frame - 1 may be read.
-    uint64_t last_frame;
-    // Order-sensitive identity of the index set drawn last (stream + the fields
-    // that select it). A different identity means the slots mean different
-    // vertices, so the whole draw loses history.
-    uint64_t index_fingerprint;
-    // One identity key can be drawn as several primitives (sub-draws). The block
-    // is placed once per frame and every sub-draw reuses that placement and its
-    // history decision; re-placing it per sub-draw moved the offset within the
-    // frame and made previous-frame history impossible.
-    uint64_t allocated_frame = UINT64_MAX;
-    uint32_t frame_prev_clip_base = UINT32_MAX;
-  };
-  // Per-draw result handed to the system constants. 0xFFFFFFFF in either base
-  // disables that side in the shader.
-  struct MotionClipDraw {
-    uint64_t key = 0;
-    uint32_t clip_base = UINT32_MAX;
-    uint32_t prev_clip_base = UINT32_MAX;
-    uint32_t index_min = 0;
-    uint32_t index_max = 0;
-    bool allocated = false;
-  };
+  using MotionClipDraw = MotionClipArena::Draw;
   enum class MotionClipInvalidationReason : uint32_t {
     // ClearCaches (also the path a draw resolution change takes).
     kClearCache,
@@ -640,29 +608,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   // A single draw may not reserve the whole half: max - min + 1 can be enormous
   // for a sparse index set, and one such draw would evict every other block.
   static constexpr uint32_t kMotionClipMaxDrawSlots = UINT32_C(1) << 20;
+  static_assert(kMotionClipSlotsPerHalf == MotionClipArena::kDefaultHalfSlots,
+                "MotionClipArena's default half must match the GPU arena");
+  static_assert(kMotionClipMaxDrawSlots == MotionClipArena::kDefaultMaxDrawSlots,
+                "MotionClipArena's default block cap must match the GPU bounds");
 
-  // Guest frame the allocator is currently laid out for, UINT64_MAX before the
-  // first rotation. Draws use this, not the trace marker's frame, because the
-  // marker's count is CPU-side and drifts from the GPU's presented frames.
-  uint64_t motion_frame_ = UINT64_MAX;
-  // Half the current frame writes; the other half was written by frame - 1.
-  uint32_t motion_parity_ = 0;
-  // Slots reserved so far in the current frame's layout. This is a high-water
-  // mark, not a per-frame bump start: preserved blocks keep the offset they had
-  // last frame, and only new or grown blocks are placed at the mark. At rotation
-  // the mark is recomputed from the blocks that survived (see AdvanceMotionFrame),
-  // so a culled block at the top frees its tail for reuse and the arena does not
-  // ratchet permanently upward.
-  uint32_t motion_frame_slot_cursor_ = 0;
-  // Placement outcome for the frame, logged at rotation: stable placement turns
-  // `history` into a measure of real correspondence rather than of draw order.
-  uint32_t motion_frame_new_blocks_ = 0;
-  uint32_t motion_frame_moved_blocks_ = 0;
+  // Draws whose block had a complete, unchanged previous-frame index set are
+  // counted by the arena's `history` report. Placement is a property of the
+  // block, and the arena keeps the survivor set, live/free ranges and offsets.
+  MotionClipArena motion_clip_arena_;
   bool motion_arena_barrier_pending_ = false;
   // Mirrors render_target_cache_'s sticky scene predicate so the once-per-change
   // log can name the transition without querying it.
   bool motion_scene_draw_ = false;
-  std::unordered_map<uint64_t, MotionClipBlock> motion_clip_blocks_;
   uint32_t motion_clip_invalidations_[size_t(MotionClipInvalidationReason::kCount)] = {};
   // Draw resolution scale the guide attachment was created under; a change
   // relayouts every framebuffer, so the arena layout must be rebuilt and counted
@@ -689,16 +647,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t motion_frame_no_bounds_ = 0;
   // Keyed draws whose viewport is not the 1000x600 scene (effects, shadow passes).
   uint32_t motion_frame_no_viewport_ = 0;
-  // Draws whose block had a complete, unchanged previous-frame index set - the
-  // only draws that can produce non-zero motion this frame.
-  uint32_t motion_frame_history_ = 0;
   // Projection jitter of frame - 1 minus this frame, in guest-NDC units, applied to
   // every draw of the frame. The guest projection carries the jitter, so the stored
   // clips include it and the fragment must subtract the difference.
   float motion_jitter_ndc_[2] = {0.0f, 0.0f};
-  uint32_t motion_frame_reallocated_ = 0;
-  uint32_t motion_frame_index_set_changed_ = 0;
-  uint32_t motion_frame_clamped_ = 0;
 
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;

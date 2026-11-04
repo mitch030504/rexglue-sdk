@@ -1,7 +1,9 @@
 # Unit Tests for ReXGlue core components
 
 add_executable(unit_tests
+    graphics/motion_clip_arena_test.cpp
     graphics/render_target_key_test.cpp
+    ui/motion_contract_test.cpp
     graphics/spirv_modification_test.cpp
     graphics/trace_marker_test.cpp
     test_memory.cpp

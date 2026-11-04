@@ -2110,10 +2110,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          motion_clip_buffer_memory_);
   // The arena is gone; keep no block or frame stamp that claims otherwise. The
   // counters are session-scoped, like the arena itself.
-  motion_clip_blocks_.clear();
-  motion_frame_ = UINT64_MAX;
-  motion_parity_ = 0;
-  motion_frame_slot_cursor_ = 0;
+  motion_clip_arena_.Forget();
   motion_arena_barrier_pending_ = false;
   motion_scene_draw_ = false;
   motion_pending_key_ = 0;
@@ -3755,13 +3752,13 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
-  if (!motion_guide_enabled_ || frame == motion_frame_) {
+  if (!motion_guide_enabled_ || frame == motion_clip_arena_.frame()) {
     return;
   }
   // A draw resolution change relayouts every framebuffer; the guide's image and
   // the arena layout's meaning both go with it. Route it through the same reset so
   // the invalidation is counted instead of silently reading old slots.
-  if (motion_frame_ != UINT64_MAX && texture_cache_ &&
+  if (motion_clip_arena_.frame() != UINT64_MAX && texture_cache_ &&
       (motion_resolution_scale_x_ != texture_cache_->draw_resolution_scale_x() ||
        motion_resolution_scale_y_ != texture_cache_->draw_resolution_scale_y())) {
     ResetMotionClipAllocator(MotionClipInvalidationReason::kResize);
@@ -3774,49 +3771,25 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
     motion_pending_key_ = 0;
     ++motion_frame_stale_;
   }
-  // Only frame - 1 can ever be a valid previous frame, so anything older (or never
-  // issued) is dead weight - unstable keys would otherwise grow the table forever.
-  // Dropped before the log so `blocks` is the number that can still be read.
-  for (auto it = motion_clip_blocks_.begin(); it != motion_clip_blocks_.end();) {
-    const uint64_t last_frame = it->second.last_frame;
-    if (last_frame == UINT64_MAX || last_frame + 1 < frame) {
-      it = motion_clip_blocks_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  // The frame that just ended was laid out up to this mark. Report it before it is
-  // recomputed; `layout_end` is how close the arena came to its half.
-  const uint32_t previous_layout_end = motion_frame_slot_cursor_;
-  // Preserved blocks keep their offsets; recompute the mark from the blocks that
-  // survived the erase so a culled block at the top frees its tail. This is what
-  // makes placement independent of draw order: the mark is a property of the live
-  // set, not of how many blocks happened to be drawn first this frame.
-  uint32_t live_layout_end = 0;
-  for (const auto& entry : motion_clip_blocks_) {
-    const MotionClipBlock& block = entry.second;
-    live_layout_end = std::max(live_layout_end, block.slot_offset + block.capacity);
-  }
-  // Report the frame that just ended, before its counters are cleared. The frame
-  // is the allocator's stamp, not marker.frame: it must match the parity and the
-  // blocks' last_frame exactly, and the CPU swap count can be ahead of the GPU.
-  if (motion_frame_ != UINT64_MAX) {
+  // The arena prunes blocks that cannot be read, rebuilds the live and free
+  // ranges from every survivor (including one not drawn yet this frame), and
+  // reports the frame that just ended before its counters are cleared.
+  MotionClipArena::FrameReport report;
+  motion_clip_arena_.BeginFrame(frame, report);
+  if (report.frame != UINT64_MAX) {
     REXLOG_INFO(
         "motion_guide frame={} blocks={} realloc={} index_set_changed={} clamped={} keys={} "
         "draws={} missing={} stale={} no_variant={} no_bounds={} no_viewport={} history={} "
-        "new={} moved={} layout_end={} live_end={}",
-        motion_frame_, motion_clip_blocks_.size(), motion_frame_reallocated_,
-        motion_frame_index_set_changed_, motion_frame_clamped_, motion_frame_keys_,
-        motion_frame_draws_, motion_frame_missing_, motion_frame_stale_,
+        "new={} moved={} layout_end={} live_end={} freed={} holes={} free_slots={} tail_free={} "
+        "drawn_end={} reused={} bumped={} grew={} repack={} ff_steps={} no_space={}",
+        report.frame, report.blocks, report.reallocated, report.index_set_changed, report.clamped,
+        motion_frame_keys_, motion_frame_draws_, motion_frame_missing_, motion_frame_stale_,
         motion_frame_no_variant_, motion_frame_no_bounds_, motion_frame_no_viewport_,
-        motion_frame_history_, motion_frame_new_blocks_, motion_frame_moved_blocks_,
-        previous_layout_end, live_layout_end);
+        report.history, report.new_blocks, report.moved_blocks, report.layout_end, report.live_end,
+        report.freed, report.holes, report.free_slots, report.tail_free, report.drawn_end,
+        report.reused, report.bumped, report.grew, report.repacked, report.ff_steps,
+        report.no_space);
   }
-  motion_frame_ = frame;
-  motion_parity_ = uint32_t(frame & 1);
-  motion_frame_slot_cursor_ = live_layout_end;
-  motion_frame_new_blocks_ = 0;
-  motion_frame_moved_blocks_ = 0;
 
   // The guest projection carries the temporal-upscaler jitter (the projection hook
   // modifies the guest matrix), so both stored clips include their frame's jitter and
@@ -3825,8 +3798,8 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
   // no jitter and zero here, which is a known no-op.
   float jitter_x = 0.0f, jitter_y = 0.0f, prev_jitter_x = 0.0f, prev_jitter_y = 0.0f;
   uint32_t render_width = 0, render_height = 0;
-  if (frame > 0 && rex::ui::temporal::IsActive(render_width, render_height) &&
-      render_width && render_height) {
+  if (frame > 0 && rex::ui::temporal::IsActive(render_width, render_height) && render_width &&
+      render_height) {
     rex::ui::temporal::JitterForFrame(frame, jitter_x, jitter_y);
     rex::ui::temporal::JitterForFrame(frame - 1, prev_jitter_x, prev_jitter_y);
     const int32_t flip = REXCVAR_QUERY(int32_t, temporal_jitter_flip);
@@ -3851,10 +3824,6 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
   motion_frame_no_variant_ = 0;
   motion_frame_no_bounds_ = 0;
   motion_frame_no_viewport_ = 0;
-  motion_frame_history_ = 0;
-  motion_frame_reallocated_ = 0;
-  motion_frame_index_set_changed_ = 0;
-  motion_frame_clamped_ = 0;
   // The rotation point: one barrier for the whole arena between the previous
   // frame's vertex-stage writes and this frame's vertex-stage reads and writes,
   // rather than one per draw.
@@ -3882,8 +3851,7 @@ void VulkanCommandProcessor::ResetMotionClipAllocator(MotionClipInvalidationReas
   if (!motion_guide_enabled_) {
     return;
   }
-  motion_clip_blocks_.clear();
-  motion_frame_slot_cursor_ = 0;
+  motion_clip_arena_.Clear();
   const size_t reason_index = size_t(reason);
   static_assert(size_t(MotionClipInvalidationReason::kCount) == 4,
                 "Update kInvalidationReasonNames when adding a reason");
@@ -3902,128 +3870,20 @@ bool VulkanCommandProcessor::AllocateMotionClipBlock(uint64_t key, uint32_t draw
                                                      uint32_t draw_index_max,
                                                      uint64_t index_fingerprint,
                                                      MotionClipDraw& draw_out) {
-  // A key may be drawn as several primitives. The block is placed once per frame;
-  // every later sub-draw of the same key reuses that placement and the history
-  // decision made for it. Re-placing it here advanced the cursor per sub-draw, so
-  // the offset changed every time and previous-frame history could never be valid.
-  {
-    auto existing = motion_clip_blocks_.find(key);
-    if (existing != motion_clip_blocks_.end() &&
-        existing->second.allocated_frame == motion_frame_) {
-      const MotionClipBlock& block = existing->second;
-      draw_out.key = key;
-      draw_out.clip_base = motion_parity_ * kMotionClipSlotsPerHalf + block.slot_offset;
-      draw_out.prev_clip_base = block.frame_prev_clip_base;
-      draw_out.index_min = block.index_min;
-      draw_out.index_max = block.index_max;
-      draw_out.allocated = true;
-      if (block.frame_prev_clip_base != UINT32_MAX) {
-        ++motion_frame_history_;
-      }
-      return true;
-    }
-  }
-  // Two attempts: the second only after a full-arena reset, where the first block
-  // necessarily fits (its capacity is capped to one half).
-  for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-    auto it = motion_clip_blocks_.find(key);
-    const bool reused = it != motion_clip_blocks_.end();
-    const uint32_t previous_offset = reused ? it->second.slot_offset : UINT32_MAX;
-    const uint32_t previous_capacity = reused ? it->second.capacity : 0;
-    const uint32_t previous_index_min = reused ? it->second.index_min : draw_index_min;
-    const uint32_t previous_index_max = reused ? it->second.index_max : draw_index_min;
-    const uint64_t previous_fingerprint = reused ? it->second.index_fingerprint : 0;
-    const uint64_t previous_last_frame = reused ? it->second.last_frame : UINT64_MAX;
-
-    // The block is a fixed gl_VertexIndex window: slot = base + (index - index_min).
-    // Its min may only move down, which requires rewriting every slot, so that is
-    // a reallocation like growth.
-    const uint32_t new_index_min = std::min(previous_index_min, draw_index_min);
-    const uint64_t required_span = uint64_t(draw_index_max) - new_index_min + 1;
-    const uint32_t slot_cap = std::min(kMotionClipMaxDrawSlots, kMotionClipSlotsPerHalf);
-    const uint32_t needed_capacity = uint32_t(std::min<uint64_t>(required_span, slot_cap));
-    // An index outside the written window stores nothing; a draw that had to be
-    // clipped can never have complete history, so it is also reported separately.
-    const bool clamped = required_span > needed_capacity;
-    // Placement is a property of the block, not of what was drawn before it this
-    // frame. A block that still fits its previous window keeps its previous offset,
-    // so its previous half stays readable no matter which blocks were culled or
-    // added around it. New or grown blocks are placed above every preserved block
-    // (the cursor is the live layout end), so they cannot overlap a range another
-    // block still needs for history. This replaces the old
-    // `previous_offset == cursor` rule, which lost history for every block after
-    // the first culled/added draw.
-    const bool reallocated =
-        reused && (new_index_min != previous_index_min || needed_capacity > previous_capacity);
-    uint32_t capacity = previous_capacity;
-    if (needed_capacity > capacity) {
-      capacity = needed_capacity;
-    }
-    const bool keep_offset = reused && !reallocated;
-    const uint32_t offset = keep_offset ? previous_offset : motion_frame_slot_cursor_;
-    if (uint64_t(offset) + capacity > kMotionClipSlotsPerHalf) {
-      // Writing past the half would alias the other parity's blocks. Dropping all
-      // history is the only alternative that cannot produce wrong motion.
-      ResetMotionClipAllocator(MotionClipInvalidationReason::kArenaFull);
-      continue;
-    }
-    if (!keep_offset) {
-      motion_frame_slot_cursor_ = offset + capacity;
-      if (reused) {
-        ++motion_frame_moved_blocks_;
-      } else {
-        ++motion_frame_new_blocks_;
-      }
-    }
-
-    // All-or-nothing: the previous half is readable only if this exact block was
-    // written last frame, the layout kept its offset, the block still covers the
-    // whole index set, and the index set is the same one.
-    const bool history_valid =
-        reused && !reallocated && capacity == previous_capacity && previous_capacity != 0 &&
-        previous_offset == offset && previous_last_frame != UINT64_MAX &&
-        previous_last_frame + 1 == motion_frame_ && previous_fingerprint == index_fingerprint &&
-        draw_index_max <= previous_index_max;
-
-    MotionClipBlock& block = motion_clip_blocks_[key];
-    block.slot_offset = offset;
-    block.capacity = capacity;
-    block.index_min = new_index_min;
-    block.index_max = new_index_min + capacity - 1;
-    block.index_fingerprint = index_fingerprint;
-    if (reallocated) {
-      ++motion_frame_reallocated_;
-    }
-    if (reused && previous_fingerprint != index_fingerprint) {
-      ++motion_frame_index_set_changed_;
-    }
-    if (clamped) {
-      ++motion_frame_clamped_;
-    }
-    if (history_valid) {
-      ++motion_frame_history_;
-    }
-
-    draw_out.key = key;
-    draw_out.clip_base = motion_parity_ * kMotionClipSlotsPerHalf + offset;
-    draw_out.prev_clip_base =
-        history_valid ? (motion_parity_ ^ 1) * kMotionClipSlotsPerHalf + offset : UINT32_MAX;
-    draw_out.index_min = new_index_min;
-    draw_out.index_max = new_index_min + capacity - 1;
-    block.allocated_frame = motion_frame_;
-    block.frame_prev_clip_base = draw_out.prev_clip_base;
-    draw_out.allocated = true;
+  if (motion_clip_arena_.Allocate(key, draw_index_min, draw_index_max, index_fingerprint,
+                                  draw_out)) {
     return true;
   }
-  REXGPU_ERROR("motion_guide: could not place a clip block after an arena reset");
+  // Per-block skip: this draw loses motion for the frame, but every other block
+  // keeps its range and its history. A full-arena reset here would drop the whole
+  // frame's field - the failure that produced a 0% guide - so it is deliberately
+  // not done. `no_space` in the frame report keeps the pressure visible.
+  draw_out = MotionClipDraw();
   return false;
 }
 
 void VulkanCommandProcessor::CommitMotionClipBlock(uint64_t key) {
-  auto it = motion_clip_blocks_.find(key);
-  if (it != motion_clip_blocks_.end()) {
-    it->second.last_frame = motion_frame_;
-  }
+  motion_clip_arena_.Commit(key);
 }
 
 void VulkanCommandProcessor::UpdateMotionSceneConstants(
@@ -4556,8 +4416,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // is re-uploaded whenever the guide is active rather than tracking equality that
   // a retry iteration could have already written.
   if (motion_guide_enabled_) {
-    const bool motion_vertex_variant =
-        vertex_shader_modification.vertex.motion_guide != 0;
+    const bool motion_vertex_variant = vertex_shader_modification.vertex.motion_guide != 0;
     if (motion_keyed && !motion_vertex_variant) {
       ++motion_frame_no_variant_;
     }
@@ -4567,7 +4426,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // viewports (1376x1080, 832x1080, 1920x1080 - split panels and the full
     // window), and the phase markers toggle per batch (4 blocks against 700 keys).
     // Composition and HUD draws carry no identity, so a keyed draw is a scene draw.
-    if (motion_keyed && motion_vertex_variant && motion_bounds_valid && motion_frame_ != UINT64_MAX) {
+    if (motion_keyed && motion_vertex_variant && motion_bounds_valid &&
+        motion_clip_arena_.frame() != UINT64_MAX) {
       // The block is placed here, but only stamped as written after the draw
       // command is recorded, so a draw that fails later cannot look like history.
       if (!AllocateMotionClipBlock(motion_key, primitive_processor_->motion_index_min(),
