@@ -9,6 +9,7 @@ namespace {
 using Catch::Approx;
 using rex::ui::kMotionNdcToBackwardUvScaleX;
 using rex::ui::kMotionNdcToBackwardUvScaleY;
+using rex::ui::MotionJitterDeltaNdc;
 using rex::ui::MotionNdcToBackwardUv;
 
 TEST_CASE("motion contract maps a zero forward delta to zero backward motion", "[graphics]") {
@@ -88,6 +89,25 @@ TEST_CASE("motion contract matches the analyzer's forward pixel convention", "[g
   float v = 0.0f;
   MotionNdcToBackwardUv(ndc_x, 0.0f, u, v);
   CHECK(-u * 1000.0f == Approx(analyzer_px));
+}
+
+TEST_CASE("motion contract pins the measured jitter sign", "[graphics]") {
+  // 1920x1080 guest output, one frame apart. The hook moves the frustum window by
+  // +j, so the stored clip moves by -2j/extent; the delta to subtract is the
+  // opposite. The x term matches the measured static residual sign, and the y
+  // term uses the height (not the width) or it is off by the aspect ratio.
+  float x = 0.0f;
+  float y = 0.0f;
+  MotionJitterDeltaNdc(0.5f, -0.25f, 0.25f, 0.5f, 1920.0f, 1080.0f, x, y);
+  CHECK(x == Approx((0.25f - 0.5f) * 2.0f / 1920.0f));
+  CHECK(y == Approx((0.5f + 0.25f) * 2.0f / 1080.0f));
+
+  // Swapping the frames negates the delta.
+  float neg_x = 0.0f;
+  float neg_y = 0.0f;
+  MotionJitterDeltaNdc(0.25f, 0.5f, 0.5f, -0.25f, 1920.0f, 1080.0f, neg_x, neg_y);
+  CHECK(neg_x == Approx(-x));
+  CHECK(neg_y == Approx(-y));
 }
 
 }  // namespace

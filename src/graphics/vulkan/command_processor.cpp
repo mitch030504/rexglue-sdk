@@ -38,6 +38,7 @@
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/ui/motion_contract.h>
 #include <rex/ui/temporal_jitter.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -3793,9 +3794,13 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
 
   // The guest projection carries the temporal-upscaler jitter (the projection hook
   // modifies the guest matrix), so both stored clips include their frame's jitter and
-  // the fragment must subtract the difference in guest-NDC units. The hook's own flip
-  // switch is honoured so the guide matches what was rendered. Inactive upscaler means
-  // no jitter and zero here, which is a known no-op.
+  // the fragment must subtract the clip-space shift the jitter introduced. The hook
+  // moves the frustum window by +j, hence the image and the stored clip move by
+  // -2j/extent; the delta is therefore 2*(previous - current)/extent, not the
+  // opposite. Measured with a temporal upscaler active: the old sign left a
+  // 0.45-1.02 px residual on a static window, the corrected sign is tested by
+  // MotionJitterDeltaNdc. The hook's own flip switch is honoured so the guide matches
+  // what was rendered. Inactive upscaler means no jitter and zero here, a no-op.
   float jitter_x = 0.0f, jitter_y = 0.0f, prev_jitter_x = 0.0f, prev_jitter_y = 0.0f;
   uint32_t render_width = 0, render_height = 0;
   if (frame > 0 && rex::ui::temporal::IsActive(render_width, render_height) && render_width &&
@@ -3811,8 +3816,9 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
       jitter_y = -jitter_y;
       prev_jitter_y = -prev_jitter_y;
     }
-    motion_jitter_ndc_[0] = (jitter_x - prev_jitter_x) * 2.0f / float(render_width);
-    motion_jitter_ndc_[1] = (jitter_y - prev_jitter_y) * 2.0f / float(render_height);
+    rex::ui::MotionJitterDeltaNdc(jitter_x, jitter_y, prev_jitter_x, prev_jitter_y,
+                                  float(render_width), float(render_height), motion_jitter_ndc_[0],
+                                  motion_jitter_ndc_[1]);
   } else {
     motion_jitter_ndc_[0] = 0.0f;
     motion_jitter_ndc_[1] = 0.0f;

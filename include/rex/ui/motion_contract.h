@@ -37,4 +37,20 @@ constexpr void MotionNdcToBackwardUv(float ndc_x, float ndc_y, float& uv_x, floa
   uv_y = kMotionNdcToBackwardUvScaleY * ndc_y;
 }
 
+// The clip-space shift the projection jitter introduced between two frames, in
+// guest NDC, to be subtracted from `current - previous`.
+//
+// The projection hook moves the frustum window by +j pixels, which moves the
+// image - and therefore the stored guest clip - by -2j/extent. A static camera
+// therefore stores a clip delta of -2*(j - j_prev)/extent; subtracting
+// +2*(j_prev - j)/extent cancels it. The sign is measured, not derived: with a
+// temporal upscaler active, the old `(j - j_prev)` form left a 0.45-1.02 px
+// residual on the static 8400 window, while the off control was 0.004 px.
+constexpr void MotionJitterDeltaNdc(float jitter_x, float jitter_y, float previous_jitter_x,
+                                    float previous_jitter_y, float width, float height,
+                                    float& ndc_x, float& ndc_y) {
+  ndc_x = (previous_jitter_x - jitter_x) * 2.0f / width;
+  ndc_y = (previous_jitter_y - jitter_y) * 2.0f / height;
+}
+
 }  // namespace rex::ui
