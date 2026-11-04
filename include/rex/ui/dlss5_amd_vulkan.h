@@ -27,4 +27,11 @@ void InitializeRuntime(const vulkan::VulkanDevice& device, uint32_t width, uint3
 // Non-blocking diagnostics for the UI, updated after a recorded frame.
 void ReportRecordedFrame(bool applied, float gpu_ms);
 
+// Development seam gate: when a substitute image is loaded and
+// dlss5_amd_mode != 0, the composition draw that samples the scene source
+// (base page 0x11C6F) uses this 1920x1080 view instead of the guest texture.
+bool SubstituteEnabled();
+bool SubstituteForFrame(uint64_t frame);
+VkImageView SubstituteView();
+
 }  // namespace rex::ui::dlss5_amd

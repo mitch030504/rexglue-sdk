@@ -7129,12 +7129,25 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+  // Development seam gate: replace the composition's scene source with the
+  // pre-upscaled/NR 1920x1080 view. The composition draws are identified by the
+  // fetch constant's base page (0x11C6F000 >> 12); HUD textures keep their own
+  // views. The texture descriptor set is rewritten for every draw, so only the
+  // image info changes here.
+  const bool nr_substitute = rex::ui::dlss5_amd::SubstituteEnabled() &&
+                             rex::ui::dlss5_amd::SubstituteForFrame(GetCurrentFrame());
   if (write_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+      VkImageView image_view = texture_cache_->GetActiveBindingOrNullImageView(
           texture_binding.fetch_constant, texture_binding.dimension,
           bool(texture_binding.is_signed));
+      if (image_view != VK_NULL_HANDLE && nr_substitute &&
+          register_file_->GetTextureFetch(texture_binding.fetch_constant).base_address ==
+              0x11C6Fu) {
+        image_view = rex::ui::dlss5_amd::SubstituteView();
+      }
+      descriptor_image_info.imageView = image_view;
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;

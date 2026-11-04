@@ -18,6 +18,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -38,6 +39,19 @@ REXCVAR_DEFINE_STRING(dlss5_amd_data_path, "", "GPU",
                       "Folder that contains dlssnr-amd/ (the model and shaders). Empty: next to "
                       "the executable. Point at the parent, not at dlssnr-amd itself.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(dlss5_amd_mode, 0, "GPU",
+                     "Development: 0 = off, 1 = substitute a pre-upscaled identity scene, "
+                     "2 = substitute an NR image. Requires dlss5_amd=true and dlss5_amd_image.")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(dlss5_amd_image, "", "GPU",
+                      "Development: 1920x1080 raw RGBA8 image substituted for the composition "
+                      "source by dlss5_amd_mode 1/2. Used for the seam mapping gate.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(dlss5_amd_frame, -1, "GPU",
+                     "Development: only substitute on this guest frame; -1 = every frame.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
 namespace {
@@ -52,6 +66,13 @@ std::string g_device_reason;
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
 std::unique_ptr<nr::Runtime> g_runtime;
 #endif
+VkImage g_substitute_image = VK_NULL_HANDLE;
+VkDeviceMemory g_substitute_memory = VK_NULL_HANDLE;
+VkImageView g_substitute_view = VK_NULL_HANDLE;
+VkDevice g_substitute_device = VK_NULL_HANDLE;
+PFN_vkDestroyImageView g_substitute_destroy_view = nullptr;
+PFN_vkDestroyImage g_substitute_destroy_image = nullptr;
+PFN_vkFreeMemory g_substitute_free_memory = nullptr;
 bool g_assets_initialized = false;
 
 // --- SHA-256 (FIPS 180-4), for the model pin. Small and self-contained so the
@@ -280,6 +301,19 @@ const Status& GetStatus() {
   return g_status;
 }
 
+bool SubstituteEnabled() {
+  return g_substitute_view != VK_NULL_HANDLE && REXCVAR_GET(dlss5_amd_mode) != 0;
+}
+
+bool SubstituteForFrame(uint64_t frame) {
+  const int32_t first = REXCVAR_GET(dlss5_amd_frame);
+  return first < 0 || uint64_t(first) == frame;
+}
+
+VkImageView SubstituteView() {
+  return g_substitute_view;
+}
+
 void SetDeviceUnsupported(const std::string& reason) {
   g_device_reason = reason;
   if (g_status.requested && g_status.state != State::kInactive) {
@@ -293,6 +327,189 @@ void SetInactive(const std::string& reason) {
   g_status.state = State::kInactive;
   g_status.reason = reason;
   REXLOG_WARN("DLSS 5 NR (AMD) inactive: {}", reason);
+}
+
+uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& memory, uint32_t bits,
+                        VkMemoryPropertyFlags flags) {
+  for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+    if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags) {
+      return i;
+    }
+  }
+  return UINT32_MAX;
+}
+
+void TransitionSubstitute(const vulkan::VulkanDevice::Functions& dfn,
+                          VkCommandBuffer command_buffer, VkImage image, VkImageLayout from,
+                          VkImageLayout to, VkPipelineStageFlags src_stage,
+                          VkPipelineStageFlags dst_stage, VkAccessFlags src_access,
+                          VkAccessFlags dst_access) {
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  barrier.srcAccessMask = src_access;
+  barrier.dstAccessMask = dst_access;
+  barrier.oldLayout = from;
+  barrier.newLayout = to;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  dfn.vkCmdPipelineBarrier(command_buffer, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1,
+                           &barrier);
+}
+
+// One-shot upload of the 1920x1080 raw RGBA8 substitute image. The image is
+// only used by the seam mapping gate; the production path will build it from
+// the live scene instead.
+bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family,
+                           const std::string& path) {
+  const vulkan::VulkanInstance::Functions& ifn = device.vulkan_instance()->functions();
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  constexpr uint32_t kWidth = 1920;
+  constexpr uint32_t kHeight = 1080;
+  constexpr VkDeviceSize kBytes = VkDeviceSize(kWidth) * kHeight * 4;
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    REXLOG_WARN("DLSS 5 NR (AMD): cannot open substitute image {}", path);
+    return false;
+  }
+  file.seekg(0, std::ios::end);
+  const std::streamoff size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  if (size != std::streamoff(kBytes)) {
+    REXLOG_WARN("DLSS 5 NR (AMD): substitute image is {} bytes, expected {}", int64_t(size),
+                int64_t(kBytes));
+    return false;
+  }
+  std::vector<uint8_t> pixels(static_cast<size_t>(kBytes));
+  file.read(reinterpret_cast<char*>(pixels.data()), std::streamsize(kBytes));
+  if (!file) {
+    return false;
+  }
+
+  VkPhysicalDeviceMemoryProperties memory;
+  ifn.vkGetPhysicalDeviceMemoryProperties(device.physical_device(), &memory);
+
+  VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+  image_info.extent = {kWidth, kHeight, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (dfn.vkCreateImage(device.device(), &image_info, nullptr, &g_substitute_image) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements image_requirements;
+  dfn.vkGetImageMemoryRequirements(device.device(), g_substitute_image, &image_requirements);
+  VkMemoryAllocateInfo image_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  image_allocate.allocationSize = image_requirements.size;
+  image_allocate.memoryTypeIndex = FindMemoryType(memory, image_requirements.memoryTypeBits,
+                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (image_allocate.memoryTypeIndex == UINT32_MAX ||
+      dfn.vkAllocateMemory(device.device(), &image_allocate, nullptr, &g_substitute_memory) !=
+          VK_SUCCESS ||
+      dfn.vkBindImageMemory(device.device(), g_substitute_image, g_substitute_memory, 0) !=
+          VK_SUCCESS) {
+    return false;
+  }
+
+  VkBufferCreateInfo staging_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  staging_info.size = kBytes;
+  staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  if (dfn.vkCreateBuffer(device.device(), &staging_info, nullptr, &staging) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements staging_requirements;
+  dfn.vkGetBufferMemoryRequirements(device.device(), staging, &staging_requirements);
+  VkMemoryAllocateInfo staging_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  staging_allocate.allocationSize = staging_requirements.size;
+  staging_allocate.memoryTypeIndex =
+      FindMemoryType(memory, staging_requirements.memoryTypeBits,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (staging_allocate.memoryTypeIndex == UINT32_MAX ||
+      dfn.vkAllocateMemory(device.device(), &staging_allocate, nullptr, &staging_memory) !=
+          VK_SUCCESS ||
+      dfn.vkBindBufferMemory(device.device(), staging, staging_memory, 0) != VK_SUCCESS) {
+    return false;
+  }
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(device.device(), staging_memory, 0, kBytes, 0, &mapped) != VK_SUCCESS) {
+    return false;
+  }
+  std::memcpy(mapped, pixels.data(), size_t(kBytes));
+  dfn.vkUnmapMemory(device.device(), staging_memory);
+
+  VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool_info.queueFamilyIndex = family;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  if (dfn.vkCreateCommandPool(device.device(), &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBufferAllocateInfo buffer_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  buffer_info.commandPool = pool;
+  buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  buffer_info.commandBufferCount = 1;
+  if (dfn.vkAllocateCommandBuffers(device.device(), &buffer_info, &command_buffer) != VK_SUCCESS) {
+    return false;
+  }
+  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (dfn.vkCreateFence(device.device(), &fence_info, nullptr, &fence) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  dfn.vkBeginCommandBuffer(command_buffer, &begin);
+  TransitionSubstitute(dfn, command_buffer, g_substitute_image, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+  VkBufferImageCopy copy{};
+  copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.imageExtent = {kWidth, kHeight, 1};
+  dfn.vkCmdCopyBufferToImage(command_buffer, staging, g_substitute_image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  TransitionSubstitute(dfn, command_buffer, g_substitute_image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT);
+  dfn.vkEndCommandBuffer(command_buffer);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer;
+  const bool submitted =
+      dfn.vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS &&
+      dfn.vkWaitForFences(device.device(), 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+  dfn.vkDestroyFence(device.device(), fence, nullptr);
+  dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+  dfn.vkDestroyBuffer(device.device(), staging, nullptr);
+  dfn.vkFreeMemory(device.device(), staging_memory, nullptr);
+  if (!submitted) {
+    return false;
+  }
+
+  VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view_info.image = g_substitute_image;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (dfn.vkCreateImageView(device.device(), &view_info, nullptr, &g_substitute_view) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  g_substitute_device = device.device();
+  g_substitute_destroy_view = dfn.vkDestroyImageView;
+  g_substitute_destroy_image = dfn.vkDestroyImage;
+  g_substitute_free_memory = dfn.vkFreeMemory;
+  REXLOG_INFO("DLSS 5 NR (AMD): substitute image loaded from {} (1920x1080 RGBA8)", path);
+  return true;
 }
 }  // namespace
 
@@ -390,6 +607,14 @@ void InitializeRuntime(const vulkan::VulkanDevice& device, uint32_t width, uint3
       return;
     }
     g_status.gpu = device.properties().deviceName;
+    const std::string substitute_path = REXCVAR_GET(dlss5_amd_image);
+    if (!substitute_path.empty() && REXCVAR_GET(dlss5_amd_mode) != 0) {
+      if (!UploadSubstituteImage(device, queue.queue(), device.queue_family_graphics_compute(),
+                                 substitute_path)) {
+        SetInactive("substitute image could not be loaded");
+        return;
+      }
+    }
     g_status.state = State::kReady;
     REXLOG_INFO("DLSS 5 NR (AMD): runtime built on {} at {}x{} (small model)", g_status.gpu, width,
                 height);
@@ -419,6 +644,21 @@ void Shutdown() {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   g_runtime.reset();
 #endif
+  if (g_substitute_device != VK_NULL_HANDLE) {
+    if (g_substitute_view != VK_NULL_HANDLE) {
+      g_substitute_destroy_view(g_substitute_device, g_substitute_view, nullptr);
+      g_substitute_view = VK_NULL_HANDLE;
+    }
+    if (g_substitute_image != VK_NULL_HANDLE) {
+      g_substitute_destroy_image(g_substitute_device, g_substitute_image, nullptr);
+      g_substitute_image = VK_NULL_HANDLE;
+    }
+    if (g_substitute_memory != VK_NULL_HANDLE) {
+      g_substitute_free_memory(g_substitute_device, g_substitute_memory, nullptr);
+      g_substitute_memory = VK_NULL_HANDLE;
+    }
+    g_substitute_device = VK_NULL_HANDLE;
+  }
 }
 
 }  // namespace rex::ui::dlss5_amd
