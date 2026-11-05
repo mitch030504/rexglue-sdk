@@ -33,6 +33,8 @@
 #include <rex/ui/vulkan/util.h>
 
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+#include <rex/runtime.h>
+
 #include "nr_runtime.hpp"
 
 namespace shaders {
@@ -110,9 +112,9 @@ REXCVAR_DEFINE_STRING(dlss5_live_dump, "", "GPU",
                       "for a byte-for-byte determinism comparison. Writes <prefix>-f<frame>-"
                       "colour.rgba, -motion.rg16f, -depth.r32f and -answer.rgba (raw, no header, "
                       "1920x1080 RGBA8 / RG16F / R32F / RGBA8) and <prefix>-f<frame>.json "
-                      "(extents, formats, per-file SHA-256). The copy is recorded in the live "
-                      "command buffer and read on a later live frame, so the queue is never "
-                      "waited on; the recorded frame itself is unchanged.")
+                      "(extents, formats, guest_frame, per-file SHA-256). The copy is recorded "
+                      "in the live command buffer and read on a later live frame, so the queue "
+                      "is never waited on; the recorded frame itself is unchanged.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(dlss5_live_dump_frame, -1, "GPU",
                      "Development: guest frame the live determinism dump records; -1 = the first "
@@ -236,6 +238,10 @@ bool g_live_dump_pending = false;
 bool g_live_dump_done = false;
 uint32_t g_live_dump_pending_slot = 0;
 uint64_t g_live_dump_pending_frame = 0;
+// The guest frame the recorded dump belongs to (see CurrentGuestFrameIndex);
+// captured with the copies, because the counter has advanced by the time the
+// pending dump is read back.
+int64_t g_live_dump_pending_guest_frame = -1;
 uint32_t g_live_dump_pending_scene_width = 0;
 uint32_t g_live_dump_pending_scene_height = 0;
 bool g_live_dump_pending_depth = false;
@@ -1198,6 +1204,22 @@ bool TransitionLiveImages(const vulkan::VulkanDevice& device, VkQueue queue, uin
 }
 
 // --- dlss5_live_dump helpers ---
+// The guest frame the recorded live frame belongs to: the command processor
+// increments this once per XE_SWAP packet it actually processes, in stream
+// order, so the value read during a frame's composition draw is that frame's
+// zero-based index. It is the value the presenter stamps onto
+// guest_output_properties.frame_index, so a presenter (FSR) dump named with
+// that index is the same guest frame as this one. GuestSwapCount() is not used:
+// that is the CPU-side VdSwap count, which the command processor's own frame
+// advance deliberately avoids because it can be ahead of the processed stream.
+// Returns -1 when no guest runtime is attached (offline tooling).
+int64_t CurrentGuestFrameIndex() {
+  const rex::Runtime* const runtime = rex::Runtime::instance();
+  const rex::system::IGraphicsSystem* const graphics =
+      runtime != nullptr ? runtime->graphics_system() : nullptr;
+  return graphics != nullptr ? int64_t(graphics->guest_frame_count()) : -1;
+}
+
 // The files are named <prefix>-f<frame>-<kind><ext>; the prefix is a path base
 // (a directory plus a run name), and the frame keeps two runs' files apart.
 std::string LiveDumpFilePath(const std::string& prefix, uint64_t frame, const char* kind,
@@ -1279,7 +1301,10 @@ void ConsumePendingLiveDump() {
                 uint64_t(g_live_dump_image_bytes), shas[i]);
   }
   // The JSON is the run's index: it names the extents, formats and each file's
-  // hash so a comparison script does not need the log.
+  // hash so a comparison script does not need the log. guest_frame is the
+  // guest frame index the presenter gives the same frame, so it aligns with a
+  // presenter (FSR) temporal dump of that frame; frame is the command
+  // processor's own frame id (normally guest_frame + 1).
   const std::string json_path = prefix + "-f" + std::to_string(frame) + ".json";
   std::ofstream json(json_path);
   if (!json) {
@@ -1288,6 +1313,7 @@ void ConsumePendingLiveDump() {
   }
   json << "{\n";
   json << "  \"frame\": " << frame << ",\n";
+  json << "  \"guest_frame\": " << g_live_dump_pending_guest_frame << ",\n";
   json << "  \"extent\": [" << g_live_width << ", " << g_live_height << "],\n";
   json << "  \"scene_extent\": [" << g_live_dump_pending_scene_width << ", "
        << g_live_dump_pending_scene_height << "],\n";
@@ -1307,9 +1333,11 @@ void ConsumePendingLiveDump() {
     REXGPU_WARN("dlss5_live_dump: short write to {}", json_path);
     return;
   }
-  REXGPU_INFO("dlss5_live_dump frame={} json={} extent={}x{} scene={}x{} depth={} answer={}",
-              frame, json_path, g_live_width, g_live_height, g_live_dump_pending_scene_width,
-              g_live_dump_pending_scene_height, g_live_dump_pending_depth ? "engine" : "none",
+  REXGPU_INFO("dlss5_live_dump frame={} guest_frame={} json={} extent={}x{} scene={}x{} depth={} "
+              "answer={}",
+              frame, g_live_dump_pending_guest_frame, json_path, g_live_width, g_live_height,
+              g_live_dump_pending_scene_width, g_live_dump_pending_scene_height,
+              g_live_dump_pending_depth ? "engine" : "none",
               g_live_dump_pending_in_place ? "in-place" : "target");
 }
 
@@ -1429,6 +1457,7 @@ bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functi
   g_live_dump_done = true;
   g_live_dump_pending_slot = descriptor_slot;
   g_live_dump_pending_frame = frame;
+  g_live_dump_pending_guest_frame = CurrentGuestFrameIndex();
   g_live_dump_pending_scene_width = scene_width;
   g_live_dump_pending_scene_height = scene_height;
   g_live_dump_pending_depth = depth_enabled;
