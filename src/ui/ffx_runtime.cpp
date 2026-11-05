@@ -100,6 +100,10 @@ static const Functions kLinked = {ffxCreateContext, ffxDestroyContext, ffxConfig
 
 namespace {
 
+// Set by ForceLinkedBackend() when the provider loaded but cannot be used (context creation
+// failed); Get() then serves the linked backend for the rest of the process.
+std::atomic<bool> g_force_linked{false};
+
 // ABI caveat: a 2.4.0-era provider .so (FSR 4.1.2) speaks the SDK 2.x ffxApi ABI, where
 // ffxCreateBackendVKDesc carries the device in a VkDeviceContext struct (see the
 // REX_FIDELITYFX_PREBUILT split in vulkan_presenter.cpp:323-330). This translation unit only
@@ -117,7 +121,13 @@ const Functions* LoadVulkanProvider(Loaded& loaded) {
     if (!rex::ui::fsr4::Selected()) {
       return;
     }
-    constexpr const char* kLibraryName = "amd_fidelityfx_upscaler_vk.so";
+    // Both names are in use: an fsr4-vk-style build produces
+    // libamd_fidelityfx_upscaler_vk.so, while the Windows signed DLL and some
+    // hand-built providers use amd_fidelityfx_upscaler_vk.so.
+    constexpr const char* kLibraryNames[] = {
+        "amd_fidelityfx_upscaler_vk.so",
+        "libamd_fidelityfx_upscaler_vk.so",
+    };
     void* module = nullptr;
     std::string loaded_from;
     std::string searched;
@@ -125,21 +135,26 @@ const Functions* LoadVulkanProvider(Loaded& loaded) {
     dlerror();  // Clear any stale error.
     // The executable directory first, then fsr4_data_path.
     for (const std::filesystem::path& folder : rex::ui::fsr4::LibrarySearchPaths()) {
-      const std::filesystem::path candidate = folder / kLibraryName;
-      searched += candidate.string();
-      searched += ", ";
-      module = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL);
-      if (module) {
-        loaded_from = candidate.string();
-        break;
+      for (const char* library_name : kLibraryNames) {
+        const std::filesystem::path candidate = folder / library_name;
+        searched += candidate.string();
+        searched += ", ";
+        module = dlopen(candidate.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (module) {
+          loaded_from = candidate.string();
+          break;
+        }
+        if (const char* error = dlerror()) {
+          last_error = error;
+        }
       }
-      if (const char* error = dlerror()) {
-        last_error = error;
+      if (module) {
+        break;
       }
     }
     if (!module) {
-      rex::ui::fsr4::SetProviderUnavailable("cannot load " + std::string(kLibraryName) +
-                                            " (searched " + searched + ")" +
+      rex::ui::fsr4::SetProviderUnavailable("cannot load amd_fidelityfx_upscaler_vk.so "
+                                            "(searched " + searched + ")" +
                                             (last_error.empty() ? "" : ": " + last_error));
       return;
     }
@@ -151,8 +166,7 @@ const Functions* LoadVulkanProvider(Loaded& loaded) {
     f.Dispatch = reinterpret_cast<PfnFfxDispatch>(dlsym(module, "ffxDispatch"));
     loaded.ok = f.CreateContext && f.DestroyContext && f.Configure && f.Query && f.Dispatch;
     if (!loaded.ok) {
-      rex::ui::fsr4::SetProviderUnavailable(std::string(kLibraryName) +
-                                            " is missing API entry points");
+      rex::ui::fsr4::SetProviderUnavailable("the FSR 4 provider is missing ffx API entry points");
       dlclose(module);
       return;
     }
@@ -168,7 +182,7 @@ const Functions* LoadVulkanProvider(Loaded& loaded) {
 
 const Functions* Get(Api api) {
   static Loaded vulkan_provider;
-  if (api == Api::kVulkan) {
+  if (api == Api::kVulkan && !g_force_linked.load(std::memory_order_relaxed)) {
     // The FSR 4 provider .so when fsr4 is on and loadable; any failure is recorded in
     // rex::ui::fsr4::GetStatus() and falls back to the linked build below.
     if (const Functions* functions = LoadVulkanProvider(vulkan_provider)) {
@@ -177,6 +191,17 @@ const Functions* Get(Api api) {
   }
   return &kLinked;
 }
+
+void ForceLinkedBackend(const char* reason) {
+  if (g_force_linked.exchange(true)) {
+    return;
+  }
+  rex::ui::fsr4::SetProviderUnavailable(reason != nullptr ? reason : "the FSR 4 provider is unusable");
+  REXLOG_WARN("FidelityFX: FSR 4 provider dropped ({}); using the linked FSR 3.1 backend",
+              reason != nullptr ? reason : "unusable");
+}
+
+bool IsProviderActive() { return !g_force_linked.load(std::memory_order_relaxed); }
 
 const Functions* GetAny() {
   return Get(Api::kVulkan);

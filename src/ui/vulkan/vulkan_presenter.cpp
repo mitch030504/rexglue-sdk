@@ -333,10 +333,16 @@ bool VulkanPresenter::EnsureTemporalUpscalerContext(uint32_t render_width, uint3
 
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
     if (ffx_functions->CreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
-      REXLOG_WARN(
-          "VulkanPresenter: Failed to create FidelityFX temporal upscaler "
-          "context");
       temporal_upscaler_context_ = nullptr;
+      // The FSR 4 provider loaded but cannot create a context on this device (for example a
+      // missing cooperative-matrix/float8 feature). Drop it and serve the linked FSR 3.1
+      // backend for the rest of the process instead of losing temporal upscaling entirely.
+      if (ffx::IsProviderActive()) {
+        ffx::ForceLinkedBackend("FSR 4 provider failed to create a context");
+        return EnsureTemporalUpscalerContext(render_width, render_height, output_width,
+                                             output_height);
+      }
+      REXLOG_WARN("VulkanPresenter: Failed to create FidelityFX temporal upscaler context");
       return false;
     }
 

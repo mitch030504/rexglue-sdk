@@ -38,6 +38,16 @@ const Functions* Get(Api api);
 /// Whichever runtime is available, for queries that don't depend on the graphics API.
 const Functions* GetAny();
 
+/// Drops the user-supplied FSR 4 provider for the rest of the process and serves the linked
+/// backend instead. Called when the provider loaded but cannot create a context (for example a
+/// device without the required cooperative-matrix/float8 features), so the presenter can retry
+/// the frame with the FSR 3.1 path instead of falling back to spatial upscaling.
+void ForceLinkedBackend(const char* reason);
+
+/// Whether Get(kVulkan) is still serving the user-supplied provider (false once the provider was
+/// dropped, and always false in a source build that has no provider).
+bool IsProviderActive();
+
 }  // namespace rex::ui::ffx
 
 #endif
