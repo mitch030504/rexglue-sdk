@@ -517,6 +517,21 @@ class VulkanPresenter final : public Presenter {
   uint32_t temporal_last_output_width_ = 0;
   uint32_t temporal_last_output_height_ = 0;
   std::chrono::steady_clock::time_point temporal_last_time_;
+  // Development timings for the FidelityFX dispatch (present_temporal_gpu_log). A small ring of
+  // timestamp pairs read back several dispatches later, so the paint thread never waits on the GPU.
+  static constexpr uint32_t kTemporalGpuTimingSlots = 8;
+  struct TemporalGpuTiming {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    float timestamp_period_ns = 0.0f;
+    uint32_t next_slot = 0;
+    uint64_t recorded = 0;
+    uint64_t slot_frame[kTemporalGpuTimingSlots] = {};
+    bool initialized = false;
+  } temporal_gpu_timing_;
+  void EnsureTemporalGpuTiming();
+  void BeginTemporalGpuTiming(VkCommandBuffer command_buffer);
+  void EndTemporalGpuTiming(VkCommandBuffer command_buffer, uint64_t frame_index);
+  void ReadTemporalGpuTiming();
   // An xess_context_handle_t, kept opaque so this header doesn't need the XeSS SDK.
   void* xess_context_ = nullptr;
   uint32_t xess_input_width_ = 0;

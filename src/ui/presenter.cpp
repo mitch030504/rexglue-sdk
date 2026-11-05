@@ -65,6 +65,9 @@ REXCVAR_DEFINE_STRING(
 REXCVAR_DEFINE_INT32(present_temporal_dump_interval, 300, "UI/Presenter",
                      "Guest frames between present_temporal_dump_prefix images.")
     .range(1, 1000000);
+REXCVAR_DEFINE_BOOL(present_temporal_gpu_log, false, "UI/Presenter",
+                    "Development: log temporal_gpu_ms=<ms> frame=<n> backend=<fsr3|fsr4> for every "
+                    "FidelityFX temporal upscaler dispatch (timestamps around the GPU work).");
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");

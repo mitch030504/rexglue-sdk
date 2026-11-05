@@ -26,6 +26,7 @@ REXCVAR_DECLARE(std::string, present_fsr_quality_mode);
 REXCVAR_DECLARE(bool, present_dither);
 REXCVAR_DECLARE(std::string, present_temporal_dump_prefix);
 REXCVAR_DECLARE(int32_t, present_temporal_dump_interval);
+REXCVAR_DECLARE(bool, present_temporal_gpu_log);
 REXCVAR_DECLARE(bool, present_allow_overscan_cutoff);
 REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
 REXCVAR_DECLARE(int32_t, window_width);

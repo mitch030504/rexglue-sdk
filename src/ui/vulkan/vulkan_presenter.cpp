@@ -227,6 +227,12 @@ VulkanPresenter::~VulkanPresenter() {
   DestroyXessContext();
   DestroyDlss();
   temporal_inputs_.reset();
+  // The paint submissions were awaited above, so no timestamp query can still be in use.
+  if (temporal_gpu_timing_.pool != VK_NULL_HANDLE) {
+    vulkan_device_->functions().vkDestroyQueryPool(vulkan_device_->device(),
+                                                   temporal_gpu_timing_.pool, nullptr);
+    temporal_gpu_timing_.pool = VK_NULL_HANDLE;
+  }
   temporal::SetInactive();
 #endif
 
@@ -451,6 +457,99 @@ bool VulkanPresenter::TemporalUpscalerHasFrame(uint64_t frame_index, VkImage out
   return temporal_last_output_image_ == output_image && temporal_last_frame_index_ == frame_index &&
          temporal_last_output_width_ == output_width &&
          temporal_last_output_height_ == output_height;
+}
+
+void VulkanPresenter::EnsureTemporalGpuTiming() {
+  TemporalGpuTiming& timing = temporal_gpu_timing_;
+  if (timing.initialized) {
+    return;
+  }
+  timing.initialized = true;
+  const VulkanInstance* instance = vulkan_device_->vulkan_instance();
+  VkPhysicalDeviceProperties properties = {};
+  instance->functions().vkGetPhysicalDeviceProperties(vulkan_device_->physical_device(),
+                                                       &properties);
+  uint32_t family_count = 0;
+  instance->functions().vkGetPhysicalDeviceQueueFamilyProperties(
+      vulkan_device_->physical_device(), &family_count, nullptr);
+  std::vector<VkQueueFamilyProperties> families(family_count);
+  instance->functions().vkGetPhysicalDeviceQueueFamilyProperties(
+      vulkan_device_->physical_device(), &family_count, families.data());
+  const uint32_t family = vulkan_device_->queue_family_graphics_compute();
+  if (family >= families.size() || families[family].timestampValidBits == 0 ||
+      properties.limits.timestampPeriod <= 0.0f) {
+    REXLOG_WARN(
+        "VulkanPresenter: the graphics queue has no GPU timestamps; present_temporal_gpu_log is "
+        "inactive");
+    return;
+  }
+  VkQueryPoolCreateInfo create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  create_info.queryCount = kTemporalGpuTimingSlots * 2;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  if (dfn.vkCreateQueryPool(vulkan_device_->device(), &create_info, nullptr, &timing.pool) !=
+      VK_SUCCESS) {
+    timing.pool = VK_NULL_HANDLE;
+    REXLOG_WARN(
+        "VulkanPresenter: cannot create the GPU timing query pool; present_temporal_gpu_log is "
+        "inactive");
+    return;
+  }
+  timing.timestamp_period_ns = properties.limits.timestampPeriod;
+}
+
+void VulkanPresenter::BeginTemporalGpuTiming(VkCommandBuffer command_buffer) {
+  TemporalGpuTiming& timing = temporal_gpu_timing_;
+  if (timing.pool == VK_NULL_HANDLE) {
+    return;
+  }
+  const uint32_t base = timing.next_slot * 2;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  // A pair is reused every kTemporalGpuTimingSlots dispatches, more than the paint submission
+  // count, so it is never reset while still pending.
+  dfn.vkCmdResetQueryPool(command_buffer, timing.pool, base, 2);
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing.pool, base);
+}
+
+void VulkanPresenter::EndTemporalGpuTiming(VkCommandBuffer command_buffer, uint64_t frame_index) {
+  TemporalGpuTiming& timing = temporal_gpu_timing_;
+  if (timing.pool == VK_NULL_HANDLE) {
+    return;
+  }
+  const uint32_t slot = timing.next_slot;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing.pool,
+                          slot * 2 + 1);
+  timing.slot_frame[slot] = frame_index;
+  timing.next_slot = (slot + 1) % kTemporalGpuTimingSlots;
+  ++timing.recorded;
+  ReadTemporalGpuTiming();
+}
+
+void VulkanPresenter::ReadTemporalGpuTiming() {
+  TemporalGpuTiming& timing = temporal_gpu_timing_;
+  if (timing.pool == VK_NULL_HANDLE || timing.recorded <= kTemporalGpuTimingSlots) {
+    return;
+  }
+  // next_slot is the oldest recorded pair: several dispatches have been submitted since, so the
+  // read does not wait. VK_NOT_READY just drops this sample.
+  const uint32_t slot = timing.next_slot;
+  uint64_t stamps[2] = {};
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  if (dfn.vkGetQueryPoolResults(vulkan_device_->device(), timing.pool, slot * 2, 2,
+                                sizeof(stamps), stamps, sizeof(uint64_t),
+                                VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  if (stamps[1] <= stamps[0]) {
+    return;
+  }
+  const double ms = double(stamps[1] - stamps[0]) * double(timing.timestamp_period_ns) / 1e6;
+  if (REXCVAR_GET(present_temporal_gpu_log)) {
+    REXLOG_INFO("temporal_gpu_ms={:.3f} frame={} backend={}", ms, timing.slot_frame[slot],
+                ffx::IsProviderActive() ? "fsr4" : "fsr3");
+  }
 }
 
 void VulkanPresenter::DestroyDlss() {
@@ -815,9 +914,18 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
     dispatch_desc.viewSpaceToMetersFactor = 1.0f;
     dispatch_desc.flags = 0;
 
+    const bool gpu_timing = REXCVAR_GET(present_temporal_gpu_log);
+    if (gpu_timing) {
+      EnsureTemporalGpuTiming();
+      BeginTemporalGpuTiming(command_buffer);
+    }
     ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
     const ffxReturnCode_t dispatch_result =
         ffx::Get(ffx::Api::kVulkan)->Dispatch(context, &dispatch_desc.header);
+    if (gpu_timing) {
+      // Closes the pair even when the dispatch fails, so a broken frame cannot leave a slot open.
+      EndTemporalGpuTiming(command_buffer, frame_index);
+    }
     if (dispatch_result != FFX_API_RETURN_OK) {
       static std::atomic<bool> logged = false;
       if (!logged.exchange(true)) {
