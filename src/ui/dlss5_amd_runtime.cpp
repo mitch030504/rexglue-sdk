@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -104,6 +105,21 @@ REXCVAR_DEFINE_BOOL(dlss5_live_no_substitute, false, "GPU",
                     "Development: record live NR but keep the guest composition source (isolates "
                     "the substitute descriptor from the split and the record).")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(dlss5_live_dump, "", "GPU",
+                      "Development (dlss5_amd_mode=3): if non-empty, one live frame is read back "
+                      "for a byte-for-byte determinism comparison. Writes <prefix>-f<frame>-"
+                      "colour.rgba, -motion.rg16f, -depth.r32f and -answer.rgba (raw, no header, "
+                      "1920x1080 RGBA8 / RG16F / R32F / RGBA8) and <prefix>-f<frame>.json "
+                      "(extents, formats, per-file SHA-256). The copy is recorded in the live "
+                      "command buffer and read on a later live frame, so the queue is never "
+                      "waited on; the recorded frame itself is unchanged.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(dlss5_live_dump_frame, -1, "GPU",
+                     "Development: guest frame the live determinism dump records; -1 = the first "
+                     "frame live NR records. The files are written once, on the next live frame "
+                     "whose descriptor slot proves the copy's submission completed.")
+    .range(-1, 1000000000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
 namespace {
@@ -187,6 +203,8 @@ VkImageLayout g_live_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 // The view substituted for the composition source: the NR target when the
 // runtime takes a separate target, else the in-place colour answer.
 VkImageView g_live_substitute_view = VK_NULL_HANDLE;
+// The image behind g_live_substitute_view, for the determinism dump's answer copy.
+VkImage g_live_substitute_image = VK_NULL_HANDLE;
 VkSampler g_live_sampler = VK_NULL_HANDLE;
 VkDescriptorSetLayout g_live_set_layout = VK_NULL_HANDLE;
 std::unique_ptr<vulkan::SingleLayoutDescriptorSetPool> g_live_pool;
@@ -194,6 +212,40 @@ VkDescriptorSet g_live_sets[kLiveDescriptorSlots] = {};
 VkPipelineLayout g_live_pipeline_layout = VK_NULL_HANDLE;
 VkPipeline g_live_pipeline = VK_NULL_HANDLE;
 bool g_live_resources_failed = false;
+
+// --- Live determinism dump (dlss5_live_dump) ---
+// One host-visible buffer holding the four 1920x1080 images at fixed offsets
+// (colour RGBA8, motion RG16F, depth R32F, answer RGBA8 - 4 bytes per pixel
+// each). It is created and mapped once at setup. A matching frame records the
+// four copies into it and sets pending; the next RecordLiveFrame call that
+// reuses the same seam slot reads it back. That slot is only handed out after
+// the submission following the live command buffer has completed, so the copy
+// is provably done: the queue is never waited on and the host never reads a
+// buffer that may still be in flight. One frame, one buffer, no per-frame
+// allocation.
+VkBuffer g_live_dump_buffer = VK_NULL_HANDLE;
+VkDeviceMemory g_live_dump_memory = VK_NULL_HANDLE;
+void* g_live_dump_mapped = nullptr;
+VkDeviceSize g_live_dump_image_bytes = 0;
+// Cached at setup: both cvars are kInitOnly, and the recorded-frame path must
+// not allocate or look anything up per frame.
+bool g_live_dump_enabled = false;
+std::string g_live_dump_prefix;
+int32_t g_live_dump_frame = -1;
+bool g_live_dump_pending = false;
+bool g_live_dump_done = false;
+uint32_t g_live_dump_pending_slot = 0;
+uint64_t g_live_dump_pending_frame = 0;
+uint32_t g_live_dump_pending_scene_width = 0;
+uint32_t g_live_dump_pending_scene_height = 0;
+bool g_live_dump_pending_depth = false;
+bool g_live_dump_pending_in_place = false;
+
+// Defined below, after the SHA-256 helper (the dump hashes the readback).
+void ConsumePendingLiveDump();
+bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                         uint64_t frame, uint32_t scene_width, uint32_t scene_height,
+                         bool takes_target, bool depth_enabled, uint32_t descriptor_slot);
 #endif  // REX_HAS_DLSS5_AMD
 
 // --- SHA-256 (FIPS 180-4), for the model pin. Small and self-contained so the
@@ -473,6 +525,14 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   const vulkan::VulkanDevice::Functions& dfn = device.functions();
   const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
+  // A pending determinism dump is read back only when this call reuses the seam
+  // slot its copies were recorded with: the command processor hands that slot
+  // out only after the submission that followed the live command buffer has
+  // completed, so the copy is done. Never wait on the queue here.
+  if (g_live_dump_pending && input.descriptor_slot == g_live_dump_pending_slot) {
+    ConsumePendingLiveDump();
+  }
+
   // Rebind the slot's descriptor set for this frame: the guide buffer is
   // persistent but may have been recreated by a cache clear, and the guest
   // colour view changes as the texture cache re-creates textures. The caller
@@ -653,6 +713,10 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
                                &to_sampled);
       g_live_colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
+    // The dump copies are recorded after the answer is final, in this same
+    // command buffer; they restore every image to the layout tracked above.
+    RecordLiveDumpFrame(cmd, dfn, input.frame, input.colour_width, input.colour_height,
+                        takes_target, has_depth, input.descriptor_slot);
     REXGPU_INFO("dlss5_live frame={} BYPASS pre-upscale only ({}x{} -> {}x{})", input.frame,
                 input.colour_width, input.colour_height, g_live_width, g_live_height);
     ReportRecordedFrame(true, 0.0f);
@@ -755,6 +819,11 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   if (takes_target) {
     g_live_target_layout = engine_frame.target.after;
   }
+  // The dump copies run after record_engine, when colour/motion/depth and the
+  // answer hold this frame's final values; the helper restores each image to
+  // the layout tracked above, so the composition still sees the same layouts.
+  RecordLiveDumpFrame(cmd, dfn, input.frame, input.colour_width, input.colour_height, takes_target,
+                      has_depth, input.descriptor_slot);
   REXGPU_INFO("dlss5_live frame={} applied={} dispatches={} history_consumed={} provider={} "
               "gpu_ms={:.3f} reset={} extent={}x{} scene={}x{} depth={}",
               input.frame, result.frame.applied ? 1 : 0, result.frame.network_dispatches,
@@ -1128,6 +1197,249 @@ bool TransitionLiveImages(const vulkan::VulkanDevice& device, VkQueue queue, uin
   return ok;
 }
 
+// --- dlss5_live_dump helpers ---
+// The files are named <prefix>-f<frame>-<kind><ext>; the prefix is a path base
+// (a directory plus a run name), and the frame keeps two runs' files apart.
+std::string LiveDumpFilePath(const std::string& prefix, uint64_t frame, const char* kind,
+                             const char* extension) {
+  return prefix + "-f" + std::to_string(frame) + "-" + kind + extension;
+}
+
+std::string JsonEscape(const std::string& text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (const char c : text) {
+    if (c == '\\' || c == '"') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
+// Hash the bytes the GPU produced, then write them raw. The hash is computed
+// from the mapping rather than the file so a short write still names the bytes
+// that were recorded.
+bool WriteLiveDumpFile(const std::string& path, const void* data, size_t size,
+                       std::string& sha256) {
+  Sha256 ctx;
+  Sha256Update(ctx, static_cast<const uint8_t*>(data), size);
+  sha256 = Sha256Final(ctx);
+  std::FILE* const file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    return false;
+  }
+  const size_t written = std::fwrite(data, 1, size, file);
+  std::fclose(file);
+  return written == size;
+}
+
+// Reads the pending dump back on the CPU. Called only from RecordLiveFrame,
+// only when the same seam slot is handed out again - that reuse is the proof
+// the submission containing the copies has completed, so nothing here waits.
+void ConsumePendingLiveDump() {
+  if (!g_live_dump_pending) {
+    return;
+  }
+  g_live_dump_pending = false;
+  if (g_live_dump_buffer == VK_NULL_HANDLE || g_live_dump_mapped == nullptr ||
+      g_live_device == nullptr || g_live_dump_image_bytes == 0) {
+    REXGPU_WARN("dlss5_live_dump: readback unavailable, frame={} dropped",
+                g_live_dump_pending_frame);
+    return;
+  }
+  const vulkan::VulkanDevice::Functions& dfn = g_live_device->functions();
+  const VkDevice device = g_live_device->device();
+  // The readback memory is host-visible but not necessarily coherent, so the
+  // CPU view is only valid after invalidation (the motion_dump does the same).
+  VkMappedMemoryRange mapped{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  mapped.memory = g_live_dump_memory;
+  mapped.offset = 0;
+  mapped.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped);
+
+  const std::string& prefix = g_live_dump_prefix;
+  const uint64_t frame = g_live_dump_pending_frame;
+  static constexpr const char* kKinds[4] = {"colour", "motion", "depth", "answer"};
+  static constexpr const char* kExtensions[4] = {".rgba", ".rg16f", ".r32f", ".rgba"};
+  static constexpr const char* kFormats[4] = {"R8G8B8A8_UNORM", "R16G16_SFLOAT", "R32_SFLOAT",
+                                              "R8G8B8A8_UNORM"};
+  const auto* const base = static_cast<const uint8_t*>(g_live_dump_mapped);
+  std::string paths[4];
+  std::string shas[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    paths[i] = LiveDumpFilePath(prefix, frame, kKinds[i], kExtensions[i]);
+    if (!WriteLiveDumpFile(paths[i], base + VkDeviceSize(i) * g_live_dump_image_bytes,
+                           size_t(g_live_dump_image_bytes), shas[i])) {
+      REXGPU_WARN("dlss5_live_dump: can't write {} ({} bytes)", paths[i],
+                  uint64_t(g_live_dump_image_bytes));
+      continue;
+    }
+    REXGPU_INFO("dlss5_live_dump frame={} file={} bytes={} sha256={}", frame, paths[i],
+                uint64_t(g_live_dump_image_bytes), shas[i]);
+  }
+  // The JSON is the run's index: it names the extents, formats and each file's
+  // hash so a comparison script does not need the log.
+  const std::string json_path = prefix + "-f" + std::to_string(frame) + ".json";
+  std::ofstream json(json_path);
+  if (!json) {
+    REXGPU_WARN("dlss5_live_dump: can't write {}", json_path);
+    return;
+  }
+  json << "{\n";
+  json << "  \"frame\": " << frame << ",\n";
+  json << "  \"extent\": [" << g_live_width << ", " << g_live_height << "],\n";
+  json << "  \"scene_extent\": [" << g_live_dump_pending_scene_width << ", "
+       << g_live_dump_pending_scene_height << "],\n";
+  json << "  \"bytes_per_image\": " << uint64_t(g_live_dump_image_bytes) << ",\n";
+  json << "  \"depth_enabled\": " << (g_live_dump_pending_depth ? "true" : "false") << ",\n";
+  json << "  \"answer_in_place\": " << (g_live_dump_pending_in_place ? "true" : "false") << ",\n";
+  json << "  \"images\": {\n";
+  for (uint32_t i = 0; i < 4; ++i) {
+    json << "    \"" << kKinds[i] << "\": {\"file\": \"" << JsonEscape(paths[i])
+         << "\", \"format\": \"" << kFormats[i] << "\", \"bytes\": "
+         << uint64_t(g_live_dump_image_bytes) << ", \"sha256\": \"" << shas[i] << "\"}"
+         << (i + 1 < 4 ? "," : "") << "\n";
+  }
+  json << "  }\n}\n";
+  json.close();
+  if (!json) {
+    REXGPU_WARN("dlss5_live_dump: short write to {}", json_path);
+    return;
+  }
+  REXGPU_INFO("dlss5_live_dump frame={} json={} extent={}x{} scene={}x{} depth={} answer={}",
+              frame, json_path, g_live_width, g_live_height, g_live_dump_pending_scene_width,
+              g_live_dump_pending_scene_height, g_live_dump_pending_depth ? "engine" : "none",
+              g_live_dump_pending_in_place ? "in-place" : "target");
+}
+
+// Records the four dump copies into the live command buffer after the answer is
+// final and restores every image to the layout the caller tracked. Returns true
+// when this frame recorded the dump.
+bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                         uint64_t frame, uint32_t scene_width, uint32_t scene_height,
+                         bool takes_target, bool depth_enabled, uint32_t descriptor_slot) {
+  if (g_live_dump_done || g_live_dump_pending || !g_live_dump_enabled ||
+      g_live_dump_buffer == VK_NULL_HANDLE || g_live_dump_image_bytes == 0) {
+    return false;
+  }
+  // -1 is the first frame that reaches this point, i.e. the first frame live NR
+  // records (record_engine or the bypass copy succeeded above).
+  if (g_live_dump_frame >= 0 && uint64_t(g_live_dump_frame) != frame) {
+    return false;
+  }
+  if (g_live_colour == VK_NULL_HANDLE || g_live_motion == VK_NULL_HANDLE ||
+      g_live_depth == VK_NULL_HANDLE || g_live_substitute_image == VK_NULL_HANDLE) {
+    return false;
+  }
+  // Colour, motion, depth and the answer at four fixed offsets. All four live
+  // images are 4 bytes per pixel (RGBA8 / RG16F / R32F / RGBA8), so the offset
+  // stride is one image's byte size. In-place live NR makes the answer the
+  // colour image itself; slot 3 then duplicates slot 0 and the JSON says so.
+  struct DumpCopy {
+    VkImage image;
+    VkImageLayout layout;
+    VkDeviceSize offset;
+  };
+  const DumpCopy copies[4] = {
+      {g_live_colour, g_live_colour_layout, 0},
+      {g_live_motion, g_live_motion_layout, g_live_dump_image_bytes},
+      {g_live_depth, g_live_depth_layout, 2 * g_live_dump_image_bytes},
+      {g_live_substitute_image,
+       takes_target ? g_live_target_layout : g_live_colour_layout,
+       3 * g_live_dump_image_bytes},
+  };
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageMemoryBarrier src[4] = {};
+  uint32_t src_count = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    bool duplicate = false;
+    for (uint32_t j = 0; j < i; ++j) {
+      duplicate = duplicate || copies[j].image == copies[i].image;
+    }
+    if (duplicate) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = src[src_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = copies[i].layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = copies[i].image;
+    barrier.subresourceRange = range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, src_count,
+                           src);
+  for (const DumpCopy& copy : copies) {
+    VkBufferImageCopy region{};
+    region.bufferOffset = copy.offset;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {g_live_width, g_live_height, 1};
+    dfn.vkCmdCopyImageToBuffer(cmd, copy.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               g_live_dump_buffer, 1, &region);
+  }
+  // Back to exactly the layout the caller tracked, so the composition draw and
+  // the next frame see the same state as without the dump.
+  VkImageMemoryBarrier dst[4] = {};
+  uint32_t dst_count = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    bool duplicate = false;
+    for (uint32_t j = 0; j < i; ++j) {
+      duplicate = duplicate || copies[j].image == copies[i].image;
+    }
+    if (duplicate) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = dst[dst_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = copies[i].layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = copies[i].image;
+    barrier.subresourceRange = range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                           dst_count, dst);
+  // Host visibility for the readback that happens after the submission completes.
+  VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_host.buffer = g_live_dump_buffer;
+  to_host.offset = 0;
+  to_host.size = VK_WHOLE_SIZE;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                           nullptr, 1, &to_host, 0, nullptr);
+
+  g_live_dump_pending = true;
+  g_live_dump_done = true;
+  g_live_dump_pending_slot = descriptor_slot;
+  g_live_dump_pending_frame = frame;
+  g_live_dump_pending_scene_width = scene_width;
+  g_live_dump_pending_scene_height = scene_height;
+  g_live_dump_pending_depth = depth_enabled;
+  g_live_dump_pending_in_place = !takes_target;
+  if (REXCVAR_GET(dlss5_live_trace)) {
+    REXGPU_INFO("dlss5_live_dump frame={} copies recorded ({} bytes/image, slot={})", frame,
+                uint64_t(g_live_dump_image_bytes), descriptor_slot);
+  }
+  return true;
+}
+
 bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family) {
   if (g_live_resources_failed) {
     return false;
@@ -1198,6 +1510,41 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
             &device, null_info, vulkan::util::MemoryPurpose::kDeviceLocal, g_live_null_depth,
             g_live_null_depth_memory)) {
       return fail("null depth image");
+    }
+  }
+  // The optional determinism dump: one host-visible buffer for all four images,
+  // sized for at least 1920x1080 each (every live image is 4 bytes per pixel).
+  // Created and mapped here so the recorded-frame path never allocates or maps;
+  // a failure only disables the dump, never live NR.
+  if (!REXCVAR_GET(dlss5_live_dump).empty()) {
+    const VkDeviceSize pixels = std::max<VkDeviceSize>(
+        VkDeviceSize(g_live_width) * VkDeviceSize(g_live_height),
+        VkDeviceSize(1920) * VkDeviceSize(1080));
+    g_live_dump_image_bytes = pixels * 4;
+    const VkDeviceSize dump_bytes = g_live_dump_image_bytes * 4;
+    if (!vulkan::util::CreateDedicatedAllocationBuffer(
+            &device, dump_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            vulkan::util::MemoryPurpose::kReadback, g_live_dump_buffer,
+            g_live_dump_memory)) {
+      REXLOG_WARN("DLSS 5 NR (AMD): failed to create the dlss5_live_dump readback buffer "
+                  "({} bytes) - the dump is off, live NR is unaffected",
+                  uint64_t(dump_bytes));
+      g_live_dump_image_bytes = 0;
+    } else if (dfn.vkMapMemory(vk_device, g_live_dump_memory, 0, VK_WHOLE_SIZE, 0,
+                               &g_live_dump_mapped) != VK_SUCCESS) {
+      g_live_dump_mapped = nullptr;
+      REXLOG_WARN("DLSS 5 NR (AMD): failed to map the dlss5_live_dump readback buffer - "
+                  "the dump is off, live NR is unaffected");
+      vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, vk_device, g_live_dump_buffer);
+      vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, vk_device, g_live_dump_memory);
+      g_live_dump_image_bytes = 0;
+    } else {
+      g_live_dump_prefix = REXCVAR_GET(dlss5_live_dump);
+      g_live_dump_frame = REXCVAR_GET(dlss5_live_dump_frame);
+      g_live_dump_enabled = true;
+      REXLOG_INFO("DLSS 5 NR (AMD): live determinism dump enabled, prefix {} ({} bytes, "
+                  "{} bytes per image)",
+                  g_live_dump_prefix, uint64_t(dump_bytes), uint64_t(g_live_dump_image_bytes));
     }
   }
   if (!CreateLiveView(device, g_live_target, VK_FORMAT_R8G8B8A8_UNORM, g_live_target_view) ||
@@ -1302,10 +1649,11 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   // Whether the runtime wants a separate answer image with the default controls;
   // that decides which view the composition substitutes.
   nr::Controls controls;
-  g_live_substitute_view =
-      g_runtime->takes_target(controls) ? g_live_target_view : g_live_colour_view;
+  const bool takes_target = g_runtime->takes_target(controls);
+  g_live_substitute_view = takes_target ? g_live_target_view : g_live_colour_view;
+  g_live_substitute_image = takes_target ? g_live_target : g_live_colour;
   REXLOG_INFO("DLSS 5 NR (AMD): live mode resources ready ({}x{}, target={}, {})", g_live_width,
-              g_live_height, g_runtime->takes_target(controls) ? "separate" : "in-place",
+              g_live_height, takes_target ? "separate" : "in-place",
               g_live_substitute_view == g_live_target_view ? "target view" : "colour view");
   return true;
 }
@@ -1458,6 +1806,22 @@ void Shutdown() {
     g_live_pool.reset();
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device, g_live_set_layout);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, g_live_sampler);
+    if (g_live_dump_pending) {
+      REXGPU_WARN("dlss5_live_dump: dropped frame={} with the live resources",
+                  g_live_dump_pending_frame);
+    }
+    g_live_dump_pending = false;
+    g_live_dump_done = false;
+    g_live_dump_enabled = false;
+    g_live_dump_prefix.clear();
+    g_live_dump_frame = -1;
+    g_live_dump_image_bytes = 0;
+    if (g_live_dump_mapped != nullptr) {
+      dfn.vkUnmapMemory(device, g_live_dump_memory);
+      g_live_dump_mapped = nullptr;
+    }
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, g_live_dump_buffer);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_dump_memory);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_target_view);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_colour_view);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_motion_view);
@@ -1474,6 +1838,7 @@ void Shutdown() {
     vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_depth_memory);
     vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_null_depth_memory);
     g_live_substitute_view = VK_NULL_HANDLE;
+    g_live_substitute_image = VK_NULL_HANDLE;
     g_live_target_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_live_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_live_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
