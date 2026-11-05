@@ -32,8 +32,17 @@ void ReportRecordedFrame(bool applied, float gpu_ms);
 // (base page 0x11C6F) uses this 1920x1080 view instead of the guest texture.
 // The substitute image is created UNORM; SubstituteView() returns the UNORM or
 // the SRGB reinterpret of it, selected by the dlss5_amd_view cvar.
+// The composition samples base page 0x11C6F twice per draw - once unsigned
+// (guest host view UNORM) and once signed (guest host view SNORM) - so
+// SubstituteViewForFetch() picks the view per fetch signedness:
+// dlss5_amd_view for unsigned fetches, dlss5_amd_signed_view (default SNORM,
+// domain-identical to the guest signed view) for signed ones.
 bool SubstituteEnabled();
 bool SubstituteForFrame(uint64_t frame);
 VkImageView SubstituteView();
+VkImageView SubstituteViewForFetch(bool is_signed);
+// The VkFormat of the view SubstituteViewForFetch() selects for this fetch
+// (for the one-shot substitution log).
+VkFormat SubstituteViewFormatForFetch(bool is_signed);
 
 }  // namespace rex::ui::dlss5_amd

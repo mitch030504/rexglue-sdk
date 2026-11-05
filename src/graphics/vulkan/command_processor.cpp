@@ -7156,19 +7156,31 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           for (const VulkanShader::TextureBinding& log_binding : *textures_pixel) {
             const xenos::xe_gpu_texture_fetch_t fetch =
                 register_file_->GetTextureFetch(log_binding.fetch_constant);
+            // Per 0x11C6F fetch, also log the substitute view format this
+            // fetch's signedness selects (0 = not a substituted fetch).
+            const uint32_t substituted_view_format =
+                fetch.base_address == 0x11C6Fu
+                    ? uint32_t(rex::ui::dlss5_amd::SubstituteViewFormatForFetch(
+                          bool(log_binding.is_signed)))
+                    : uint32_t(VK_FORMAT_UNDEFINED);
             REXGPU_INFO(
                 "nr_substitute fetch={} base={:05X} fmt={} sign={}/{}/{}/{} swizzle={:03X} "
-                "dim={} tiled={} num_format={} exp_adjust={} signed={} guest_view_format={}",
+                "dim={} tiled={} num_format={} exp_adjust={} signed={} guest_view_format={} "
+                "substituted_view_format={}",
                 log_binding.fetch_constant, fetch.base_address, uint32_t(fetch.format),
                 uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                 uint32_t(fetch.sign_w), fetch.swizzle, uint32_t(fetch.dimension),
                 fetch.tiled ? 1 : 0, uint32_t(fetch.num_format), int32_t(fetch.exp_adjust),
                 log_binding.is_signed ? 1 : 0,
                 uint32_t(texture_cache_->GetActiveBindingViewFormat(
-                    log_binding.fetch_constant, bool(log_binding.is_signed))));
+                    log_binding.fetch_constant, bool(log_binding.is_signed))),
+                substituted_view_format);
           }
         }
-        image_view = rex::ui::dlss5_amd::SubstituteView();
+        // Per-fetch view: the composition samples base page 0x11C6F twice per
+        // draw, once unsigned and once signed; each fetch gets the substitute
+        // view in its own domain (dlss5_amd_view / dlss5_amd_signed_view).
+        image_view = rex::ui::dlss5_amd::SubstituteViewForFetch(bool(texture_binding.is_signed));
       }
       descriptor_image_info.imageView = image_view;
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE

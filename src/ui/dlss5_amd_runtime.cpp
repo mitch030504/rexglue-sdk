@@ -53,11 +53,19 @@ REXCVAR_DEFINE_INT32(dlss5_amd_frame, -1, "GPU",
     .range(-1, 1000000000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(dlss5_amd_view, 1, "GPU",
-                     "Development: view format used for the substitute image - 0 = "
-                     "R8G8B8A8_UNORM (domain-identical to the guest composition fetch, which "
-                     "is UNORM end-to-end), 1 = R8G8B8A8_SRGB (legacy). The image itself is "
-                     "always created UNORM so both views are legal reinterprets.")
+                     "Development: view format used for the substitute image on UNSIGNED "
+                     "fetches - 0 = R8G8B8A8_UNORM (domain-identical to the guest composition "
+                     "fetch, which is UNORM end-to-end), 1 = R8G8B8A8_SRGB (legacy). The image "
+                     "itself is always created UNORM so all views are legal reinterprets.")
     .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(dlss5_amd_signed_view, 0, "GPU",
+                     "Development: view format used for the substitute image on SIGNED fetches "
+                     "of the composition source - 0 = R8G8B8A8_SNORM (domain-identical to the "
+                     "guest signed host view of base page 0x11C6F), 1 = R8G8B8A8_UNORM, 2 = "
+                     "R8G8B8A8_SRGB (A/B). The composition draw samples 0x11C6F twice per draw, "
+                     "once unsigned and once signed; each fetch gets its own view.")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
@@ -75,10 +83,12 @@ std::unique_ptr<nr::Runtime> g_runtime;
 #endif
 VkImage g_substitute_image = VK_NULL_HANDLE;
 VkDeviceMemory g_substitute_memory = VK_NULL_HANDLE;
-// Both reinterprets of the one UNORM image, created together at upload; the
-// active one is picked per dlss5_amd_view in SubstituteView().
+// All reinterprets of the one UNORM image, created together at upload; the
+// active one is picked per fetch signedness in SubstituteViewForFetch() -
+// dlss5_amd_view for unsigned fetches, dlss5_amd_signed_view for signed ones.
 VkImageView g_substitute_view_unorm = VK_NULL_HANDLE;
 VkImageView g_substitute_view_srgb = VK_NULL_HANDLE;
+VkImageView g_substitute_view_snorm = VK_NULL_HANDLE;
 VkDevice g_substitute_device = VK_NULL_HANDLE;
 PFN_vkDestroyImageView g_substitute_destroy_view = nullptr;
 PFN_vkDestroyImage g_substitute_destroy_image = nullptr;
@@ -321,9 +331,42 @@ bool SubstituteForFrame(uint64_t frame) {
 }
 
 VkImageView SubstituteView() {
-  // dlss5_amd_view is kInitOnly and both views are created at upload, so this
-  // is a pure selection between the UNORM and SRGB reinterpret of the image.
+  // Unsigned-fetch case of SubstituteViewForFetch(). dlss5_amd_view is
+  // kInitOnly and both views are created at upload, so this is a pure
+  // selection between the UNORM and SRGB reinterpret of the image.
   return REXCVAR_GET(dlss5_amd_view) == 0 ? g_substitute_view_unorm : g_substitute_view_srgb;
+}
+
+VkImageView SubstituteViewForFetch(bool is_signed) {
+  // The composition draw samples base page 0x11C6F twice per draw: once
+  // unsigned (guest host view UNORM) and once signed (guest host view SNORM),
+  // and each fetch must see a substitute view in the same domain. All three
+  // views are created at upload over the one UNORM image (both cvars are
+  // kInitOnly), so this is a pure selection per fetch signedness.
+  if (!is_signed) {
+    return SubstituteView();
+  }
+  switch (REXCVAR_GET(dlss5_amd_signed_view)) {
+    case 1:
+      return g_substitute_view_unorm;
+    case 2:
+      return g_substitute_view_srgb;
+    default:
+      return g_substitute_view_snorm;
+  }
+}
+
+VkFormat SubstituteViewFormatForFetch(bool is_signed) {
+  // The VkFormat of the view SubstituteViewForFetch() would bind for this
+  // fetch, for the one-shot substitution log.
+  const VkImageView view = SubstituteViewForFetch(is_signed);
+  if (view == g_substitute_view_snorm) {
+    return VK_FORMAT_R8G8B8A8_SNORM;
+  }
+  if (view == g_substitute_view_srgb) {
+    return VK_FORMAT_R8G8B8A8_SRGB;
+  }
+  return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
 void SetDeviceUnsupported(const std::string& reason) {
@@ -510,9 +553,12 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
     return false;
   }
 
-  // Two views of the one UNORM image: UNORM is domain-identical to the guest
-  // composition fetch (no gamma PWL anywhere on the guest path), SRGB inserts
-  // a decode the guest never applies. dlss5_amd_view picks the active one.
+  // Three views of the one UNORM image: UNORM is domain-identical to the guest
+  // unsigned composition fetch (no gamma PWL anywhere on the guest path), SNORM
+  // is domain-identical to the guest SIGNED host view of the same base page
+  // (the composition fetches 0x11C6F twice per draw, once per sign), and SRGB
+  // inserts a decode the guest never applies. dlss5_amd_view /
+  // dlss5_amd_signed_view pick the active view per fetch signedness.
   VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view_info.image = g_substitute_image;
   view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -527,14 +573,23 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
       VK_SUCCESS) {
     return false;
   }
+  view_info.format = VK_FORMAT_R8G8B8A8_SNORM;
+  if (dfn.vkCreateImageView(device.device(), &view_info, nullptr, &g_substitute_view_snorm) !=
+      VK_SUCCESS) {
+    return false;
+  }
   g_substitute_device = device.device();
   g_substitute_destroy_view = dfn.vkDestroyImageView;
   g_substitute_destroy_image = dfn.vkDestroyImage;
   g_substitute_free_memory = dfn.vkFreeMemory;
   const bool view_unorm = REXCVAR_GET(dlss5_amd_view) == 0;
+  const char* signed_view_name =
+      REXCVAR_GET(dlss5_amd_signed_view) == 1   ? "R8G8B8A8_UNORM"
+      : REXCVAR_GET(dlss5_amd_signed_view) == 2 ? "R8G8B8A8_SRGB"
+                                                : "R8G8B8A8_SNORM";
   REXLOG_INFO("DLSS 5 NR (AMD): substitute image loaded from {} (1920x1080 RGBA8 UNORM image, "
-              "active view {})",
-              path, view_unorm ? "R8G8B8A8_UNORM" : "R8G8B8A8_SRGB");
+              "unsigned view {}, signed view {})",
+              path, view_unorm ? "R8G8B8A8_UNORM" : "R8G8B8A8_SRGB", signed_view_name);
   return true;
 }
 }  // namespace
@@ -678,6 +733,10 @@ void Shutdown() {
     if (g_substitute_view_srgb != VK_NULL_HANDLE) {
       g_substitute_destroy_view(g_substitute_device, g_substitute_view_srgb, nullptr);
       g_substitute_view_srgb = VK_NULL_HANDLE;
+    }
+    if (g_substitute_view_snorm != VK_NULL_HANDLE) {
+      g_substitute_destroy_view(g_substitute_device, g_substitute_view_snorm, nullptr);
+      g_substitute_view_snorm = VK_NULL_HANDLE;
     }
     if (g_substitute_image != VK_NULL_HANDLE) {
       g_substitute_destroy_image(g_substitute_device, g_substitute_image, nullptr);
