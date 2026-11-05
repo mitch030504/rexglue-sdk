@@ -54,6 +54,8 @@
 REXCVAR_DECLARE(bool, present_use_actual_aspect);
 // Defined in ui/window.cpp.
 REXCVAR_DECLARE(std::string, resolution);
+// Defined in ui/dlss5_amd_runtime.cpp.
+REXCVAR_DECLARE(int32_t, dlss5_amd_draw_filter);
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -7134,8 +7136,25 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // fetch constant's base page (0x11C6F000 >> 12); HUD textures keep their own
   // views. The texture descriptor set is rewritten for every draw, so only the
   // image info changes here.
+  // Draw filter: with dlss5_amd_draw_filter=1 only the composition draw is
+  // substituted - identified by also fetching the seq-1 page 0x1212F in the
+  // same draw. Substituting every 0x11C6F fetch leaks the substitute image into
+  // intermediate buffers (e.g. the pass writing 0x1212F), which then feed the
+  // composition's additive seq-1 term and break the 1:1 transfer (measured:
+  // cross-substitute additivity fails with filter=0).
+  bool composition_draw = false;
+  if (REXCVAR_GET(dlss5_amd_draw_filter) != 0 && write_pixel_textures && texture_count_pixel) {
+    for (const VulkanShader::TextureBinding& filter_binding : *textures_pixel) {
+      if (register_file_->GetTextureFetch(filter_binding.fetch_constant).base_address ==
+          0x1212Fu) {
+        composition_draw = true;
+        break;
+      }
+    }
+  }
   const bool nr_substitute = rex::ui::dlss5_amd::SubstituteEnabled() &&
-                             rex::ui::dlss5_amd::SubstituteForFrame(GetCurrentFrame());
+                             rex::ui::dlss5_amd::SubstituteForFrame(GetCurrentFrame()) &&
+                             (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || composition_draw);
   if (write_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
@@ -7152,7 +7171,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         static bool nr_substitute_logged = false;
         if (!nr_substitute_logged) {
           nr_substitute_logged = true;
-          REXGPU_INFO("nr_substitute draw: logging all {} pixel fetches", texture_count_pixel);
+          REXGPU_INFO("nr_substitute draw: logging all {} pixel fetches (composition_draw={} "
+                      "draw_filter={})",
+                      texture_count_pixel, composition_draw ? 1 : 0,
+                      REXCVAR_GET(dlss5_amd_draw_filter));
           for (const VulkanShader::TextureBinding& log_binding : *textures_pixel) {
             const xenos::xe_gpu_texture_fetch_t fetch =
                 register_file_->GetTextureFetch(log_binding.fetch_constant);

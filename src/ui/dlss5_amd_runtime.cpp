@@ -67,6 +67,14 @@ REXCVAR_DEFINE_INT32(dlss5_amd_signed_view, 0, "GPU",
                      "once unsigned and once signed; each fetch gets its own view.")
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(dlss5_amd_draw_filter, 1, "GPU",
+                     "Development: which draws fetching the composition source (base page "
+                     "0x11C6F) get the substitute view - 0 = every such draw (legacy; leaks the "
+                     "substitute into intermediate buffers that later feed the composition, "
+                     "e.g. the seq-1 term 0x1212F), 1 = only composition draws, identified by "
+                     "also fetching the seq-1 page 0x1212F in the same draw.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
 namespace {
