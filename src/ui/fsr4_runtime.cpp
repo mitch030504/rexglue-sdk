@@ -23,8 +23,8 @@
 REXCVAR_DEFINE_BOOL(fsr4, false, "GPU",
                     "Linux, AMD: FSR 4.1.2 temporal upscaling through a user-built "
                     "amd_fidelityfx_upscaler_vk.so (fsr4-vk-style provider built from the "
-                    "user's own FidelityFX SDK 2.4.0 / FSR 4.1.2.4555 DLL). The .so is never "
-                    "shipped or packaged; it is dlopen'd from the executable directory or "
+                    "user's own FidelityFX SDK 2.4.0 / FSR 4.1.2.4555 DLL). The .so is not part "
+                    "of the source release; it is dlopen'd from the executable directory or "
                     "fsr4_data_path. Enables the FP8/cooperative-matrix device features.")
     // kRequiresRestart, not kInitOnly: the device features are created during presentation setup,
     // but the value must remain writable so the F4/F9 menus can save it for the next launch.
@@ -58,7 +58,8 @@ void EnsureStatus() {
 
 bool IsCompiledIn() {
   // The dlopen seam is compiled into every build; only the provider .so is
-  // user-supplied and never packaged.
+  // user-supplied. It is never part of the source release; the owner's private
+  // package may bundle it next to the executable.
   return true;
 }
 
