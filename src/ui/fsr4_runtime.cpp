@@ -26,20 +26,23 @@ REXCVAR_DEFINE_BOOL(fsr4, false, "GPU",
                     "user's own FidelityFX SDK 2.4.0 / FSR 4.1.2.4555 DLL). The .so is never "
                     "shipped or packaged; it is dlopen'd from the executable directory or "
                     "fsr4_data_path. Enables the FP8/cooperative-matrix device features.")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    // kRequiresRestart, not kInitOnly: the device features are created during presentation setup,
+    // but the value must remain writable so the F4/F9 menus can save it for the next launch.
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fsr4_data_path, "", "GPU",
                       "Folder that contains amd_fidelityfx_upscaler_vk.so. Empty: next to "
                       "the executable.")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::ui::fsr4 {
 namespace {
 
 Status g_status;
 
-// The cvars are kInitOnly and the device is created before the provider .so is
-// loaded, so the requested/compiled_in/data_root fields are refreshed on every
-// accessor; the state transitions (kInactive/kReady) are sticky.
+// The device is created before the provider .so is loaded, so the
+// requested/compiled_in/data_root fields are refreshed on every accessor; the
+// state transitions (kInactive/kReady) are sticky. The cvars are restart-only:
+// a change takes effect on the next launch.
 void EnsureStatus() {
   g_status.compiled_in = IsCompiledIn();
   g_status.requested = REXCVAR_GET(fsr4);
