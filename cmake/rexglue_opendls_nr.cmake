@@ -139,6 +139,7 @@ endif()
 set(_patched_root "${CMAKE_BINARY_DIR}/opendls-nr-patched")
 file(REMOVE_RECURSE "${_patched_root}")
 file(COPY "${_src}/src" DESTINATION "${_patched_root}")   # -> ${_patched_root}/src
+file(COPY "${_src}/shaders" DESTINATION "${_patched_root}")   # -> ${_patched_root}/shaders
 set(_patch_file "${CMAKE_CURRENT_LIST_DIR}/patches/opendls_nr_linux.patch")
 find_program(REXGLUE_PATCH_EXECUTABLE patch)
 if(NOT REXGLUE_PATCH_EXECUTABLE)
@@ -158,11 +159,37 @@ if(NOT _patched_kernels_h MATCHES "OPEN_DLSSNR_PTX_ROUTE")
         "OpenDLSS-NR: patch reported success but the marker is missing; pin drift?")
 endif()
 
+# The fp8 compute shaders carry an f16 cooperative-matrix accumulator. RADV (GFX12) advertises
+# float8 cooperative matrices only with an f32 accumulator and mis-lowers the f16 form, so every
+# fp8 MMA returns garbage (half the rows zero). The carried shader patch stages the accumulator
+# through shared memory in f32 and converts at the edges; on RADV it takes a block GEMM from
+# 0-8/4096 exact to 4096/4096, and the whole small network from 6.76 dB to 27.65 dB PSNR against
+# DLSSNR-AMD (still not bit-exact: f32 accumulation differs from the reference's f16). NVIDIA is
+# unaffected in principle but loses the f16 accumulator's registers, so this is applied only in
+# this optional Linux module, never to a pristine fetch.
+set(_shader_patch_file "${CMAKE_CURRENT_LIST_DIR}/patches/opendls_nr_f32_acc.patch")
+execute_process(
+    COMMAND "${REXGLUE_PATCH_EXECUTABLE}" -p1 --no-backup-if-mismatch -i "${_shader_patch_file}"
+    WORKING_DIRECTORY "${_patched_root}"
+    RESULT_VARIABLE _shader_patch_result OUTPUT_VARIABLE _shader_patch_out
+    ERROR_VARIABLE _shader_patch_err)
+if(NOT _shader_patch_result EQUAL 0)
+    message(FATAL_ERROR
+        "OpenDLSS-NR: f32-accumulator shader patch does not apply to ${_rexglue_opendls_nr_pin}: "
+        "${_shader_patch_err}")
+endif()
+file(READ "${_patched_root}/shaders/gemm_fp8.comp" _patched_gemm_fp8)
+if(NOT _patched_gemm_fp8 MATCHES "coopmat<float, gl_ScopeSubgroup, 16, 16")
+    message(FATAL_ERROR
+        "OpenDLSS-NR: shader patch reported success but the f32 accumulator marker is missing")
+endif()
+
 # The staged tool tree: the executable, the 13 .spv next to it and the license files.
 set(_stage_dir "${CMAKE_BINARY_DIR}/opendls-nr")
 
-file(GLOB _opendls_shaders CONFIGURE_DEPENDS "${_src}/shaders/*.comp")
-file(GLOB _opendls_glsl CONFIGURE_DEPENDS "${_src}/shaders/*.glsl")
+# Compile from the patched copies (the C++ patch's Linux route plus the f32 accumulator shaders).
+file(GLOB _opendls_shaders CONFIGURE_DEPENDS "${_patched_root}/shaders/*.comp")
+file(GLOB _opendls_glsl CONFIGURE_DEPENDS "${_patched_root}/shaders/*.glsl")
 list(SORT _opendls_shaders)
 list(LENGTH _opendls_shaders _opendls_shader_count)
 if(NOT _opendls_shader_count EQUAL 13)
@@ -175,7 +202,7 @@ foreach(_comp IN LISTS _opendls_shaders)
     set(_spv "${_stage_dir}/shaders/${_name}.spv")
     add_custom_command(OUTPUT "${_spv}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_stage_dir}/shaders"
-        COMMAND "${_glslang}" -V --target-env vulkan1.3 -I"${_src}/shaders" "${_comp}" -o "${_spv}"
+        COMMAND "${_glslang}" -V --target-env vulkan1.3 -I"${_patched_root}/shaders" "${_comp}" -o "${_spv}"
         DEPENDS "${_comp}" ${_opendls_glsl}
         COMMENT "OpenDLSS-NR: glslang ${_name}.comp"
         VERBATIM)

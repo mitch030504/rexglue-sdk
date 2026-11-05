@@ -1,0 +1,697 @@
+--- a/shaders/gemm_fp8.comp
++++ b/shaders/gemm_fp8.comp
+@@ -90,8 +90,14 @@
+ const uint SHARED_WORDS = STAGE_WORDS > EPI_WORDS ? STAGE_WORDS : EPI_WORDS;
+ shared uvec4 stage[SHARED_WORDS];
+ shared float16_t tileStage[SUBGROUPS * 256u];         // per-subgroup 16x16 accumulator staging (residual prologue)
+-
+-#define ACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++// One 16x16 f32 accumulator tile per subgroup, extracted through shared memory
++// (the accumulator fragment layout is opaque, so this is the only way out).
++const uint EPI_F32_STRIDE = 20u;
++shared float epiF32[SUBGROUPS * 16u * EPI_F32_STRIDE];
++
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type;
++// an f16 accumulator is accepted at pipeline creation but mis-lowered (garbage).
++#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+ #define MAT_A coopmat<floate4m3_t, gl_ScopeSubgroup, 16, KSTEP, gl_MatrixUseA>
+ #define MAT_B coopmat<floate4m3_t, gl_ScopeSubgroup, KSTEP, 16, gl_MatrixUseB>
+ 
+@@ -159,54 +165,29 @@
+ 
+   ACC acc[TILES];
+   ACC total[TILES];
+-  // Native mma.sync starts from FP16 accumulators holding the scaled skip.
++  // Native mma.sync starts from FP16 accumulators holding the scaled skip.  With an
++  // f32 accumulator the skip is staged as f32 and loaded as the C fragment.
+   const bool seedResidual = (FLAGS & F_RESIDUAL) != 0u && split == 0u;
+-  [[unroll]] for (uint t = 0u; t < TILES; ++t) {
+-    if (seedResidual) {
+-      if ((FLAGS & (F_SCALE_RESIDUAL | F_RESIDUAL_E4)) == 0u) {
+-        // Plain half residual: load the C tile directly (rows past the end read padding rows).
+-        uint row = min(rowBase, pc.rows - 1u);
+-        coopMatLoad(acc[t], residual16, row * pc.outputStride + outColumn + colBase + t * 16u, pc.outputStride,
+-                    gl_CooperativeMatrixLayoutRowMajor);
+-      } else {
+-        acc[t] = ACC(0.0);   // filled below from the staged, scaled residual
+-      }
+-    } else {
+-      acc[t] = ACC(0.0);
+-    }
+-  }
+-  const uint epiBase = subgroup * 16u * 9u;   // per-subgroup f16 [16][64] staging, 9-word rows
+-  // Epilogue/prologue lane mapping: a pass covers up to 4 tiles (64 columns); LPR lanes share a row,
+-  // each handling 16 columns (two words) with 16-byte accesses; RPI rows per instruction.
+-  const uint LPR4 = 4u, RPI4 = 8u;   // 4-tile passes
+-  if (seedResidual && (FLAGS & (F_SCALE_RESIDUAL | F_RESIDUAL_E4)) != 0u && rowsValid) {
+-    // Scaled and/or E4 residual: round_f16(residual * scale) staged as f16 with 16-byte loads, in passes of
+-    // up to four tiles (all loads of a pass in flight together), then loaded as the C fragments.
+-    [[unroll]] for (uint pass = 0u; pass < TILES; pass += 4u) {
+-      const uint passTiles = (TILES - pass) < 4u ? (TILES - pass) : 4u;
+-      const uint lpr = passTiles == 1u ? 1u : (passTiles == 2u ? 2u : 4u);
+-      const uint rpi = 32u / lpr;
+-      const uint quarter = lane % lpr;
+-      [[unroll]] for (uint it = 0u; it < (16u + rpi - 1u) / rpi; ++it) {
+-        uint r = it * rpi + lane / lpr;
+-        uint row = rowBase + r;
+-        if (r < 16u && quarter < passTiles && row < pc.rows) {
+-          uint column = colBase + pass * 16u + quarter * 16u;
+-          vec2 res[8];
+-          loadResidual16(row * pc.outputStride + outColumn + column, res);
+-          if ((FLAGS & F_SCALE_RESIDUAL) != 0u) {
+-            uvec4 s0 = aux16x8[(pc.auxHalfOffset + column) >> 3u], s1 = aux16x8[((pc.auxHalfOffset + column) >> 3u) + 1u];
+-            [[unroll]] for (uint i = 0u; i < 4u; ++i) { res[i] *= vec2(unpackFloat2x16(s0[i])); res[4u + i] *= vec2(unpackFloat2x16(s1[i])); }
+-          }
+-          uvec4 w0, w1;
+-          [[unroll]] for (uint i = 0u; i < 4u; ++i) { w0[i] = packFloat2x16(f16vec2(res[i])); w1[i] = packFloat2x16(f16vec2(res[4u + i])); }
+-          stage[epiBase + r * 9u + quarter * 2u] = w0;
+-          stage[epiBase + r * 9u + quarter * 2u + 1u] = w1;
++  [[unroll]] for (uint t = 0u; t < TILES; ++t) acc[t] = ACC(0.0);
++  const uint f32Base = subgroup * 16u * EPI_F32_STRIDE;
++  if (seedResidual && rowsValid) {
++    // Residual (plain, scaled and/or E4) staged as f32, one 16x16 tile at a time, and
++    // loaded as the f32 C fragment.
++    [[unroll]] for (uint t = 0u; t < TILES; ++t) {
++      const uint column = colBase + t * 16u;
++      const uint pairBase = (outColumn + column) >> 1u;
++      for (uint idx = lane; idx < 128u; idx += 32u) {
++        const uint r = idx >> 3u, pair = idx & 7u;
++        const uint row = rowBase + r;
++        if (row < pc.rows) {
++          vec2 res = loadResidualPair(row * (pc.outputStride >> 1u) + pairBase + pair);
++          if ((FLAGS & F_SCALE_RESIDUAL) != 0u) res *= auxPair(column + pair * 2u);
++          epiF32[f32Base + r * EPI_F32_STRIDE + pair * 2u] = res.x;
++          epiF32[f32Base + r * EPI_F32_STRIDE + pair * 2u + 1u] = res.y;
+         }
+       }
+       subgroupSync();
+-      [[unroll]] for (uint t = 0u; t < passTiles; ++t)
+-        coopMatLoad(acc[pass + t], stage, epiBase + t * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
++      coopMatLoad(acc[t], epiF32, f32Base, EPI_F32_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+       subgroupSync();
+     }
+   }
+@@ -309,23 +290,31 @@
+     // Partial accumulators of this partition as raw f16 [rows][N] at split * splitStride.
+     [[unroll]] for (uint pass = 0u; pass < TILES; pass += 4u) {
+       const uint passTiles = (TILES - pass) < 4u ? (TILES - pass) : 4u;
+-      [[unroll]] for (uint t = 0u; t < passTiles; ++t)
+-        coopMatStore(acc[pass + t], stage, epiBase + t * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
+-      subgroupSync();
+-      const uint lpr = passTiles == 1u ? 1u : (passTiles == 2u ? 2u : 4u);
+-      const uint rpi = 32u / lpr;
+-      const uint quarter = lane % lpr;
+-      [[unroll]] for (uint it = 0u; it < (16u + rpi - 1u) / rpi; ++it) {
+-        uint r = it * rpi + lane / lpr;
+-        uint row = rowBase + r;
+-        if (r < 16u && quarter < passTiles && row < pc.rows) {
+-          uint column = colBase + pass * 16u + quarter * 16u;
+-          uint index = split * pc.splitStride + row * pc.N + batch * pc.N * pc.rows + column;
+-          out16x8[index >> 3u] = stage[epiBase + r * 9u + quarter * 2u];
+-          out16x8[(index >> 3u) + 1u] = stage[epiBase + r * 9u + quarter * 2u + 1u];
++      [[unroll]] for (uint t = 0u; t < passTiles; ++t) {
++        coopMatStore(acc[pass + t], epiF32, f32Base, EPI_F32_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++        subgroupSync();
++        const uint lpr = passTiles == 1u ? 1u : (passTiles == 2u ? 2u : 4u);
++        const uint rpi = 32u / lpr;
++        const uint quarter = lane % lpr;
++        [[unroll]] for (uint it = 0u; it < (16u + rpi - 1u) / rpi; ++it) {
++          uint r = it * rpi + lane / lpr;
++          uint row = rowBase + r;
++          if (r < 16u && quarter == (lpr - 1u) && row < pc.rows) {
++            uint column = colBase + pass * 16u + t * 16u;
++            uint index = split * pc.splitStride + row * pc.N + batch * pc.N * pc.rows + column;
++            uvec4 w0, w1;
++            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
++              w0[i] = packFloat2x16(f16vec2(epiF32[f32Base + r * EPI_F32_STRIDE + i * 2u],
++                                             epiF32[f32Base + r * EPI_F32_STRIDE + i * 2u + 1u]));
++              w1[i] = packFloat2x16(f16vec2(epiF32[f32Base + r * EPI_F32_STRIDE + 8u + i * 2u],
++                                             epiF32[f32Base + r * EPI_F32_STRIDE + 8u + i * 2u + 1u]));
++            }
++            out16x8[index >> 3u] = w0;
++            out16x8[(index >> 3u) + 1u] = w1;
++          }
+         }
++        subgroupSync();
+       }
+-      subgroupSync();
+     }
+     return;
+   }
+@@ -333,21 +322,28 @@
+   // (9-word row stride), then lanes publish 16 columns each with 16-byte accesses (full sectors).
+   [[unroll]] for (uint pass = 0u; pass < TILES; pass += 4u) {
+     const uint passTiles = (TILES - pass) < 4u ? (TILES - pass) : 4u;
+-    [[unroll]] for (uint t = 0u; t < passTiles; ++t)
+-      coopMatStore(acc[pass + t], stage, epiBase + t * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
+-    subgroupSync();
+-    const uint lpr = passTiles == 1u ? 1u : (passTiles == 2u ? 2u : 4u);
+-    const uint rpi = 32u / lpr;
+-    const uint quarter = lane % lpr;
+-    [[unroll]] for (uint it = 0u; it < (16u + rpi - 1u) / rpi; ++it) {
+-      uint r = it * rpi + lane / lpr;
+-      uint row = rowBase + r;
+-      if (r < 16u && quarter < passTiles && row < pc.rows) {
+-        uint column = colBase + pass * 16u + quarter * 16u;
+-        uvec4 v0 = stage[epiBase + r * 9u + quarter * 2u], v1 = stage[epiBase + r * 9u + quarter * 2u + 1u];
+-        publish16(v0, v1, row * pc.outputStride + outColumn + column, column);
++    [[unroll]] for (uint t = 0u; t < passTiles; ++t) {
++      coopMatStore(acc[pass + t], epiF32, f32Base, EPI_F32_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++      subgroupSync();
++      const uint lpr = passTiles == 1u ? 1u : (passTiles == 2u ? 2u : 4u);
++      const uint rpi = 32u / lpr;
++      const uint quarter = lane % lpr;
++      [[unroll]] for (uint it = 0u; it < (16u + rpi - 1u) / rpi; ++it) {
++        uint r = it * rpi + lane / lpr;
++        uint row = rowBase + r;
++        if (r < 16u && quarter == (lpr - 1u) && row < pc.rows) {
++          uint column = colBase + pass * 16u + t * 16u;
++          uvec4 v0, v1;
++          [[unroll]] for (uint i = 0u; i < 4u; ++i) {
++            v0[i] = packFloat2x16(f16vec2(epiF32[f32Base + r * EPI_F32_STRIDE + i * 2u],
++                                          epiF32[f32Base + r * EPI_F32_STRIDE + i * 2u + 1u]));
++            v1[i] = packFloat2x16(f16vec2(epiF32[f32Base + r * EPI_F32_STRIDE + 8u + i * 2u],
++                                          epiF32[f32Base + r * EPI_F32_STRIDE + 8u + i * 2u + 1u]));
++          }
++          publish16(v0, v1, row * pc.outputStride + outColumn + column, column);
++        }
+       }
++      subgroupSync();
+     }
+-    subgroupSync();
+   }
+ }
+--- a/shaders/gemm_mlp.comp
++++ b/shaders/gemm_mlp.comp
+@@ -54,14 +54,19 @@
+ shared uvec4 stage[BUFFERS * BUF_WORDS];     // double-buffered W1 operands; then the W2 chunk tile [NOUT][128 k] (9-word rows)
+ shared uint stage32[4u * 16u * 16u];          // output row tiles as 32-bit words: [subgroup][16 rows][NOUT/4 words]
+ 
+-#define ACC16x128 coopmat<float16_t, gl_ScopeSubgroup, 16, 128, gl_MatrixUseAccumulator>
+-#define ACCOUT coopmat<float16_t, gl_ScopeSubgroup, 16, NOUT, gl_MatrixUseAccumulator>
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type (an f16 accumulator is
++// accepted at pipeline creation but mis-lowered), so the accumulators are f32 and every f16 publication below
++// rounds explicitly.
++#define ACC16x128 coopmat<float, gl_ScopeSubgroup, 16, 128, gl_MatrixUseAccumulator>
++#define ACCOUT coopmat<float, gl_ScopeSubgroup, 16, NOUT, gl_MatrixUseAccumulator>
+ #define A16x32 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+ #define A16x128 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 128, gl_MatrixUseA>
+ #define B32x128 coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 128, gl_MatrixUseB>
+ #define B128xOUT coopmat<floate4m3_t, gl_ScopeSubgroup, 128, NOUT, gl_MatrixUseB>
+ 
+-float16_t siluElement(const in uint row, const in uint col, const in float16_t value) { return siluHalf(value); }
++// The reference SiLU is f16; the f32 accumulator element is rounded to f16 before it, so the elementwise
++// arithmetic is unchanged (only the accumulation itself gains precision).
++float siluElement(const in uint row, const in uint col, const in float value) { return float(siluHalf(float16_t(value))); }
+ 
+ void main() {
+   const uint thread = gl_LocalInvocationID.x;
+--- a/shaders/window_attend.comp
++++ b/shaders/window_attend.comp
+@@ -1,6 +1,6 @@
+ #version 460
+-// Fused 8x8 window cosine attention (exact Ada FP8 MMA, tiled 4x4 token order for the
+-// learned prior and the value MMA, the network's softmax reduction order).
++// Fused 8x8 window cosine attention (FP8 MMA with an f32 accumulator, tiled 4x4 token order for
++// the learned prior and the value MMA, the network's softmax reduction order).
+ //
+ // One workgroup = one (window, head). Four subgroups.
+ //   S = Q K^T + prior          16 MMAs (16x16x32, C = learned prior tile)
+@@ -37,10 +37,20 @@
+ shared uint8_t qs[64 * 32];      // [query][component]
+ shared uint8_t ks[64 * 32];      // [physical key][component]
+ shared uint8_t vs[64 * 32];      // [physical key][component]
+-shared float16_t priors[64 * 64];
+ shared float16_t scores[64 * 64]; // [query][physical key]
+ shared uint8_t weights[64 * 64];  // E4M3 [query][physical key]
+ shared float16_t outputs[64 * 32];
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type; the f16 accumulator is
++// accepted at pipeline creation but mis-lowered. The accumulator fragment layout is opaque, so the result is
++// extracted through shared memory: the MMAs store their f32 tiles here, and one pass per tensor rounds them to
++// the f16 publications the rest of the kernel reads. (Seeding C with the f16 prior through a cooperative-matrix
++// load is not possible either: a load does not convert between component types. The prior is added in f32 in
++// that same pass, which is the f32-accumulation form of the reference's f16 C seed.)
++const uint ACC_STRIDE = 20u;   // 16 rows of 16 floats + pad
++shared float accStage[4u * 16u * ACC_STRIDE];   // one 16x16 tile per subgroup, reused by both loops
++#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++
++void subgroupSync() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
+ 
+ uint inverseTiledToken(uint token) {
+   uint tile = token >> 4u, within = token & 15u;
+@@ -92,7 +102,8 @@
+   const uint stride3 = pc.channels * 3u;
+   const uint headBase = head * 96u;
+ 
+-  // Stage Q (query order), K/V (physical key order) and the prior.
++  // Stage Q (query order) and K/V (physical key order). The prior is read from global memory where it is
++  // needed (8 KB per head, L2-resident) to keep the workgroup's shared memory below the two-workgroup mark.
+   for (uint i = thread; i < 64u * 32u; i += 128u) {
+     uint token = i >> 5u, component = i & 31u;
+     int qx = windowX + int(token & 7u), qy = windowY + int(token >> 3u);
+@@ -112,20 +123,30 @@
+     ks[i] = k;
+     vs[i] = v;
+   }
+-  for (uint i = thread; i < 64u * 64u; i += 128u) priors[i] = prior[head * 4096u + i];
+   barrier();
+ 
+-  // S = Q K^T with the learned prior as the incoming FP16 accumulator.
++  // S = Q K^T (f32 accumulation from zero), then + the learned prior and the f16 publication. The prior stays
++  // in global memory (8 KB per head, L2-resident): staging it in shared would cost the occupancy the f32
++  // accumulator already needs.
++  const uint lane = gl_SubgroupInvocationID, g = lane >> 2u, t = lane & 3u;
+   for (uint tile = subgroup; tile < 16u; tile += 4u) {
+     uint qTile = tile >> 2u, kTile = tile & 3u;
+     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> ma;
+     coopMatLoad(ma, qs, qTile * 16u * 32u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+     coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mb;
+     coopMatLoad(mb, ks, kTile * 16u * 32u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
+-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mc;
+-    coopMatLoad(mc, priors, qTile * 16u * 64u + kTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
++    ACC mc = ACC(0.0);
+     mc = coopMatMulAdd(ma, mb, mc);
+-    coopMatStore(mc, scores, qTile * 16u * 64u + kTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
++    const uint stageBase = subgroup * 16u * ACC_STRIDE;
++    coopMatStore(mc, accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    for (uint idx = lane; idx < 128u; idx += 32u) {   // 16 rows, 8 packed half pairs
++      uint r = idx >> 3u, w = idx & 7u;
++      uint row = (qTile * 16u + r) * 64u + kTile * 16u + 2u * w;
++      scores[row] = float16_t(accStage[stageBase + r * ACC_STRIDE + 2u * w] + float(prior[head * 4096u + row]));
++      scores[row + 1u] = float16_t(accStage[stageBase + r * ACC_STRIDE + 2u * w + 1u] + float(prior[head * 4096u + row + 1u]));
++    }
++    subgroupSync();   // the staging tile is reused by the next pass
+   }
+   barrier();
+ 
+@@ -144,11 +165,10 @@
+   barrier();
+ 
+   // O = P V over the 64 physical keys as two k32 steps (four F13 groups in
+-  // tile order 0,1,2,3), FP16 accumulation from zero.
++  // tile order 0,1,2,3), f32 accumulation from zero, then the f16 publication in one pass.
+   for (uint tile = subgroup; tile < 8u; tile += 4u) {
+     uint qTile = tile >> 1u, cTile = tile & 1u;
+-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mc =
+-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
++    ACC mc = ACC(0.0);
+     for (uint kb = 0u; kb < 64u; kb += 32u) {
+       coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> ma;
+       coopMatLoad(ma, weights, qTile * 16u * 64u + kb, 64u, gl_CooperativeMatrixLayoutRowMajor);
+@@ -156,7 +176,16 @@
+       coopMatLoad(mb, vs, kb * 32u + cTile * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+       mc = coopMatMulAdd(ma, mb, mc);
+     }
+-    coopMatStore(mc, outputs, qTile * 16u * 32u + cTile * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
++    const uint stageBase = subgroup * 16u * ACC_STRIDE;
++    coopMatStore(mc, accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    for (uint idx = lane; idx < 128u; idx += 32u) {
++      uint r = idx >> 3u, w = idx & 7u;
++      uint row = (qTile * 16u + r) * 32u + cTile * 16u + 2u * w;
++      outputs[row] = float16_t(accStage[stageBase + r * ACC_STRIDE + 2u * w]);
++      outputs[row + 1u] = float16_t(accStage[stageBase + r * ACC_STRIDE + 2u * w + 1u]);
++    }
++    subgroupSync();
+   }
+   barrier();
+ 
+--- a/shaders/global_attend.comp
++++ b/shaders/global_attend.comp
+@@ -12,6 +12,7 @@
+ #extension GL_KHR_memory_scope_semantics : require
+ #extension GL_KHR_cooperative_matrix : require
+ #extension GL_KHR_shader_subgroup_basic : require
++#extension GL_EXT_control_flow_attributes : require
+ #extension GL_GOOGLE_include_directive : require
+ #include "common.glsl"
+ 
+@@ -30,8 +31,14 @@
+ 
+ shared float16_t scores[16u * PADDED_TOKENS];
+ shared uint8_t weights[16u * PADDED_TOKENS];
+-shared float16_t outputs[16u * 32u];
+ shared float16_t reciprocals[16];
++// 16x16 f32 accumulator staging (stride 20, one subgroup). RADV GFX12 only advertises float8 cooperative
++// matrices with an f32 result type; with an f32 accumulator the f16 publication goes through this tile.
++const uint ACC_STRIDE = 20u;
++shared float accStage[16u * ACC_STRIDE];
++#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++
++void subgroupSync() { subgroupMemoryBarrierShared(); subgroupBarrier(); }
+ 
+ float16_t vitExpWeight(float16_t score) {
+   // Global-ViT approximation constants (f32 literals converted to half by PTX).
+@@ -76,10 +83,16 @@
+   for (uint kTile = 0u; kTile < PADDED_TOKENS / 16u; ++kTile) {
+     coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mk;
+     coopMatLoad(mk, qkv, kTile * 16u * stride3 + headBase + 32u, stride3, gl_CooperativeMatrixLayoutColumnMajor);
+-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mc =
+-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
++    ACC mc = ACC(0.0);
+     mc = coopMatMulAdd(mq, mk, mc);
+-    coopMatStore(mc, scores, kTile * 16u, PADDED_TOKENS, gl_CooperativeMatrixLayoutRowMajor);
++    coopMatStore(mc, accStage, 0u, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    for (uint idx = lane; idx < 128u; idx += 32u) {   // 16 rows, 8 packed half pairs
++      uint r = idx >> 3u, w = idx & 7u;
++      scores[r * PADDED_TOKENS + kTile * 16u + 2u * w] = float16_t(accStage[r * ACC_STRIDE + 2u * w]);
++      scores[r * PADDED_TOKENS + kTile * 16u + 2u * w + 1u] = float16_t(accStage[r * ACC_STRIDE + 2u * w + 1u]);
++    }
++    subgroupSync();   // the staging tile is reused by the next key tile
+   }
+   barrier();
+   for (uint i = lane; i < 16u * PADDED_TOKENS; i += 32u) scores[i] = vitExpWeight(scores[i]);
+@@ -101,8 +114,7 @@
+   barrier();
+ 
+   for (uint cTile = 0u; cTile < 2u; ++cTile) {
+-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mc =
+-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
++    ACC mc = ACC(0.0);
+     for (uint kb = 0u; kb < PADDED_TOKENS; kb += 32u) {
+       coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> mp;
+       coopMatLoad(mp, weights, kb, PADDED_TOKENS, gl_CooperativeMatrixLayoutRowMajor);
+@@ -110,15 +122,20 @@
+       coopMatLoad(mv, qkv, kb * stride3 + headBase + 64u + cTile * 16u, stride3, gl_CooperativeMatrixLayoutRowMajor);
+       mc = coopMatMulAdd(mp, mv, mc);
+     }
+-    coopMatStore(mc, outputs, cTile * 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+-  }
+-  barrier();
+-
+-  for (uint i = lane; i < 16u * 32u; i += 32u) {
+-    uint row = i >> 5u, component = i & 31u;
+-    uint token = qTile * 16u + row;
+-    if (token >= pc.tokens) continue;
+-    precise float value = roundF16(float(outputs[i]) * float(reciprocals[row]));
+-    attended[token * pc.channels + head * 32u + component] = uint8_t(e4m3CodeFromF32(value));
++    coopMatStore(mc, accStage, 0u, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    // Publish straight from the staging tile (no f16 `outputs` array: at the 1080p ViT token count its 1 KB
++    // would push the workgroup over the two-workgroup shared-memory mark).
++    for (uint idx = lane; idx < 128u; idx += 32u) {   // 16 rows, 8 pairs
++      uint r = idx >> 3u, w = idx & 7u;
++      uint token = qTile * 16u + r;
++      if (token >= pc.tokens) continue;
++      [[unroll]] for (uint k = 0u; k < 2u; ++k) {
++        uint component = cTile * 16u + 2u * w + k;
++        precise float value = roundF16(float(float16_t(accStage[r * ACC_STRIDE + 2u * w + k])) * float(reciprocals[r]));
++        attended[token * pc.channels + head * 32u + component] = uint8_t(e4m3CodeFromF32(value));
++      }
++    }
++    subgroupSync();
+   }
+ }
+--- a/shaders/qkv_attention.comp
++++ b/shaders/qkv_attention.comp
+@@ -54,9 +54,13 @@
+ shared uvec4 stage[64 * 5 + 96 * 5];   // 5-word (80-byte) rows: bank-conflict-free fragment loads
+ shared uint16_t kv16[2048];
+ shared uint tile32[4 * 16 * 8];          // per subgroup: the attended row tile as 32-bit words [16 rows][8]
++shared float priorF32[16u * 68u];        // the prior tile as f32 for the f32 accumulator's C fragment (4.3 KB)
+ 
+-#define ACC16x32 coopmat<float16_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseAccumulator>
+-#define ACC16x64 coopmat<float16_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseAccumulator>
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type (an f16 accumulator is
++// accepted at pipeline creation but mis-lowered), so the accumulators are f32; the f16-valued elementwise
++// stages below convert explicitly, so their arithmetic is unchanged.
++#define ACC16x32 coopmat<float, gl_ScopeSubgroup, 16, 32, gl_MatrixUseAccumulator>
++#define ACC16x64 coopmat<float, gl_ScopeSubgroup, 16, 64, gl_MatrixUseAccumulator>
+ #define A16x32 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+ #define A16x64 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseA>
+ #define B32x32 coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 32, gl_MatrixUseB>
+@@ -95,7 +99,7 @@
+     precise float16_t s1 = s2.x + s2.y;
+     float16_t norm = float16_t(inversesqrt(float(s1)));
+     [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+-      precise float16_t n = m[b + i] * norm;
++      precise float16_t n = float16_t(m[b + i]) * norm;
+       float16_t value = n;
+       if (applyScale) { precise float16_t ns = n * scale; value = ns; }
+       m[b + i] = isnan(value) ? float16_t(0.0) : value;
+@@ -135,9 +139,17 @@
+   image = setTensorLayoutDimensionNV(image, pc.height, pc.width, pc.channels);
+   image = setTensorLayoutStrideNV(image, pc.width * pc.channels, pc.channels, 1);
+ 
+-  // The attention prior (learned 64x64 bias per head) and the head scale: independent loads issued first.
++  // The attention prior (learned 64x64 bias per head) and the head scale: independent loads issued first. The
++  // prior is f16 in memory; the f32 C fragment needs it staged as f32 (a cooperative-matrix load does not
++  // convert between component types).
+   ACC16x64 s;
+-  coopMatLoad(s, prior, head * 4096u + rowBase * 64u, 64u, gl_CooperativeMatrixLayoutRowMajor);
++  for (uint idx = lane; idx < 16u * 64u; idx += 32u) {
++    uint r = idx >> 6u, c = idx & 63u;
++    priorF32[r * 68u + c] = float(prior[head * 4096u + (rowBase + r) * 64u + c]);
++  }
++  subgroupMemoryBarrierShared(); subgroupBarrier();
++  coopMatLoad(s, priorF32, 0u, 68u, gl_CooperativeMatrixLayoutRowMajor);
++  subgroupMemoryBarrierShared(); subgroupBarrier();
+   const float16_t scale = float16_t(uintBitsToFloat(aux32[pc.scaleWordOffset + head]));
+ 
+   // ---- q, k, v projections in K = 64 chunks; A rows gathered by token (zero outside the image) and the
+--- a/shaders/fused_block32.comp
++++ b/shaders/fused_block32.comp
+@@ -98,13 +98,17 @@
+ 
+ const uint W1T = 0u, W2T = 256u, WQKV = 544u, WPROJ = 736u;
+ 
+-#define ACC16x32 coopmat<float16_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseAccumulator>
+-#define ACC16x16H coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type (an f16 accumulator is
++// accepted at pipeline creation but mis-lowered), so the accumulators are f32. The elementwise stages below
++// convert the accumulator elements to f16 explicitly where the reference arithmetic is f16, and the two f16 C
++// seeds are read element by element (a cooperative-matrix load does not convert component types).
++#define ACC16x32 coopmat<float, gl_ScopeSubgroup, 16, 32, gl_MatrixUseAccumulator>
++#define ACC16x16H coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+ #define A16x16H coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+ #define B16x32H coopmat<float16_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseB>
+ #define B16x16H coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+-#define ACC16x64 coopmat<float16_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseAccumulator>
+-#define ACC16x128 coopmat<float16_t, gl_ScopeSubgroup, 16, 128, gl_MatrixUseAccumulator>
++#define ACC16x64 coopmat<float, gl_ScopeSubgroup, 16, 64, gl_MatrixUseAccumulator>
++#define ACC16x128 coopmat<float, gl_ScopeSubgroup, 16, 128, gl_MatrixUseAccumulator>
+ #define A16x32 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+ #define A16x64 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseA>
+ #define A16x128 coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 128, gl_MatrixUseA>
+@@ -147,7 +151,34 @@
+ 
+ // Per-element callbacks (elementwise, order-free; the half rounding is a real conversion).
+ float16_t siluElement(const in uint row, const in uint col, const in float16_t value) { return siluHalf(value); }
++// f32 accumulator callbacks: the reference arithmetic is f16, so the accumulator element is rounded to f16
++// first and the result widened back exactly.
++float siluElementF32(const in uint row, const in uint col, const in float value) { return float(siluHalf(float16_t(value))); }
+ float16_t nanToZero(const in uint row, const in uint col, const in float16_t value) { return isnan(value) ? float16_t(0.0) : value; }
++float nanToZeroF32(const in uint row, const in uint col, const in float value) { return isnan(value) ? 0.0 : value; }
++
++// Element (i) of a lane's 16x32 f32 accumulator: row g + 8*(i>>3), column 8*((i>>1)&3) + 2t + (i&1) -- the same
++// accumulator layout the publications below use. Seeds from the f16 staging words of `scratch32` (16 words per
++// row, 32 halves) instead of coopMatLoad, which does not convert an f16 tile into an f32 accumulator.
++void seedFromStage(inout ACC16x32 m, const in uint base, const in uint g, const in uint t) {
++  [[unroll]] for (uint i = 0u; i < 16u; ++i) {
++    const uint r = g + 8u * (i >> 3u);
++    const uint c = 8u * ((i >> 1u) & 3u) + 2u * t + (i & 1u);
++    m[i] = float(unpackFloat2x16(scratch32[base + r * 16u + (c >> 1u)])[c & 1u]);
++  }
++}
++
++// The 16x64 prior tile as the f32 attention accumulator: element (16h + 2m + b) is row g + 8h, key 8m + 2t + b.
++// (A macro: an unsized array cannot be a function parameter.)
++#define LOAD_PRIOR_F32(dst, priorRows, stride)                                                          \
++  [[unroll]] for (uint h_ = 0u; h_ < 2u; ++h_) {                                                        \
++    const uint row_ = rowBase + g + 8u * h_;                                                            \
++    [[unroll]] for (uint m_ = 0u; m_ < 8u; ++m_) {                                                      \
++      const uint column_ = 8u * m_ + 2u * t;                                                            \
++      (dst)[16u * h_ + 2u * m_] = float((priorRows)[row_ * (stride) + column_]);                        \
++      (dst)[16u * h_ + 2u * m_ + 1u] = float((priorRows)[row_ * (stride) + column_ + 1u]);              \
++    }                                                                                                   \
++  }
+ // round_f16(residual * aux[col]): exact product in f32, one rounding.
+ float16_t scaleByAux(const in uint row, const in uint col, const in float16_t value, const in uint auxOffset) {
+   precise float product = float(value) * float(uint16BitsToFloat16(aux16[auxOffset + col]));
+@@ -176,7 +207,7 @@
+     precise float16_t s1 = s2.x + s2.y;
+     float16_t norm = float16_t(inversesqrt(float(s1)));
+     [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+-      precise float16_t n = m[b + i] * norm;
++      precise float16_t n = float16_t(m[b + i]) * norm;
+       float16_t value = n;
+       if (applyScale) { precise float16_t ns = n * scale; value = ns; }
+       m[b + i] = isnan(value) ? float16_t(0.0) : value;
+@@ -328,7 +359,7 @@
+     adapted = coopMatMulAdd(fa, fb, adapted);
+     cInit = adapted;
+     ACC16x32 adaptedClean;
+-    coopMatPerElementNV(adaptedClean, adapted, nanToZero);
++    coopMatPerElementNV(adaptedClean, adapted, nanToZeroF32);
+     x = A16x32(adaptedClean);
+   } else if ((FLAGS & (F_POST | F_UPRES)) != 0u) {
+     // learned_post_blend per channel: raw = round_f16(round_f16(up * sA) + adapter * sB) (products exact in f32);
+@@ -361,7 +392,7 @@
+       [[unroll]] for (uint i = 0u; i < 8u; ++i) scratch32[w + i] = rawWords[i];
+     }
+     subgroupBarrier();
+-    coopMatLoad(cInit, scratch32, SCR, 16u, gl_CooperativeMatrixLayoutRowMajor);
++    seedFromStage(cInit, SCR, g, t);
+     subgroupBarrier();
+     {
+       const uint w = SCR + (ldRow * 2u + ldWord) * 4u;
+@@ -395,7 +426,7 @@
+       scratch32[w] = lo.x; scratch32[w + 1u] = lo.y; scratch32[w + 2u] = lo.z; scratch32[w + 3u] = lo.w;
+       scratch32[w + 4u] = hi.x; scratch32[w + 5u] = hi.y; scratch32[w + 6u] = hi.z; scratch32[w + 7u] = hi.w;
+       subgroupBarrier();
+-      coopMatLoad(cInit, scratch32, SCR, 16u, gl_CooperativeMatrixLayoutRowMajor);
++      seedFromStage(cInit, SCR, g, t);
+       subgroupBarrier();
+     }
+   }
+@@ -438,7 +469,7 @@
+     ffnAcc = coopMatMulAdd(hiddenE4, w2, ffnAcc);
+   }
+   ACC16x32 ffnClean;
+-  coopMatPerElementNV(ffnClean, ffnAcc, nanToZero);
++  coopMatPerElementNV(ffnClean, ffnAcc, nanToZeroF32);
+   A16x32 ffnQ = A16x32(ffnClean);
+ 
+   // ==== Phase Q: q, k, v in registers; normalize in the accumulator layout; K/V rows to shared.
+@@ -458,11 +489,12 @@
+ 
+   // ==== Phase A: attention and projection in registers.
+   B32x64 kp; coopMatLoad(kp, kv16, KP, 24u, gl_CooperativeMatrixLayoutColumnMajor);   // [64 physical][32 k]
+-  ACC16x64 s;   // attention prior for these 16 query rows (staged in shared)
+ #if PRIOR_SHARED
+-  coopMatLoad(s, priorS, rowBase * 72u, 72u, gl_CooperativeMatrixLayoutRowMajor);
++  ACC16x64 s;   // attention prior for these 16 query rows
++  LOAD_PRIOR_F32(s, priorS, 72u)
+ #else
+-  coopMatLoad(s, prior, rowBase * 64u, 64u, gl_CooperativeMatrixLayoutRowMajor);   // L2-resident 8 KB per block
++  ACC16x64 s;
++  LOAD_PRIOR_F32(s, prior, 64u)   // L2-resident 8 KB per block
+ #endif
+   s = coopMatMulAdd(mq, kp, s);
+   // Softmax in the accumulator layout. Row half h: elements [16h + 2m, 16h + 2m + 1] are keys (8m + 2t, +1).
+@@ -501,7 +533,7 @@
+   ACC16x32 o = ACC16x32(0.0);
+   o = coopMatMulAdd(p, vp, o);
+   ACC16x32 oClean;
+-  coopMatPerElementNV(oClean, o, nanToZero);
++  coopMatPerElementNV(oClean, o, nanToZeroF32);
+   A16x32 attended = A16x32(oClean);
+   ACC16x32 projC = ffnAcc;
+   scalePairs(projC, auxAttn);
+--- a/shaders/global_attention.comp
++++ b/shaders/global_attention.comp
+@@ -143,6 +143,7 @@
+   // ---- Attention over the key blocks. Lane pair per S row: row = lane >> 1, half hh = lane & 1.
+   const uint lr = lane >> 1u, hh = lane & 1u;
+   const uint sBase = base + F64;
++  const uint stageBase = gl_SubgroupID * 16u * ACC_STRIDE;   // f32 accumulator staging
+   ACC mo[2];
+   mo[0] = ACC(0.0); mo[1] = ACC(0.0);
+   precise float16_t total = float16_t(0.0);
+@@ -184,7 +185,10 @@
+       MAT_B mb; coopMatLoad(mb, kv4, KP + (block * 64u + kTile * 16u) * 2u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
+       ACC mc = ACC(0.0);
+       mc = coopMatMulAdd(mq, mb, mc);
+-      coopMatStore(mc, priv4, sBase + kTile * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
++      coopMatStore(mc, accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++      subgroupSync();
++      publishPrivF16(stageBase, sBase + kTile * 2u, 9u);
++      subgroupSync();   // the staging tile is reused by the next key tile
+     }
+     subgroupSync();
+     {
+@@ -254,9 +258,12 @@
+   }
+   const float reciprocal = roundF16(1.0 / float(total));   // bit-level: float(float16_t(x)) is elided by the compiler
+   // Output: value accumulators staged in words 4..7, times the reciprocal in f32, rounded to half, E4.
+-  [[unroll]] for (uint cTile = 0u; cTile < 2u; ++cTile)
+-    coopMatStore(mo[cTile], priv4, sBase + 4u + cTile * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
+-  subgroupSync();
++  [[unroll]] for (uint cTile = 0u; cTile < 2u; ++cTile) {
++    coopMatStore(mo[cTile], accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    publishPrivF16(stageBase, sBase + 4u + cTile * 2u, 9u);
++    subgroupSync();
++  }
+   const uint outToken = queryBlock * 64u + rowBase + lr;
+   if (outToken < pc.tokens) {
+     uint src = sBase + lr * 9u + 4u + hh * 2u;
+--- a/shaders/attention_common.glsl
++++ b/shaders/attention_common.glsl
+@@ -13,7 +13,26 @@
+ 
+ const uint PRIV = 176u, F64 = 32u, F32 = 32u, HID = 32u;
+ 
+-#define ACC coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++// RADV GFX12 only advertises float8 cooperative matrices with an f32 result type (an f16 accumulator is
++// accepted at pipeline creation but mis-lowered), so the accumulator is f32. Every f16 publication below
++// goes through this shared f32 staging tile (one 16x16 tile per subgroup, stride 20).
++const uint ACC_STRIDE = 20u;
++shared float accStage[8u * 16u * ACC_STRIDE];
++#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
++
++// The staged 16x16 f32 tile -> the packed f16 halves `coopMatStore` used to write into the caller's `priv4`
++// (uvec4 words; 16 halves = two uvec4 per row).
++void publishPrivF16(uint stageBase, uint dst, uint stride) {
++  for (uint idx = gl_SubgroupInvocationID; idx < 32u; idx += 32u) {
++    uint r = idx >> 1u, h = 8u * (idx & 1u);
++    const uint row = stageBase + r * ACC_STRIDE + h;
++    priv4[dst + r * stride + (idx & 1u)] = uvec4(
++        packFloat2x16(f16vec2(accStage[row + 0u], accStage[row + 1u])),
++        packFloat2x16(f16vec2(accStage[row + 2u], accStage[row + 3u])),
++        packFloat2x16(f16vec2(accStage[row + 4u], accStage[row + 5u])),
++        packFloat2x16(f16vec2(accStage[row + 6u], accStage[row + 7u])));
++  }
++}
+ #define MAT_A coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+ #define MAT_B coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+ 
+@@ -123,15 +142,26 @@
+   const uint lr = lane >> 1u, lh = lane & 1u;
+   const uint sBase = base + F64;   // S rows [16][64] f16, 9 words per row
+   MAT_A mq; coopMatLoad(mq, priv4, base, 2u, gl_CooperativeMatrixLayoutRowMajor);
++  const uint stageBase = gl_SubgroupID * 16u * ACC_STRIDE;
+   ACC priors[4];
+-  [[unroll]] for (uint kTile = 0u; kTile < 4u; ++kTile)
+-    coopMatLoad(priors[kTile], prior, priorOffset + kTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
++  [[unroll]] for (uint kTile = 0u; kTile < 4u; ++kTile) {
++    // The prior is f16 in memory; the f32 C fragment needs it staged as f32.
++    for (uint idx = gl_SubgroupInvocationID; idx < 256u; idx += 32u) {
++      uint r = idx >> 4u, c = idx & 15u;
++      accStage[stageBase + r * ACC_STRIDE + c] = float(prior[priorOffset + kTile * 16u + r * 64u + c]);
++    }
++    subgroupSync();
++    coopMatLoad(priors[kTile], accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++  }
+   [[unroll]] for (uint kTile = 0u; kTile < 4u; ++kTile) {
+     MAT_B mb; coopMatLoad(mb, kv4, KP + kTile * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
+     ACC mc = coopMatMulAdd(mq, mb, priors[kTile]);
+-    coopMatStore(mc, priv4, sBase + kTile * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
++    coopMatStore(mc, accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    publishPrivF16(stageBase, sBase + kTile * 2u, 9u);
++    subgroupSync();   // the staging tile is reused by the next key tile
+   }
+-  subgroupSync();
+   // Softmax: one lane pair per S row (lane = row*2 + hh, hh selects keys 0..31 or 32..63).
+   // the specified softmax reduction: b[g][j] = e[g+16j] + e[g+16j+8]; t[g] = ((b0+b1)+b2)+b3;
+   // total = (((t0+t2)+t4)+t6) + (((t1+t3)+t5)+t7). The exponentials stay in registers for the weights.
+@@ -195,9 +225,12 @@
+       mo[cTile] = coopMatMulAdd(mp, mv, mo[cTile]);
+     }
+   }
+-  [[unroll]] for (uint cTile = 0u; cTile < 2u; ++cTile)
+-    coopMatStore(mo[cTile], priv4, sBase + 4u + cTile * 2u, 9u, gl_CooperativeMatrixLayoutRowMajor);
+-  subgroupSync();
++  [[unroll]] for (uint cTile = 0u; cTile < 2u; ++cTile) {
++    coopMatStore(mo[cTile], accStage, stageBase, ACC_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
++    subgroupSync();
++    publishPrivF16(stageBase, sBase + 4u + cTile * 2u, 9u);
++    subgroupSync();
++  }
+   {
+     uint src = sBase + lr * 9u + 4u + lh * 2u;
+     priv4[base + lr * 2u + lh] = quantize16(priv4[src], priv4[src + 1u]);   // attended E4 [16][32]
