@@ -25,6 +25,7 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/display_mode.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
 
@@ -98,6 +99,40 @@ Uint32 CursorAutoHideTimerCallback(void* userdata, SDL_TimerID timer_id, Uint32 
   return 0;  // One-shot.
 }
 
+// Queries the current mode of the given display (0 = the window's current display, or the
+// primary display when there is no window yet) and publishes it as the native display mode --
+// the ground truth for 'resolution=native' and the cap custom resolutions scale down to.
+// Prefers the current mode over the desktop mode, and the precise rational refresh rate
+// over SDL's float approximation.
+void PublishNativeDisplayMode(SDL_Window* window, SDL_DisplayID display_id) {
+  if (!display_id) {
+    display_id = window ? SDL_GetDisplayForWindow(window) : 0;
+  }
+  if (!display_id) {
+    display_id = SDL_GetPrimaryDisplay();
+  }
+  const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
+  if (!mode) {
+    mode = SDL_GetDesktopDisplayMode(display_id);
+  }
+  if (!mode || mode->w <= 0 || mode->h <= 0) {
+    REXLOG_WARN("No display mode reported for display {}; 'resolution=native' will fall back "
+                "to 1920x1080",
+                uint32_t(display_id));
+    return;
+  }
+  double refresh_hz = double(mode->refresh_rate);
+  if (mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0) {
+    refresh_hz = double(mode->refresh_rate_numerator) / double(mode->refresh_rate_denominator);
+  }
+  if (refresh_hz <= 0.0) {
+    refresh_hz = 60.0;
+  }
+  rex::ui::display_mode::SetNativeDisplayMode(int32_t(mode->w), int32_t(mode->h), refresh_hz);
+  REXLOG_INFO("Native display mode on display {}: {}x{} @ {:.3f} Hz", uint32_t(display_id),
+              mode->w, mode->h, refresh_hz);
+}
+
 MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
   switch (button) {
     case SDL_BUTTON_LEFT:
@@ -156,6 +191,7 @@ bool WindowSDL::OpenImpl() {
 
   // Center on the requested display before fullscreen so SDL resolves
   // fullscreen against it. 1-based enumeration order; 0 = system default.
+  SDL_DisplayID selected_display = 0;
   if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
     int display_count = 0;
     SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
@@ -164,6 +200,7 @@ bool WindowSDL::OpenImpl() {
         SDL_DisplayID display = displays[monitor_index - 1];
         SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
                               SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+        selected_display = display;
       } else {
         REXLOG_WARN("monitor cvar is {} but only {} display(s) present; using default",
                     monitor_index, display_count);
@@ -171,6 +208,10 @@ bool WindowSDL::OpenImpl() {
       SDL_free(displays);
     }
   }
+
+  // Record the selected monitor's current display mode now that the window is positioned
+  // on it, so 'resolution=native' resolves to it and custom values can be capped at it.
+  PublishNativeDisplayMode(sdl_window_, selected_display);
 
   if (IsFullscreen()) {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
@@ -471,6 +512,9 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       break;
     }
     case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
+      // The window moved to another display (data1 = new display ID); the native mode
+      // follows it so 'resolution=native' and the resolution cap stay correct.
+      PublishNativeDisplayMode(sdl_window_, SDL_DisplayID(event.window.data1));
       MonitorUpdateEvent e(this, true);
       OnMonitorUpdate(e);
       break;

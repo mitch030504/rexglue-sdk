@@ -9,13 +9,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 #include <rex/cvar.h>
+#include <rex/ui/display_mode.h>
 #include <rex/ui/flags.h>
 
 namespace rex::graphics::video_mode_util {
@@ -108,6 +111,69 @@ inline bool TryParseResolutionPreset(std::string_view resolution_value, int32_t&
   return false;
 }
 
+// Resolves a 'resolution' value to concrete dimensions, additionally honoring the native
+// display mode recorded by the window (rex::ui::display_mode):
+// - "native"/"display"/"desktop" (same normalization as TryParseResolutionPreset) resolve to
+//   the selected monitor's current display mode, or 1920x1080 if none was recorded yet;
+// - anything else goes through TryParseResolutionPreset unchanged;
+// - if a native mode is known and the result exceeds it, the result is scaled down to fit
+//   inside the display, preserving aspect ratio. Never scaled up.
+inline bool TryResolveResolutionPreset(std::string_view resolution_value, int32_t& width_out,
+                                       int32_t& height_out) {
+  std::string normalized;
+  normalized.reserve(resolution_value.size());
+  for (char c : resolution_value) {
+    unsigned char c_unsigned = static_cast<unsigned char>(c);
+    if (std::isspace(c_unsigned) || c == '_' || c == '-') {
+      continue;
+    }
+    normalized.push_back(char(std::tolower(c_unsigned)));
+  }
+
+  int32_t resolved_width = 0;
+  int32_t resolved_height = 0;
+  const bool is_native =
+      normalized == "native" || normalized == "display" || normalized == "desktop";
+  if (is_native) {
+    int32_t native_width = 0;
+    int32_t native_height = 0;
+    double native_refresh_hz = 0.0;
+    if (rex::ui::display_mode::GetNativeDisplayMode(native_width, native_height,
+                                                     native_refresh_hz) &&
+        native_width > 0 && native_height > 0) {
+      resolved_width = native_width;
+      resolved_height = native_height;
+    } else {
+      // No window yet (or the query failed): fall back to the common default.
+      resolved_width = 1920;
+      resolved_height = 1080;
+    }
+  } else if (!TryParseResolutionPreset(resolution_value, resolved_width, resolved_height)) {
+    return false;
+  }
+
+  // Cap custom values at the native display mode, preserving aspect (never up). A native
+  // request is already exactly the display mode, so only clamp non-native results.
+  if (!is_native && resolved_width > 0 && resolved_height > 0) {
+    int32_t native_width = 0;
+    int32_t native_height = 0;
+    double native_refresh_hz = 0.0;
+    if (rex::ui::display_mode::GetNativeDisplayMode(native_width, native_height,
+                                                     native_refresh_hz) &&
+        native_width > 0 && native_height > 0 &&
+        (resolved_width > native_width || resolved_height > native_height)) {
+      const double scale = std::min(double(native_width) / double(resolved_width),
+                                    double(native_height) / double(resolved_height));
+      resolved_width = std::max(1, int32_t(std::lround(double(resolved_width) * scale)));
+      resolved_height = std::max(1, int32_t(std::lround(double(resolved_height) * scale)));
+    }
+  }
+
+  width_out = resolved_width;
+  height_out = resolved_height;
+  return true;
+}
+
 inline bool TryGetResolutionPresetFromCVar(int32_t& width_out, int32_t& height_out) {
   if (!rex::cvar::HasNonDefaultValue("resolution")) {
     return false;
@@ -116,7 +182,7 @@ inline bool TryGetResolutionPresetFromCVar(int32_t& width_out, int32_t& height_o
   if (resolution_value.empty()) {
     return false;
   }
-  return TryParseResolutionPreset(resolution_value, width_out, height_out);
+  return TryResolveResolutionPreset(resolution_value, width_out, height_out);
 }
 
 // Snaps an arbitrary requested resolution to a resolution real Xbox 360

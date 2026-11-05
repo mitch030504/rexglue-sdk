@@ -22,6 +22,7 @@
 #include <rex/audio/audio_system.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/graphics/frame_rate_limit.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/video_mode_util.h>
@@ -72,12 +73,15 @@
 //
 // This shares the *same* frame_rate_limit cvar the host present loop uses (d3d12_presenter.cpp),
 // rather than a separate guest-only cvar, so there is one knob: at frame_rate_limit=0 (default)
-// the guest ticks at the safe console-authentic 30Hz regardless of host present rate; setting
-// frame_rate_limit=N raises both the host present cap and the guest tick rate to N together, the
-// same tradeoff the Cemu (Wii U) build's graphic-pack FPS mod makes with its single vsyncFrequency
-// setting -- movement/timing math that assumes 30Hz can scale with N, this cvar alone doesn't fix
-// that, see the 0x820D011C constant noted above for where such a fix would need to go.
-REXCVAR_DECLARE(int32_t, frame_rate_limit);
+// the guest ticks at the safe console-authentic 30Hz regardless of host present rate;
+// frame_rate_limit=-1 leaves the guest tick fully unthrottled (the host presents every frame it
+// gets; vsync still governs the display); setting frame_rate_limit=N raises both the host
+// present cap and the guest tick rate to N together, clamped to the display refresh rate when
+// the native display mode is known (see GetEffectiveFrameRateLimit in
+// graphics/frame_rate_limit.cpp) -- the same tradeoff the Cemu (Wii U) build's graphic-pack FPS
+// mod makes with its single vsyncFrequency setting. Movement/timing math that assumes 30Hz can
+// scale with N, this cvar alone doesn't fix that, see the 0x820D011C constant noted above for
+// where such a fix would need to go.
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -181,11 +185,18 @@ void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline) {
 // guest's own render thread -- a plain function-local static (no synchronization) is sufficient
 // since nothing else touches it concurrently.
 void ThrottleGuestTickRate() {
-  const int32_t frame_rate_limit_value = REXCVAR_GET(frame_rate_limit);
-  // frame_rate_limit=0 means "unlimited" for the host present loop, but the guest sim can never
-  // safely go fully uncapped (that's the render-speed-coupled gameplay speed bug) -- fall back to
-  // the console-authentic 30Hz default in that case. Only an explicit positive frame_rate_limit
-  // raises the guest tick rate, matching the host present cap.
+  // The effective limit re-reads the (hot-reloadable) cvar on every call and clamps positive
+  // values to the display refresh rate when the native display mode is known.
+  const int32_t frame_rate_limit_value = rex::graphics::GetEffectiveFrameRateLimit();
+  // -1 = unlimited: no guest tick throttle at all -- return immediately; the host presents
+  // every frame it gets and vsync still governs the display.
+  if (frame_rate_limit_value < 0) {
+    return;
+  }
+  // frame_rate_limit=0 means the guest sim can never safely go fully uncapped by default (that's
+  // the render-speed-coupled gameplay speed bug) -- fall back to the console-authentic 30Hz
+  // default in that case. Only an explicit positive limit raises the guest tick rate, matching
+  // the host present cap.
   const double target_hz = frame_rate_limit_value > 0 ? double(frame_rate_limit_value) : 30.0;
   static std::optional<std::chrono::steady_clock::time_point> next_tick_time;
   const auto tick_duration =

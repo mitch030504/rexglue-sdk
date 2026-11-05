@@ -21,6 +21,7 @@ set(REXUI_CORE_SOURCES
     fsr4_runtime.cpp
     window.cpp
     window_sdl.cpp
+    display_mode.cpp
     windowed_app.cpp
     windowed_app_context.cpp
     windowed_app_context_sdl.cpp

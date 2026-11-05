@@ -22,6 +22,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_rate_limit.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -39,8 +40,6 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
-
-REXCVAR_DECLARE(int32_t, frame_rate_limit);
 
 namespace {
 
@@ -166,13 +165,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        // If frame_rate_limit asks for more than the configured video_mode_refresh_rate, raise
-        // the guest vblank rate to match automatically -- otherwise this thread would still only
-        // mark vblank at the old (lower) rate, silently capping anything paced off vblank
-        // interrupts even though ThrottleGuestTickRate (xboxkrnl_video.cpp) and the host present
-        // loop (d3d12_presenter.cpp) were both told to go faster. No separate cvar to keep in
-        // sync by hand: frame_rate_limit alone is enough.
-        const int32_t frame_rate_limit_value = REXCVAR_GET(frame_rate_limit);
+        // If the effective frame rate limit asks for more than the configured
+        // video_mode_refresh_rate, raise the guest vblank rate to match automatically --
+        // otherwise this thread would still only mark vblank at the old (lower) rate, silently
+        // capping anything paced off vblank interrupts even though ThrottleGuestTickRate
+        // (xboxkrnl_video.cpp) and the host present loop (d3d12_presenter.cpp) were both told to
+        // go faster. No separate cvar to keep in sync by hand: frame_rate_limit alone is enough.
+        // -1 (unlimited) deliberately leaves the vblank rate at the configured video mode rate:
+        // the guest tick is unthrottled, but the console's own clock keeps its configured
+        // cadence.
+        const int32_t frame_rate_limit_value = rex::graphics::GetEffectiveFrameRateLimit();
         if (frame_rate_limit_value > 0) {
           refresh_rate_hz = std::max(refresh_rate_hz, double(frame_rate_limit_value));
         }

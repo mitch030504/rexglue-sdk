@@ -30,6 +30,13 @@ set(REXGPU_XENOS_SOURCES
     pipeline/shader/translator_disasm.cpp
 )
 
+# frame_rate_limit.cpp lives in this directory (next to graphics_system.cpp above) but is
+# compiled into the rexui object library, not the plugin: GetEffectiveFrameRateLimit is called
+# from rexruntime (kernel/xboxkrnl/xboxkrnl_video.cpp) and from the unit tests, and rexgpu-xenos
+# links rexruntime -- so the definition must sit in the one module that contains the rexui
+# objects (rexruntime), where the frame_rate_limit cvar storage (presenter.cpp) also lives.
+target_sources(rexui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/frame_rate_limit.cpp)
+
 # SPIR-V shader translation
 set(REXGPU_XENOS_SPIRV_SOURCES
     pipeline/shader/spirv_builder.cpp

@@ -6,6 +6,7 @@ add_executable(unit_tests
     ui/motion_contract_test.cpp
     graphics/spirv_modification_test.cpp
     graphics/trace_marker_test.cpp
+    graphics/resolution_frame_limit_test.cpp
     test_memory.cpp
     audio/guest_audio_stretch_test.cpp
     memory/heap_allocation_test.cpp

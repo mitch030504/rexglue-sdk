@@ -32,10 +32,15 @@ REXCVAR_DEFINE_INT32(frame_rate_limit, 0, "Graphics",
                      "Caps the frame rate to this many frames per second. Paces the guest's own "
                      "Update+Render+Present tick (see ThrottleGuestTickRate in "
                      "xboxkrnl_video.cpp); the host presents each guest frame as it arrives, so "
-                     "this one limiter sets the displayed frame rate too. 0 = the guest ticks at "
-                     "a safe 30Hz default. Some of the game's own gameplay timing math assumes a "
-                     "fixed ~30Hz cadence and doesn't automatically scale with a higher rate.")
-    .range(0, 1000)
+                     "this one limiter sets the displayed frame rate too. -1 = unlimited: no "
+                     "guest tick throttle at all, the host presents every frame and vsync still "
+                     "governs the display. 0 = the guest ticks at a safe 30Hz default. N > 0 = "
+                     "cap at N frames per second, clamped to the display refresh rate when the "
+                     "native display mode is known (see GetEffectiveFrameRateLimit in "
+                     "graphics/frame_rate_limit.cpp). Some of the game's own gameplay timing "
+                     "math assumes a fixed ~30Hz cadence and doesn't automatically scale with a "
+                     "higher rate.")
+    .range(-1, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Shared by the D3D12 and Vulkan presenters' temporal upscalers.

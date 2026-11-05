@@ -2565,7 +2565,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     // anchor both fixes to the same ground truth.
     int32_t configured_width = 0;
     int32_t configured_height = 0;
-    if (rex::graphics::video_mode_util::TryParseResolutionPreset(
+    if (rex::graphics::video_mode_util::TryResolveResolutionPreset(
             REXCVAR_GET(resolution), configured_width, configured_height) &&
         configured_width > 0 && configured_height > 0) {
       display_width = uint32_t(configured_width);

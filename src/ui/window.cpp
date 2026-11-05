@@ -61,7 +61,9 @@ REXCVAR_DEFINE_INT32(video_mode_height, 0, "Display",
 
 REXCVAR_DEFINE_STRING(resolution, "", "Graphics",
                       "Common resolution preset for both guest video mode and startup window (for "
-                      "example: 720p, 1080p, 1440p, 4k, 1280x720)")
+                      "example: 720p, 1080p, 1440p, 4k, or a custom WxH like 1280x720). 'native' "
+                      "uses the selected monitor's current display mode; values above the display "
+                      "resolution are scaled down to fit, preserving aspect")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "Display",
