@@ -89,6 +89,13 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
+  // Same binding, but as a true 2D view of layer 0 even when the guest texture
+  // is a 2D array (the guest binds array views to sampler2D; the live NR prep
+  // shader declares sampler2D, and a 2D array view there is invalid usage).
+  // Falls back to the normal view for 3D textures (already a 2D view).
+  VkImageView GetActiveBindingOrNullImageView2D(uint32_t fetch_constant_index,
+                                                xenos::FetchOpDimension dimension, bool is_signed);
+
   // Host VkFormat of the view bound for this fetch constant (from the guest
   // texture's host format pair), or VK_FORMAT_UNDEFINED when there is no valid
   // binding. The guest path never stores the view format on the texture, but

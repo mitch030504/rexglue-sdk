@@ -4337,7 +4337,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         fetches_composition_source &&
         (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || fetches_seq1);
     if (seam_draw && colour_fetch_constant != UINT32_MAX) {
-      const VkImageView colour_view = texture_cache_->GetActiveBindingOrNullImageView(
+      // The prep's texture bindings are sampler2D; the guest's stacked textures
+      // are bound as 2D array views by the game itself (a spec mismatch there),
+      // so acquire a true 2D view of layer 0 for the compute dispatch.
+      const VkImageView colour_view = texture_cache_->GetActiveBindingOrNullImageView2D(
           colour_fetch_constant, colour_dimension, false);
       uint32_t scene_width = 0;
       uint32_t scene_height = 0;

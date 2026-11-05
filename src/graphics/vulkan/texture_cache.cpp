@@ -671,6 +671,34 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
   }
 }
 
+VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView2D(
+    uint32_t fetch_constant_index, xenos::FetchOpDimension dimension, bool is_signed) {
+  // The live NR prep shader declares sampler2D, but the guest binds its stacked
+  // textures as 2D array views (the guest draw has the same spec mismatch).
+  // Sampling layer 0 through a true 2D view is what the guest shader's
+  // sampler2D effectively does, and it is valid usage for the compute pipeline.
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || !AreDimensionsCompatible(dimension, binding->key.dimension)) {
+    return VK_NULL_HANDLE;
+  }
+  if (binding->key.dimension == xenos::DataDimension::k3D &&
+      (dimension == xenos::FetchOpDimension::k1D || dimension == xenos::FetchOpDimension::k2D)) {
+    Texture* texture = is_signed && texture_util::IsAnySignSigned(binding->swizzled_signs) &&
+                               IsSignedVersionSeparateForFormat(binding->key)
+                           ? binding->texture_signed
+                           : binding->texture;
+    return texture != nullptr ? static_cast<VulkanTexture*>(texture)->GetOrCreate3DAs2DImageView(
+                                    is_signed, binding->host_swizzle)
+                              : VK_NULL_HANDLE;
+  }
+  VulkanTexture* texture = static_cast<VulkanTexture*>(
+      is_signed ? binding->texture_signed : binding->texture);
+  if (texture == nullptr) {
+    return VK_NULL_HANDLE;
+  }
+  return texture->GetView(is_signed, binding->host_swizzle, false);
+}
+
 VkFormat VulkanTextureCache::GetActiveBindingViewFormat(uint32_t fetch_constant_index,
                                                         bool is_signed) const {
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
