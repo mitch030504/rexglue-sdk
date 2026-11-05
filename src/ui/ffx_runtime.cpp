@@ -103,6 +103,9 @@ namespace {
 // Set by ForceLinkedBackend() when the provider loaded but cannot be used (context creation
 // failed); Get() then serves the linked backend for the rest of the process.
 std::atomic<bool> g_force_linked{false};
+// Set once the user-supplied provider loaded and its entry points resolved, i.e. Get(kVulkan)
+// serves it (until ForceLinkedBackend drops it).
+std::atomic<bool> g_provider_loaded{false};
 
 // ABI caveat: a 2.4.0-era provider .so (FSR 4.1.2) speaks the SDK 2.x ffxApi ABI, where
 // ffxCreateBackendVKDesc carries the device in a VkDeviceContext struct (see the
@@ -172,6 +175,7 @@ const Functions* LoadVulkanProvider(Loaded& loaded) {
     }
     // The module stays loaded for the process lifetime: the provider owns Vulkan objects, so
     // dlclose at exit would not be safe.
+    g_provider_loaded.store(true, std::memory_order_relaxed);
     rex::ui::fsr4::SetProviderLoaded(loaded_from);
     REXLOG_INFO("FidelityFX: using {} for Vulkan", loaded_from);
   });
@@ -201,7 +205,10 @@ void ForceLinkedBackend(const char* reason) {
               reason != nullptr ? reason : "unusable");
 }
 
-bool IsProviderActive() { return !g_force_linked.load(std::memory_order_relaxed); }
+bool IsProviderActive() {
+  return g_provider_loaded.load(std::memory_order_relaxed) &&
+         !g_force_linked.load(std::memory_order_relaxed);
+}
 
 const Functions* GetAny() {
   return Get(Api::kVulkan);
