@@ -42,8 +42,13 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(push_constant) uniform PushConstants {
   // The NR evaluation extent (record_engine's width/height).
   uvec2 out_extent;
-  // The guest composition source's extent (the scene resolve, 1000x600 today).
+  // The guest composition source's and depth resolve's extent (the scene
+  // resolve, 1000x600 today).
   uvec2 scene_extent;
+  // Whether the guest supplied a depth resolve this frame; 0 means the bound
+  // depth source is the 1x1 dummy and depth_out is left alone (the runtime is
+  // then given no depth image at all).
+  uint depth_enabled;
 } pc;
 
 // set 0, binding 0: the motion guide output buffer, packed uvec2 words, one
@@ -61,6 +66,15 @@ layout(set = 0, binding = 2) uniform sampler2D colour_src;
 // set 0, binding 3: the evaluation-extent R8G8B8A8_UNORM pre-upscaled colour NR
 // consumes.
 layout(rgba8, set = 0, binding = 3) writeonly uniform image2D colour_out;
+
+// set 0, binding 4: the guest's scene depth resolve, sampled as R32_SFLOAT
+// (the texture cache's k_24_8 load shader decodes the 24-bit unorm depth).
+layout(set = 0, binding = 4) uniform sampler2D depth_src;
+
+// set 0, binding 5: the evaluation-extent R32_SFLOAT depth NR consumes. The
+// runtime samples it in place, so this is a nearest resample of the guest
+// depth (interpolating across a silhouette would invent a surface).
+layout(r32f, set = 0, binding = 5) writeonly uniform image2D depth_out;
 
 vec4 unpack_guide(uvec2 word) {
   // Low word: packHalf2x16(motion.xy). High word: packHalf2x16(motion.zw),
@@ -97,4 +111,11 @@ void main() {
   // Colour: the same linear scene-to-output mapping as the composition fetch.
   const vec2 cuv = (vec2(px) + 0.5) / vec2(pc.out_extent);
   imageStore(colour_out, ivec2(px), textureLod(colour_src, cuv, 0.0));
+  // Depth: nearest, at the guest texel that covers this output pixel. The
+  // guest depth resolve is the same scene rect as the colour source.
+  if (pc.depth_enabled != 0u) {
+    const ivec2 src = clamp(ivec2(vec2(px) * vec2(pc.scene_extent) / vec2(pc.out_extent)),
+                            ivec2(0), ivec2(pc.scene_extent) - 1);
+    imageStore(depth_out, ivec2(px), vec4(texelFetch(depth_src, src, 0).r, 0.0, 0.0, 1.0));
+  }
 }

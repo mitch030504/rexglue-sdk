@@ -696,6 +696,64 @@ void VulkanTextureCache::GetActiveBindingExtent(uint32_t fetch_constant_index, u
   height = binding->key.GetHeight();
 }
 
+VkImageView VulkanTextureCache::AcquireResolvedGuestTextureView(uint32_t base,
+                                                                uint32_t pitch_div_32,
+                                                                uint32_t width, uint32_t height,
+                                                                xenos::Endian endian,
+                                                                VkImage& image_out) {
+  image_out = VK_NULL_HANDLE;
+  if (!base || !pitch_div_32 || !width || !height) {
+    return VK_NULL_HANDLE;
+  }
+  // A 2D guest texture sampled as k_24_8 (the depth resolve): the host format
+  // pair's load shader decodes the 24-bit unorm depth into R32_SFLOAT.
+  TextureKey key;
+  key.base_page = base >> 12;
+  key.dimension = xenos::DataDimension::k2DOrStacked;
+  key.width_minus_1 = width - 1;
+  key.height_minus_1 = height - 1;
+  key.tiled = 1;
+  key.pitch = pitch_div_32;
+  key.format = xenos::TextureFormat::k_24_8;
+  key.endianness = endian;
+  key.is_valid = 1;
+  Texture* texture = FindOrCreateTexture(key);
+  if (texture == nullptr) {
+    return VK_NULL_HANDLE;
+  }
+  // The resolve wrote guest memory; this records the load shader (a compute
+  // dispatch reading the shared memory buffer) into the open submission, the
+  // same way RequestTextures does for a fetch binding.
+  if (!LoadTextureData(*texture)) {
+    return VK_NULL_HANDLE;
+  }
+  VulkanTexture* vulkan_texture = static_cast<VulkanTexture*>(texture);
+  vulkan_texture->MarkAsUsed();
+  // SetUsage returns the usage the texture had before, which is what the
+  // barrier must transition from (LoadTextureData leaves it as a transfer
+  // destination; a texture that needed no load may be in any state).
+  VulkanTexture::Usage old_usage =
+      vulkan_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
+  if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
+    VkPipelineStageFlags old_stage_mask;
+    VkAccessFlags old_access_mask;
+    VkImageLayout old_layout;
+    GetTextureUsageMasks(old_usage, old_stage_mask, old_access_mask, old_layout);
+    VkPipelineStageFlags dst_stage_mask;
+    VkAccessFlags dst_access_mask;
+    VkImageLayout new_layout;
+    GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, dst_stage_mask, dst_access_mask,
+                         new_layout);
+    command_processor_.PushImageMemoryBarrier(
+        vulkan_texture->image(), ui::vulkan::util::InitializeSubresourceRange(), old_stage_mask,
+        dst_stage_mask, old_access_mask, dst_access_mask, old_layout, new_layout);
+  }
+  image_out = vulkan_texture->image();
+  // The depth input is sampled as a 2D texture; the array view is not needed
+  // (the composition source's 2D-array view is what the guest draw binds).
+  return vulkan_texture->GetView(false, GetHostFormatSwizzle(key), false);
+}
+
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();

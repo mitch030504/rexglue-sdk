@@ -65,6 +65,12 @@ struct LiveFrameInput {
   uint32_t colour_height = 0;
   // The Phase 2 guide resolve output, colour_width x colour_height uvec2 words.
   VkBuffer guide_buffer = VK_NULL_HANDLE;
+  // The guest's own scene depth resolve (1000x600 kD24S8, sampled as
+  // R32_SFLOAT), or null on a frame without a usable depth resolve - NR then
+  // runs without the silhouette guide, as before.
+  VkImageView depth_view = VK_NULL_HANDLE;
+  uint32_t depth_width = 0;
+  uint32_t depth_height = 0;
   // The sampler the composition draw binds for this fetch: the pre-upscale must
   // resample exactly as the composition would, or the live answer's mapping
   // differs from the guest path.

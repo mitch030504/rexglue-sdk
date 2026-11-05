@@ -552,7 +552,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // sets last_live_skip_frame_ and returns false (the caller keeps the guest
   // view). Nothing is recorded without a valid guide field for this frame.
   bool RecordLiveNrAtSeam(VkImageView colour_view, uint32_t colour_width, uint32_t colour_height,
-                          VkSampler sampler, uint64_t frame);
+                          VkSampler sampler, VkImageView depth_view, uint32_t depth_width,
+                          uint32_t depth_height, uint64_t frame);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,

@@ -58,6 +58,7 @@ REXCVAR_DECLARE(std::string, resolution);
 REXCVAR_DECLARE(int32_t, dlss5_amd_draw_filter);
 REXCVAR_DECLARE(bool, dlss5_live_trace);
 REXCVAR_DECLARE(bool, dlss5_live_no_substitute);
+REXCVAR_DECLARE(bool, dlss5_live_no_depth);
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -4356,8 +4357,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         }
       }
       if (colour_view != VK_NULL_HANDLE) {
-        RecordLiveNrAtSeam(colour_view, scene_width, scene_height, composition_sampler,
-                           GetCurrentFrame());
+        // Depth: the guest's own scene resolve, acquired as a sampled R32_SFLOAT
+        // texture from guest memory (the resolve copied it there this frame).
+        // record_engine blits it to the model extent with NEAREST, so no
+        // upscale here - and no depth at all on a frame without a usable
+        // resolve, which the runtime handles as it always has.
+        VkImageView depth_view = VK_NULL_HANDLE;
+        uint32_t depth_width = 0;
+        uint32_t depth_height = 0;
+        const auto& depth_resolve = render_target_cache_->live_depth_resolve();
+        if (!REXCVAR_GET(dlss5_live_no_depth) && depth_resolve.valid &&
+            depth_resolve.frame == GetCurrentFrame() && depth_resolve.base) {
+          VkImage acquired_depth = VK_NULL_HANDLE;
+          depth_view = texture_cache_->AcquireResolvedGuestTextureView(
+              depth_resolve.base, depth_resolve.pitch_div_32, depth_resolve.width,
+              depth_resolve.height, depth_resolve.endian, acquired_depth);
+          if (depth_view != VK_NULL_HANDLE && acquired_depth != VK_NULL_HANDLE) {
+            depth_width = depth_resolve.width;
+            depth_height = depth_resolve.height;
+          } else {
+            depth_view = VK_NULL_HANDLE;
+          }
+        }
+        RecordLiveNrAtSeam(colour_view, scene_width, scene_height, composition_sampler, depth_view,
+                           depth_width, depth_height, GetCurrentFrame());
       }
     }
   }
@@ -6960,7 +6983,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
 bool VulkanCommandProcessor::RecordLiveNrAtSeam(VkImageView colour_view, uint32_t colour_width,
                                                 uint32_t colour_height, VkSampler sampler,
-                                                uint64_t frame) {
+                                                VkImageView depth_view, uint32_t depth_width,
+                                                uint32_t depth_height, uint64_t frame) {
   // Live NR seam (dlss5_amd_mode=3), per the Track 1 live path: at the first
   // composition draw of a guest frame the scene is complete, so the motion
   // guide can be composited early, the submission split, one NR frame recorded
@@ -7078,6 +7102,9 @@ bool VulkanCommandProcessor::RecordLiveNrAtSeam(VkImageView colour_view, uint32_
         live_input.colour_height = colour_height;
         live_input.guide_buffer = guide_buffer;
         live_input.sampler = sampler;
+        live_input.depth_view = depth_view;
+        live_input.depth_width = depth_width;
+        live_input.depth_height = depth_height;
         live_input.frame = frame;
         live_input.reset = reset;
         live_input.descriptor_slot = slot;

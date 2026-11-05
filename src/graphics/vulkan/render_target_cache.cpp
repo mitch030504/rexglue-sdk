@@ -3916,6 +3916,26 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          // Remember the scene depth resolve for the live NR seam: the seam
+          // acquires the resolved texture by guest address and hands it to
+          // record_engine as the depth input. Only the exact scene resolve at
+          // 1000x600 in kD24S8 is usable (the same geometry the depth probe
+          // validates); anything else leaves the seam without depth.
+          if (resolve_info.IsCopyingDepth() && !draw_resolution_scaled &&
+              resolve_info.coordinate_info.width_div_8 == (1000u / 8u) &&
+              resolve_info.height_div_8 == (600u / 8u) &&
+              xenos::DepthRenderTargetFormat(resolve_info.depth_edram_info.format) ==
+                  xenos::DepthRenderTargetFormat::kD24S8) {
+            live_depth_resolve_.valid = true;
+            live_depth_resolve_.frame = command_processor_.GetCurrentFrame();
+            live_depth_resolve_.base = resolve_info.copy_dest_base;
+            live_depth_resolve_.pitch_div_32 =
+                resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
+            live_depth_resolve_.width = 1000;
+            live_depth_resolve_.height = 600;
+            live_depth_resolve_.endian =
+                xenos::Endian(resolve_info.copy_dest_info.copy_dest_endian);
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;

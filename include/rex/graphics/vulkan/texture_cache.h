@@ -103,6 +103,21 @@ class VulkanTextureCache final : public TextureCache {
   void GetActiveBindingExtent(uint32_t fetch_constant_index, uint32_t& width,
                               uint32_t& height) const;
 
+  // Acquires a guest 2D texture that no fetch constant currently references
+  // (the live NR seam's depth input: the guest's own scene depth resolve) and
+  // returns a sampled view of it, creating and loading the texture from guest
+  // memory if needed. The geometry is the resolve destination's: `base` is the
+  // guest address, `pitch_div_32` the pitch in 32-pixel units, `endian` the
+  // copy's destination endianness. The load is recorded into the open
+  // submission (a compute dispatch reading the shared memory buffer, as
+  // RequestTextures does), and a barrier to SHADER_READ_ONLY is pushed if the
+  // usage changed. `image_out` receives the VkImage for the caller's
+  // record_engine frame description. Returns VK_NULL_HANDLE if the key cannot
+  // be created or loaded.
+  VkImageView AcquireResolvedGuestTextureView(uint32_t base, uint32_t pitch_div_32, uint32_t width,
+                                              uint32_t height, xenos::Endian endian,
+                                              VkImage& image_out);
+
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,

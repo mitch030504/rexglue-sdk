@@ -96,6 +96,10 @@ REXCVAR_DEFINE_BOOL(dlss5_live_trace, false, "GPU",
                     "Development: log each step of the live seam (split, guide resolve, live "
                     "record, submit, resume) so a stall can be localized to its call.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(dlss5_live_no_depth, false, "GPU",
+                    "Development (dlss5_amd_mode=3): do not feed the guest scene depth resolve "
+                    "to NR (A/B of the silhouette guide).")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(dlss5_live_no_substitute, false, "GPU",
                     "Development: record live NR but keep the guest composition source (isolates "
                     "the substitute descriptor from the split and the record).")
@@ -163,10 +167,23 @@ VkImageView g_live_colour_view = VK_NULL_HANDLE;
 VkImage g_live_motion = VK_NULL_HANDLE;
 VkDeviceMemory g_live_motion_memory = VK_NULL_HANDLE;
 VkImageView g_live_motion_view = VK_NULL_HANDLE;
+// The NR depth input (R32_SFLOAT at the runtime extent): the prep writes it by
+// nearest-sampling the guest's own scene depth resolve, and record_engine
+// samples it in place. The guest depth texture itself is SAMPLED|TRANSFER_DST
+// only, so it cannot be blitted from - this image is why the prep exists.
+VkImage g_live_depth = VK_NULL_HANDLE;
+VkDeviceMemory g_live_depth_memory = VK_NULL_HANDLE;
+VkImageView g_live_depth_view = VK_NULL_HANDLE;
+// 1x1 R32_SFLOAT bound as the prep's depth source on frames without a guest
+// depth resolve (never sampled then - depth_enabled is 0).
+VkImage g_live_null_depth = VK_NULL_HANDLE;
+VkDeviceMemory g_live_null_depth_memory = VK_NULL_HANDLE;
+VkImageView g_live_null_depth_view = VK_NULL_HANDLE;
 // Actual current layout of each live image, in this queue's submission order.
 VkImageLayout g_live_target_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 VkImageLayout g_live_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 VkImageLayout g_live_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_live_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 // The view substituted for the composition source: the NR target when the
 // runtime takes a separate target, else the in-place colour answer.
 VkImageView g_live_substitute_view = VK_NULL_HANDLE;
@@ -476,8 +493,16 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   VkDescriptorImageInfo colour_out_info{};
   colour_out_info.imageView = g_live_colour_view;
   colour_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-  VkWriteDescriptorSet writes[4] = {};
-  for (uint32_t i = 0; i < 4; ++i) {
+  const bool has_depth = input.depth_view != VK_NULL_HANDLE;
+  VkDescriptorImageInfo depth_src_info{};
+  depth_src_info.sampler = g_live_sampler;
+  depth_src_info.imageView = has_depth ? input.depth_view : g_live_null_depth_view;
+  depth_src_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorImageInfo depth_out_info{};
+  depth_out_info.imageView = g_live_depth_view;
+  depth_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkWriteDescriptorSet writes[6] = {};
+  for (uint32_t i = 0; i < 6; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = descriptor_set;
     writes[i].dstBinding = i;
@@ -491,6 +516,10 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   writes[2].pImageInfo = &colour_src_info;
   writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[3].pImageInfo = &colour_out_info;
+  writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  writes[4].pImageInfo = &depth_src_info;
+  writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[5].pImageInfo = &depth_out_info;
   dfn.vkUpdateDescriptorSets(device.device(), uint32_t(rex::countof(writes)), writes, 0, nullptr);
 
   // Everything the previous (same-queue, already submitted) work wrote - the
@@ -525,14 +554,32 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
                              &to_general);
     g_live_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
   }
+  // The depth output has the same storage-write requirement and the same
+  // in-place sample afterwards (record_engine reads it where the prep wrote
+  // it), so it follows the colour's layout cycle.
+  if (g_live_depth_layout != VK_IMAGE_LAYOUT_GENERAL) {
+    VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_general.oldLayout = g_live_depth_layout;
+    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.image = g_live_depth;
+    to_general.subresourceRange = full_range;
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_general);
+    g_live_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+  }
 
   dfn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline);
   dfn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline_layout, 0, 1,
                               &descriptor_set, 0, nullptr);
   // [out extent, scene extent] - the pre-upscale maps the whole source onto the
   // whole output, exactly as the composition's own fetch of the source does.
-  const uint32_t push_constants[4] = {g_live_width, g_live_height, input.colour_width,
-                                      input.colour_height};
+  const uint32_t push_constants[5] = {g_live_width, g_live_height, input.colour_width,
+                                      input.colour_height, has_depth ? 1u : 0u};
   dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                          sizeof(push_constants), push_constants);
   dfn.vkCmdDispatch(cmd, (g_live_width + 7u) / 8u, (g_live_height + 7u) / 8u, 1);
@@ -644,7 +691,25 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   engine_frame.motion_scale_y = rex::ui::kMotionNdcToBackwardUvScaleY;
   engine_frame.motion_texture_width = g_live_width;
   engine_frame.motion_texture_height = g_live_height;
-  // Depth is v2: left empty, not inverted.
+  // Depth is optional: the prep's nearest resample of the guest's scene depth
+  // resolve, at the runtime extent, sampled in place by record_engine (the
+  // runtime's depth_in_place path - no blit, and no TRANSFER_SRC needed on the
+  // guest texture). `depth_inverted=false` is the Xenos convention the depth
+  // probe validated.
+  if (has_depth) {
+    engine_frame.depth.image = g_live_depth;
+    engine_frame.depth.format = VK_FORMAT_R32_SFLOAT;
+    engine_frame.depth.width = g_live_width;
+    engine_frame.depth.height = g_live_height;
+    engine_frame.depth.before = VK_IMAGE_LAYOUT_GENERAL;
+    engine_frame.depth.after = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    engine_frame.depth.before_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    engine_frame.depth.before_access = VK_ACCESS_SHADER_WRITE_BIT;
+    engine_frame.depth.after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    engine_frame.depth.after_access = VK_ACCESS_SHADER_READ_BIT;
+    engine_frame.depth.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
   engine_frame.depth_inverted = false;
   engine_frame.reset = input.reset;
   engine_frame.feature = 0;
@@ -684,15 +749,19 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   // when it is the answer; a separate target otherwise).
   g_live_colour_layout = engine_frame.colour.after;
   g_live_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  if (has_depth) {
+    g_live_depth_layout = engine_frame.depth.after;
+  }
   if (takes_target) {
     g_live_target_layout = engine_frame.target.after;
   }
   REXGPU_INFO("dlss5_live frame={} applied={} dispatches={} history_consumed={} provider={} "
-              "gpu_ms={:.3f} reset={} extent={}x{} scene={}x{}",
+              "gpu_ms={:.3f} reset={} extent={}x{} scene={}x{} depth={}",
               input.frame, result.frame.applied ? 1 : 0, result.frame.network_dispatches,
               result.history_consumed ? 1 : 0, result.motion_provider,
               double(g_runtime->last_gpu_ms()), input.reset ? 1 : 0, g_live_width, g_live_height,
-              input.colour_width, input.colour_height);
+              input.colour_width, input.colour_height,
+              has_depth ? "engine" : "none");
   ReportRecordedFrame(result.frame.applied, g_runtime->last_gpu_ms());
   return result.frame.applied;
 #else
@@ -1030,9 +1099,10 @@ bool TransitionLiveImages(const vulkan::VulkanDevice& device, VkQueue queue, uin
   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   dfn.vkBeginCommandBuffer(command_buffer, &begin);
-  const VkImage images[3] = {g_live_target, g_live_colour, g_live_motion};
-  VkImageMemoryBarrier barriers[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  const VkImage images[5] = {g_live_target, g_live_colour, g_live_motion, g_live_depth,
+                             g_live_null_depth};
+  VkImageMemoryBarrier barriers[5] = {};
+  for (uint32_t i = 0; i < 5; ++i) {
     barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[i].srcAccessMask = 0;
     barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1103,9 +1173,38 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
                        g_live_motion_memory)) {
     return fail("motion image");
   }
+  // Depth: the prep shader's R32_SFLOAT output. record_engine either samples it
+  // in place (depth_in_place) or blits it into its own depth image, so it needs
+  // both SAMPLED and TRANSFER_SRC.
+  if (!CreateLiveImage(device, VK_FORMAT_R32_SFLOAT,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                       g_live_depth, g_live_depth_memory)) {
+    return fail("depth image");
+  }
+  // The bound-but-unused depth source for frames without a guest depth resolve.
+  {
+    VkImageCreateInfo null_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    null_info.imageType = VK_IMAGE_TYPE_2D;
+    null_info.format = VK_FORMAT_R32_SFLOAT;
+    null_info.extent = {1, 1, 1};
+    null_info.mipLevels = 1;
+    null_info.arrayLayers = 1;
+    null_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    null_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    null_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    null_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!vulkan::util::CreateDedicatedAllocationImage(
+            &device, null_info, vulkan::util::MemoryPurpose::kDeviceLocal, g_live_null_depth,
+            g_live_null_depth_memory)) {
+      return fail("null depth image");
+    }
+  }
   if (!CreateLiveView(device, g_live_target, VK_FORMAT_R8G8B8A8_UNORM, g_live_target_view) ||
       !CreateLiveView(device, g_live_colour, VK_FORMAT_R8G8B8A8_UNORM, g_live_colour_view) ||
-      !CreateLiveView(device, g_live_motion, VK_FORMAT_R16G16_SFLOAT, g_live_motion_view)) {
+      !CreateLiveView(device, g_live_motion, VK_FORMAT_R16G16_SFLOAT, g_live_motion_view) ||
+      !CreateLiveView(device, g_live_depth, VK_FORMAT_R32_SFLOAT, g_live_depth_view) ||
+      !CreateLiveView(device, g_live_null_depth, VK_FORMAT_R32_SFLOAT, g_live_null_depth_view)) {
     return fail("views");
   }
   if (!TransitionLiveImages(device, queue, family)) {
@@ -1114,6 +1213,7 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   g_live_target_layout = VK_IMAGE_LAYOUT_GENERAL;
   g_live_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
   g_live_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_live_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
   // The colour pre-upscale resamples the 1000x600 scene onto the runtime
   // extent; the draw's own sampler is passed per frame when available, and this
   // one (linear, clamp) is the fallback for the same mapping.
@@ -1130,8 +1230,9 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
     return fail("sampler");
   }
   // set 0: binding 0 = guide SSBO, 1 = motion storage image, 2 = colour
-  // sampler, 3 = colour storage image (see nr_motion_prep_cs.glsl).
-  VkDescriptorSetLayoutBinding bindings[4] = {};
+  // sampler, 3 = colour storage image, 4 = depth sampler, 5 = depth storage
+  // image (see nr_motion_prep_cs.glsl).
+  VkDescriptorSetLayoutBinding bindings[6] = {};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -1148,6 +1249,14 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   bindings[3].descriptorCount = 1;
   bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[4].binding = 4;
+  bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[4].descriptorCount = 1;
+  bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[5].binding = 5;
+  bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[5].descriptorCount = 1;
+  bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   VkDescriptorSetLayoutCreateInfo set_layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
   set_layout_info.bindingCount = uint32_t(rex::countof(bindings));
   set_layout_info.pBindings = bindings;
@@ -1159,9 +1268,9 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   pool_sizes[0].descriptorCount = kLiveDescriptorSlots;
   pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  pool_sizes[1].descriptorCount = 2 * kLiveDescriptorSlots;
+  pool_sizes[1].descriptorCount = 3 * kLiveDescriptorSlots;
   pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  pool_sizes[2].descriptorCount = kLiveDescriptorSlots;
+  pool_sizes[2].descriptorCount = 2 * kLiveDescriptorSlots;
   g_live_pool = std::make_unique<vulkan::SingleLayoutDescriptorSetPool>(
       &device, kLiveDescriptorSlots, uint32_t(rex::countof(pool_sizes)), pool_sizes,
       g_live_set_layout);
@@ -1175,7 +1284,7 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   VkPushConstantRange push_constant_range{};
   push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   push_constant_range.offset = 0;
-  push_constant_range.size = 4 * sizeof(uint32_t);
+  push_constant_range.size = 5 * sizeof(uint32_t);
   VkPipelineLayoutCreateInfo pipeline_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   pipeline_layout_info.setLayoutCount = 1;
   pipeline_layout_info.pSetLayouts = &g_live_set_layout;
@@ -1352,16 +1461,23 @@ void Shutdown() {
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_target_view);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_colour_view);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_motion_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_depth_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_null_depth_view);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_target);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_colour);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_motion);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_depth);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_null_depth);
     vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_target_memory);
     vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_colour_memory);
     vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_motion_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_depth_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_null_depth_memory);
     g_live_substitute_view = VK_NULL_HANDLE;
     g_live_target_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_live_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_live_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_live_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_live_width = 0;
     g_live_height = 0;
     g_live_device = nullptr;

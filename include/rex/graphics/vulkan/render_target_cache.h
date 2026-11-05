@@ -366,6 +366,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // The device-local 1000x600 RGBA16F guide buffer the last resolve produced
   // (see ResolveMotionGuideFrame). Consumed by the live NR seam's motion prep.
   VkBuffer motion_guide_output_buffer() const { return motion_guide_output_buffer_; }
+
+  // Geometry of the last scene depth resolve this frame (the guest's own
+  // 1000x600 kD24S8 resolve into guest memory), captured when the resolve copy
+  // wrote it so the live NR seam can acquire the resolved texture and hand it to
+  // record_engine as the depth input. `valid` is false when no such resolve
+  // happened for `frame` (or the destination was scaled or another format).
+  struct LiveDepthResolveGeometry {
+    bool valid = false;
+    uint64_t frame = UINT64_MAX;
+    // Guest address of the destination texture base.
+    uint32_t base = 0;
+    // Destination pitch in 32-pixel units (TextureKey::pitch).
+    uint32_t pitch_div_32 = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    xenos::Endian endian = xenos::Endian::kNone;
+  };
+  const LiveDepthResolveGeometry& live_depth_resolve() const { return live_depth_resolve_; }
   // Runs the ResolveMotionGuideFrame() body early - at the composition seam,
   // while the submission is still open - for the current frame, exactly once
   // per frame. The resolve swaps and clears the frame's framebuffer list, so
@@ -1432,6 +1450,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Presented-frame number of the field currently in the output buffer, or
   // UINT64_MAX when the last frame produced none (the buffer is not cleared then).
   uint64_t motion_guide_output_frame_ = UINT64_MAX;
+  // Last scene depth resolve for the live NR seam (see live_depth_resolve()).
+  LiveDepthResolveGeometry live_depth_resolve_;
   // Guide frame the live NR seam already resolved early
   // (EnsureMotionGuideResolvedForSeam); ResolveMotionGuideFrame refuses to run
   // a second composite for the same frame, which would overwrite the seam's
