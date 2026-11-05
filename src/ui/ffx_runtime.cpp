@@ -91,6 +91,11 @@ const Functions* GetAny() {
   return functions ? functions : Get(Api::kVulkan);
 }
 
+// The prebuilt loader has no user-supplied provider: the Vulkan presenter still queries these for
+// its FSR 4 status line and its context-failure fallback.
+void ForceLinkedBackend(const char*) {}
+bool IsProviderActive() { return false; }
+
 #elif !REX_PLATFORM_WIN32
 
 // The source build links one backend (FSR 3.1.4); its entry points accept only that backend's
@@ -228,6 +233,11 @@ const Functions* Get(Api) {
 const Functions* GetAny() {
   return &kLinked;
 }
+
+// The prebuilt SDK loader has no user-supplied provider: the Vulkan presenter still calls these
+// for its FSR 4 status line and context fallback, so provide the always-linked answers.
+void ForceLinkedBackend(const char*) {}
+bool IsProviderActive() { return false; }
 
 #endif
 
