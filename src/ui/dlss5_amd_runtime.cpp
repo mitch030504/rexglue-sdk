@@ -23,11 +23,20 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/math.h>
+#include <rex/types.h>
 #include <rex/ui/dlss5_amd.h>
 #include <rex/ui/dlss5_amd_vulkan.h>
+#include <rex/ui/motion_contract.h>
+#include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
+#include <rex/ui/vulkan/util.h>
 
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
 #include "nr_runtime.hpp"
+
+namespace shaders {
+#include "shaders/vulkan_spirv/nr_motion_prep_cs.h"
+}  // namespace shaders
 #endif
 
 REXCVAR_DEFINE_BOOL(dlss5_amd, false, "GPU",
@@ -41,8 +50,10 @@ REXCVAR_DEFINE_STRING(dlss5_amd_data_path, "", "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(dlss5_amd_mode, 0, "GPU",
                      "Development: 0 = off, 1 = substitute a pre-upscaled identity scene, "
-                     "2 = substitute an NR image. Requires dlss5_amd=true and dlss5_amd_image.")
-    .range(0, 2)
+                     "2 = substitute an NR image, 3 = live per-frame NR recorded at the "
+                     "composition seam (every frame; dlss5_amd_frame is ignored). Modes 1/2 "
+                     "require dlss5_amd=true and dlss5_amd_image; mode 3 requires dlss5_amd=true.")
+    .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(dlss5_amd_image, "", "GPU",
                       "Development: 1920x1080 raw RGBA8 image substituted for the composition "
@@ -75,6 +86,20 @@ REXCVAR_DEFINE_INT32(dlss5_amd_draw_filter, 1, "GPU",
                      "also fetching the seq-1 page 0x1212F in the same draw.")
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(dlss5_live_bypass, false, "GPU",
+                    "Development (dlss5_amd_mode=3): the live seam's identity control - the "
+                    "pre-upscaled scene colour is copied into the substitute instead of running "
+                    "NR, so the split, the pre-upscale and the transfer can be checked against "
+                    "the control without the network's edit.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(dlss5_live_trace, false, "GPU",
+                    "Development: log each step of the live seam (split, guide resolve, live "
+                    "record, submit, resume) so a stall can be localized to its call.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(dlss5_live_no_substitute, false, "GPU",
+                    "Development: record live NR but keep the guest composition source (isolates "
+                    "the substitute descriptor from the split and the record).")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::dlss5_amd {
 namespace {
@@ -102,6 +127,57 @@ PFN_vkDestroyImageView g_substitute_destroy_view = nullptr;
 PFN_vkDestroyImage g_substitute_destroy_image = nullptr;
 PFN_vkFreeMemory g_substitute_free_memory = nullptr;
 bool g_assets_initialized = false;
+
+// --- Live per-frame NR (mode 3) ---
+// Persistent resources created in InitializeRuntime when dlss5_amd_mode == 3
+// and the runtime constructed, at the runtime's own extent (model_width/height,
+// which is what record_engine validates against). g_live_target is the NR
+// answer and the composition substitute; g_live_colour is the pre-upscaled
+// scene colour NR consumes (the guest composition source is 1000x600, while
+// record_engine requires the colour at the runtime extent); g_live_motion is
+// the prep shader's R16G16_SFLOAT output. The prep pipeline is the one compute
+// shader compiled from shaders/nr_motion_prep_cs.glsl. The descriptor sets are
+// a small ring: the command processor hands RecordLiveFrame the slot whose
+// previous submission has completed, so updating the set is never in-flight.
+//
+// The layouts are tracked per image because the runtime takes the caller's
+// `before` as the barrier oldLayout: after the composition samples the answer
+// it is in SHADER_READ_ONLY_OPTIMAL, not GENERAL, and handing the runtime a
+// stale GENERAL would make the next frame's write an illegal no-op transition.
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+constexpr uint32_t kLiveGuideWidth = 1000;
+constexpr uint32_t kLiveGuideHeight = 600;
+constexpr VkDeviceSize kLiveGuideBytes =
+    VkDeviceSize(kLiveGuideWidth) * VkDeviceSize(kLiveGuideHeight) * 8u;
+constexpr uint32_t kLiveDescriptorSlots = 4;
+
+const vulkan::VulkanDevice* g_live_device = nullptr;
+uint32_t g_live_width = 0;
+uint32_t g_live_height = 0;
+VkImage g_live_target = VK_NULL_HANDLE;
+VkDeviceMemory g_live_target_memory = VK_NULL_HANDLE;
+VkImageView g_live_target_view = VK_NULL_HANDLE;
+VkImage g_live_colour = VK_NULL_HANDLE;
+VkDeviceMemory g_live_colour_memory = VK_NULL_HANDLE;
+VkImageView g_live_colour_view = VK_NULL_HANDLE;
+VkImage g_live_motion = VK_NULL_HANDLE;
+VkDeviceMemory g_live_motion_memory = VK_NULL_HANDLE;
+VkImageView g_live_motion_view = VK_NULL_HANDLE;
+// Actual current layout of each live image, in this queue's submission order.
+VkImageLayout g_live_target_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_live_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_live_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+// The view substituted for the composition source: the NR target when the
+// runtime takes a separate target, else the in-place colour answer.
+VkImageView g_live_substitute_view = VK_NULL_HANDLE;
+VkSampler g_live_sampler = VK_NULL_HANDLE;
+VkDescriptorSetLayout g_live_set_layout = VK_NULL_HANDLE;
+std::unique_ptr<vulkan::SingleLayoutDescriptorSetPool> g_live_pool;
+VkDescriptorSet g_live_sets[kLiveDescriptorSlots] = {};
+VkPipelineLayout g_live_pipeline_layout = VK_NULL_HANDLE;
+VkPipeline g_live_pipeline = VK_NULL_HANDLE;
+bool g_live_resources_failed = false;
+#endif  // REX_HAS_DLSS5_AMD
 
 // --- SHA-256 (FIPS 180-4), for the model pin. Small and self-contained so the
 // SDK does not gain a crypto dependency just to validate one user-supplied file.
@@ -330,12 +406,300 @@ const Status& GetStatus() {
 }
 
 bool SubstituteEnabled() {
-  return g_substitute_view_unorm != VK_NULL_HANDLE && REXCVAR_GET(dlss5_amd_mode) != 0;
+  // Mode 3 substitutes the live NR answer instead of the uploaded image, so it
+  // is enabled whenever the live resources exist, even without dlss5_amd_image.
+  return REXCVAR_GET(dlss5_amd_mode) != 0 &&
+         (g_substitute_view_unorm != VK_NULL_HANDLE || LiveEnabled());
 }
 
 bool SubstituteForFrame(uint64_t frame) {
+  // Mode 3 is live: every guest frame is substituted (the frame cvar's -1
+  // semantics), the per-frame gating happens in the command processor.
+  if (REXCVAR_GET(dlss5_amd_mode) == 3) {
+    return true;
+  }
   const int32_t first = REXCVAR_GET(dlss5_amd_frame);
   return first < 0 || uint64_t(first) == frame;
+}
+
+bool LiveEnabled() {
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  return REXCVAR_GET(dlss5_amd_mode) == 3 && g_runtime != nullptr &&
+         g_live_substitute_view != VK_NULL_HANDLE;
+#else
+  return false;
+#endif
+}
+
+VkImageView LiveTargetView() {
+  // The view substituted for the unsigned composition fetch in mode 3: the NR
+  // answer (a separate target when the runtime takes one, else the in-place
+  // colour). The signed fetch keeps SubstituteViewForFetch - it is never
+  // sampled by the composition shader.
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  return g_live_substitute_view;
+#else
+  return VK_NULL_HANDLE;
+#endif
+}
+
+bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  if (!g_runtime || g_live_device == nullptr || g_live_pipeline == VK_NULL_HANDLE ||
+      input.colour_view == VK_NULL_HANDLE || input.guide_buffer == VK_NULL_HANDLE ||
+      !input.colour_width || !input.colour_height ||
+      VkDeviceSize(input.colour_width) * VkDeviceSize(input.colour_height) * 8u > kLiveGuideBytes ||
+      input.descriptor_slot >= kLiveDescriptorSlots) {
+    return false;
+  }
+  const vulkan::VulkanDevice& device = *g_live_device;
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+  // Rebind the slot's descriptor set for this frame: the guide buffer is
+  // persistent but may have been recreated by a cache clear, and the guest
+  // colour view changes as the texture cache re-creates textures. The caller
+  // only hands out a slot whose previous submission has completed, so the set
+  // is not in use by in-flight work.
+  const VkDescriptorSet descriptor_set = g_live_sets[input.descriptor_slot];
+  VkDescriptorBufferInfo guide_info{};
+  guide_info.buffer = input.guide_buffer;
+  guide_info.offset = 0;
+  guide_info.range = kLiveGuideBytes;
+  VkDescriptorImageInfo motion_info{};
+  motion_info.imageView = g_live_motion_view;
+  motion_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkDescriptorImageInfo colour_src_info{};
+  colour_src_info.sampler = input.sampler != VK_NULL_HANDLE ? input.sampler : g_live_sampler;
+  colour_src_info.imageView = input.colour_view;
+  colour_src_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorImageInfo colour_out_info{};
+  colour_out_info.imageView = g_live_colour_view;
+  colour_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = descriptor_set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+  }
+  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  writes[0].pBufferInfo = &guide_info;
+  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[1].pImageInfo = &motion_info;
+  writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  writes[2].pImageInfo = &colour_src_info;
+  writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[3].pImageInfo = &colour_out_info;
+  dfn.vkUpdateDescriptorSets(device.device(), uint32_t(rex::countof(writes)), writes, 0, nullptr);
+
+  // Everything the previous (same-queue, already submitted) work wrote - the
+  // guide resolve's buffer stores and the guest texture's detile/transfer
+  // writes - must be visible to the prep dispatch. A device-scope memory
+  // barrier covers the guest image, whose VkImage is not known here (only its
+  // view), and the guide buffer together; the images stay in their current
+  // layouts (GENERAL for ours, SHADER_READ_ONLY_OPTIMAL for the guest view).
+  VkMemoryBarrier in_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  in_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_WRITE_BIT;
+  in_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in_barrier, 0, nullptr, 0,
+                           nullptr);
+
+  // The prep writes the colour as a storage image, which requires GENERAL. In
+  // the in-place fallback the answer is left SHADER_READ_ONLY (the composition
+  // samples it), so from the second frame on that is the colour's real layout.
+  if (g_live_colour_layout != VK_IMAGE_LAYOUT_GENERAL) {
+    VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_general.oldLayout = g_live_colour_layout;
+    to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_general.image = g_live_colour;
+    to_general.subresourceRange = full_range;
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_general);
+    g_live_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  dfn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline);
+  dfn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline_layout, 0, 1,
+                              &descriptor_set, 0, nullptr);
+  // [out extent, scene extent] - the pre-upscale maps the whole source onto the
+  // whole output, exactly as the composition's own fetch of the source does.
+  const uint32_t push_constants[4] = {g_live_width, g_live_height, input.colour_width,
+                                      input.colour_height};
+  dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         sizeof(push_constants), push_constants);
+  dfn.vkCmdDispatch(cmd, (g_live_width + 7u) / 8u, (g_live_height + 7u) / 8u, 1);
+  const bool trace = REXCVAR_GET(dlss5_live_trace);
+  if (trace) {
+    REXGPU_INFO("dlss5_live frame={} prep dispatched {}x{} -> {}x{}", input.frame,
+                input.colour_width, input.colour_height, g_live_width, g_live_height);
+  }
+
+  // Make the prep dispatch's stores visible to record_engine's own barriers.
+  VkMemoryBarrier out_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  out_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  out_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &out_barrier, 0, nullptr, 0,
+                           nullptr);
+
+  nr::Controls controls;
+  const bool takes_target = g_runtime->takes_target(controls);
+  if (REXCVAR_GET(dlss5_live_bypass)) {
+    // The live identity control: no network. The pre-upscaled colour is the
+    // answer, so copy it into the target (or keep it in place) and leave it in
+    // the layout the composition sample needs.
+    if (takes_target) {
+      if (g_live_target_layout != VK_IMAGE_LAYOUT_GENERAL) {
+        VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_general.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_general.oldLayout = g_live_target_layout;
+        to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.image = g_live_target;
+        to_general.subresourceRange = full_range;
+        dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &to_general);
+      }
+      VkImageCopy copy{};
+      copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      copy.dstSubresource = copy.srcSubresource;
+      copy.extent = {g_live_width, g_live_height, 1};
+      dfn.vkCmdCopyImage(cmd, g_live_colour, VK_IMAGE_LAYOUT_GENERAL, g_live_target,
+                         VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+      VkImageMemoryBarrier to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      to_sampled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      to_sampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      to_sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      to_sampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_sampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_sampled.image = g_live_target;
+      to_sampled.subresourceRange = full_range;
+      dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                               &to_sampled);
+      g_live_target_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+      VkImageMemoryBarrier to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      to_sampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      to_sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      to_sampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      to_sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      to_sampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_sampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_sampled.image = g_live_colour;
+      to_sampled.subresourceRange = full_range;
+      dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                               &to_sampled);
+      g_live_colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    REXGPU_INFO("dlss5_live frame={} BYPASS pre-upscale only ({}x{} -> {}x{})", input.frame,
+                input.colour_width, input.colour_height, g_live_width, g_live_height);
+    ReportRecordedFrame(true, 0.0f);
+    return true;
+  }
+
+  nr::EngineFrame engine_frame;
+  engine_frame.colour.image = g_live_colour;
+  engine_frame.colour.format = VK_FORMAT_R8G8B8A8_UNORM;
+  engine_frame.colour.width = g_live_width;
+  engine_frame.colour.height = g_live_height;
+  engine_frame.colour.before = VK_IMAGE_LAYOUT_GENERAL;
+  // In-place: the answer stays here and the composition samples it, so it must
+  // end in the sampled layout. A separate target leaves the colour as an input.
+  engine_frame.colour.after =
+      takes_target ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  engine_frame.colour.before_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  engine_frame.colour.before_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  engine_frame.colour.after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  engine_frame.colour.after_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  engine_frame.colour.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  engine_frame.motion.image = g_live_motion;
+  engine_frame.motion.format = VK_FORMAT_R16G16_SFLOAT;
+  engine_frame.motion.width = g_live_width;
+  engine_frame.motion.height = g_live_height;
+  engine_frame.motion.before = VK_IMAGE_LAYOUT_GENERAL;
+  engine_frame.motion.after = VK_IMAGE_LAYOUT_GENERAL;
+  engine_frame.motion.before_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  engine_frame.motion.before_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  engine_frame.motion.after_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  engine_frame.motion.after_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  engine_frame.motion.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  // Forward guest-NDC motion -> backward normalized UV (motion_contract.h).
+  engine_frame.motion_scale_x = rex::ui::kMotionNdcToBackwardUvScaleX;
+  engine_frame.motion_scale_y = rex::ui::kMotionNdcToBackwardUvScaleY;
+  engine_frame.motion_texture_width = g_live_width;
+  engine_frame.motion_texture_height = g_live_height;
+  // Depth is v2: left empty, not inverted.
+  engine_frame.depth_inverted = false;
+  engine_frame.reset = input.reset;
+  engine_frame.feature = 0;
+  if (takes_target) {
+    engine_frame.target.image = g_live_target;
+    engine_frame.target.format = VK_FORMAT_R8G8B8A8_UNORM;
+    engine_frame.target.width = g_live_width;
+    engine_frame.target.height = g_live_height;
+    engine_frame.target.before = g_live_target_layout;
+    // The composition draw samples the answer, so end in the sampled layout.
+    engine_frame.target.after = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    engine_frame.target.before_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    engine_frame.target.before_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    engine_frame.target.after_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    engine_frame.target.after_access = VK_ACCESS_SHADER_READ_BIT;
+    engine_frame.target.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  }
+
+  nr::EngineResult result;
+  try {
+    if (REXCVAR_GET(dlss5_live_trace)) {
+      REXGPU_INFO("dlss5_live frame={} engine_begin target={} colour_before={}", input.frame,
+                  takes_target ? "separate" : "in-place",
+                  engine_frame.target.before == VK_IMAGE_LAYOUT_GENERAL ? "general" : "sampled");
+    }
+    result = g_runtime->record_engine(cmd, engine_frame, controls);
+  } catch (const std::exception& e) {
+    REXLOG_WARN("DLSS 5 NR (AMD): record_engine failed on frame {}: {}", input.frame, e.what());
+    // The layouts the runtime left behind are unknown; stop touching the live
+    // resources rather than hand the next frame a wrong oldLayout.
+    g_live_resources_failed = true;
+    return false;
+  }
+  // record_engine ends each image at its requested `after` (the colour only
+  // when it is the answer; a separate target otherwise).
+  g_live_colour_layout = engine_frame.colour.after;
+  g_live_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  if (takes_target) {
+    g_live_target_layout = engine_frame.target.after;
+  }
+  REXGPU_INFO("dlss5_live frame={} applied={} dispatches={} history_consumed={} provider={} "
+              "gpu_ms={:.3f} reset={} extent={}x{} scene={}x{}",
+              input.frame, result.frame.applied ? 1 : 0, result.frame.network_dispatches,
+              result.history_consumed ? 1 : 0, result.motion_provider,
+              double(g_runtime->last_gpu_ms()), input.reset ? 1 : 0, g_live_width, g_live_height,
+              input.colour_width, input.colour_height);
+  ReportRecordedFrame(result.frame.applied, g_runtime->last_gpu_ms());
+  return result.frame.applied;
+#else
+  (void)cmd;
+  (void)input;
+  return false;
+#endif
 }
 
 VkImageView SubstituteView() {
@@ -600,6 +964,243 @@ bool UploadSubstituteImage(const vulkan::VulkanDevice& device, VkQueue queue, ui
               path, view_unorm ? "R8G8B8A8_UNORM" : "R8G8B8A8_SRGB", signed_view_name);
   return true;
 }
+
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+// Creates the persistent live-mode (dlss5_amd_mode=3) resources: the 1920x1080
+// target/colour/motion images with their views, the prep pipeline and the
+// descriptor ring, and transitions the images to GENERAL once (the queue is
+// idle here, at setup). Called from InitializeRuntime after the runtime was
+// constructed, so g_runtime is valid. A failure releases everything created so
+// far and is remembered, so it is not retried.
+bool CreateLiveImage(const vulkan::VulkanDevice& device, VkFormat format,
+                     VkImageUsageFlags usage, VkImage& image_out, VkDeviceMemory& memory_out) {
+  VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = format;
+  image_info.extent = {g_live_width, g_live_height, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = usage;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  return vulkan::util::CreateDedicatedAllocationImage(
+      &device, image_info, vulkan::util::MemoryPurpose::kDeviceLocal, image_out, memory_out);
+}
+
+bool CreateLiveView(const vulkan::VulkanDevice& device, VkImage image, VkFormat format,
+                    VkImageView& view_out) {
+  VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view_info.image = image;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = format;
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  return device.functions().vkCreateImageView(device.device(), &view_info, nullptr, &view_out) ==
+         VK_SUCCESS;
+}
+
+// One-time UNDEFINED -> GENERAL transition of the live images, recorded into a
+// one-off command buffer submitted with a fence and waited on: at setup the
+// queue is idle, and later RecordLiveFrame calls assume GENERAL.
+bool TransitionLiveImages(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family) {
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool_info.queueFamilyIndex = family;
+  pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  if (dfn.vkCreateCommandPool(device.device(), &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBufferAllocateInfo buffer_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  buffer_info.commandPool = pool;
+  buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  buffer_info.commandBufferCount = 1;
+  if (dfn.vkAllocateCommandBuffers(device.device(), &buffer_info, &command_buffer) != VK_SUCCESS) {
+    dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+    return false;
+  }
+  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (dfn.vkCreateFence(device.device(), &fence_info, nullptr, &fence) != VK_SUCCESS) {
+    dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  dfn.vkBeginCommandBuffer(command_buffer, &begin);
+  const VkImage images[3] = {g_live_target, g_live_colour, g_live_motion};
+  VkImageMemoryBarrier barriers[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[i].srcAccessMask = 0;
+    barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[i].image = images[i];
+    barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  }
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3,
+                           barriers);
+  dfn.vkEndCommandBuffer(command_buffer);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer;
+  const bool ok = dfn.vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS &&
+                  dfn.vkWaitForFences(device.device(), 1, &fence, VK_TRUE, UINT64_MAX) ==
+                      VK_SUCCESS;
+  dfn.vkDestroyFence(device.device(), fence, nullptr);
+  dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+  return ok;
+}
+
+bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family) {
+  if (g_live_resources_failed) {
+    return false;
+  }
+  if (g_live_pipeline != VK_NULL_HANDLE) {
+    return true;
+  }
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  const VkDevice vk_device = device.device();
+  g_live_device = &device;
+  auto fail = [&](const char* what) {
+    REXLOG_WARN("DLSS 5 NR (AMD): failed to create the live NR {} - live mode inactive", what);
+    // Partially created handles stay set; Shutdown() releases them.
+    g_live_resources_failed = true;
+    return false;
+  };
+  // The runtime extent is what record_engine validates the frames against; the
+  // images must exist at exactly that size, and the prep dispatch runs over it.
+  g_live_width = g_runtime->model_width();
+  g_live_height = g_runtime->model_height();
+  if (!g_live_width || !g_live_height) {
+    return fail("runtime extent");
+  }
+  // Target: the NR answer, substituted for the composition source (sampled by
+  // the composition draw), dumpable (TRANSFER_SRC) and a write-back destination
+  // (TRANSFER_DST: the runtime's transfer pass copies into it).
+  if (!CreateLiveImage(device, VK_FORMAT_R8G8B8A8_UNORM,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       g_live_target, g_live_target_memory)) {
+    return fail("target image");
+  }
+  // Colour: the 1920x1080 pre-upscaled scene colour record_engine consumes.
+  if (!CreateLiveImage(device, VK_FORMAT_R8G8B8A8_UNORM,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       g_live_colour, g_live_colour_memory)) {
+    return fail("colour image");
+  }
+  // Motion: the prep shader's R16G16_SFLOAT output, sampled in place by NR.
+  if (!CreateLiveImage(device, VK_FORMAT_R16G16_SFLOAT,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, g_live_motion,
+                       g_live_motion_memory)) {
+    return fail("motion image");
+  }
+  if (!CreateLiveView(device, g_live_target, VK_FORMAT_R8G8B8A8_UNORM, g_live_target_view) ||
+      !CreateLiveView(device, g_live_colour, VK_FORMAT_R8G8B8A8_UNORM, g_live_colour_view) ||
+      !CreateLiveView(device, g_live_motion, VK_FORMAT_R16G16_SFLOAT, g_live_motion_view)) {
+    return fail("views");
+  }
+  if (!TransitionLiveImages(device, queue, family)) {
+    return fail("initial layout transition");
+  }
+  g_live_target_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_live_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_live_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  // The colour pre-upscale resamples the 1000x600 scene onto the runtime
+  // extent; the draw's own sampler is passed per frame when available, and this
+  // one (linear, clamp) is the fallback for the same mapping.
+  VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = VK_FILTER_LINEAR;
+  sampler_info.minFilter = VK_FILTER_LINEAR;
+  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.minLod = 0.0f;
+  sampler_info.maxLod = 0.0f;
+  if (dfn.vkCreateSampler(vk_device, &sampler_info, nullptr, &g_live_sampler) != VK_SUCCESS) {
+    return fail("sampler");
+  }
+  // set 0: binding 0 = guide SSBO, 1 = motion storage image, 2 = colour
+  // sampler, 3 = colour storage image (see nr_motion_prep_cs.glsl).
+  VkDescriptorSetLayoutBinding bindings[4] = {};
+  bindings[0].binding = 0;
+  bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[0].descriptorCount = 1;
+  bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[1].binding = 1;
+  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[1].descriptorCount = 1;
+  bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[2].binding = 2;
+  bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[2].descriptorCount = 1;
+  bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[3].binding = 3;
+  bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[3].descriptorCount = 1;
+  bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutCreateInfo set_layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_layout_info.bindingCount = uint32_t(rex::countof(bindings));
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(vk_device, &set_layout_info, nullptr, &g_live_set_layout) !=
+      VK_SUCCESS) {
+    return fail("descriptor set layout");
+  }
+  VkDescriptorPoolSize pool_sizes[3] = {};
+  pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  pool_sizes[0].descriptorCount = kLiveDescriptorSlots;
+  pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  pool_sizes[1].descriptorCount = 2 * kLiveDescriptorSlots;
+  pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  pool_sizes[2].descriptorCount = kLiveDescriptorSlots;
+  g_live_pool = std::make_unique<vulkan::SingleLayoutDescriptorSetPool>(
+      &device, kLiveDescriptorSlots, uint32_t(rex::countof(pool_sizes)), pool_sizes,
+      g_live_set_layout);
+  for (uint32_t i = 0; i < kLiveDescriptorSlots; ++i) {
+    const size_t index = g_live_pool->Allocate();
+    if (index == SIZE_MAX) {
+      return fail("descriptor set");
+    }
+    g_live_sets[i] = g_live_pool->Get(index);
+  }
+  VkPushConstantRange push_constant_range{};
+  push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push_constant_range.offset = 0;
+  push_constant_range.size = 4 * sizeof(uint32_t);
+  VkPipelineLayoutCreateInfo pipeline_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &g_live_set_layout;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(vk_device, &pipeline_layout_info, nullptr,
+                                 &g_live_pipeline_layout) != VK_SUCCESS) {
+    return fail("pipeline layout");
+  }
+  g_live_pipeline = vulkan::util::CreateComputePipeline(
+      &device, g_live_pipeline_layout, shaders::nr_motion_prep_cs, sizeof(shaders::nr_motion_prep_cs));
+  if (g_live_pipeline == VK_NULL_HANDLE) {
+    return fail("prep pipeline");
+  }
+  // Whether the runtime wants a separate answer image with the default controls;
+  // that decides which view the composition substitutes.
+  nr::Controls controls;
+  g_live_substitute_view =
+      g_runtime->takes_target(controls) ? g_live_target_view : g_live_colour_view;
+  REXLOG_INFO("DLSS 5 NR (AMD): live mode resources ready ({}x{}, target={}, {})", g_live_width,
+              g_live_height, g_runtime->takes_target(controls) ? "separate" : "in-place",
+              g_live_substitute_view == g_live_target_view ? "target view" : "colour view");
+  return true;
+}
+#endif  // REX_HAS_DLSS5_AMD
 }  // namespace
 
 void InitializeAssets() {
@@ -697,16 +1298,23 @@ void InitializeRuntime(const vulkan::VulkanDevice& device, uint32_t width, uint3
     }
     g_status.gpu = device.properties().deviceName;
     const std::string substitute_path = REXCVAR_GET(dlss5_amd_image);
-    if (!substitute_path.empty() && REXCVAR_GET(dlss5_amd_mode) != 0) {
+    if (!substitute_path.empty() && REXCVAR_GET(dlss5_amd_mode) != 0 &&
+        REXCVAR_GET(dlss5_amd_mode) != 3) {
       if (!UploadSubstituteImage(device, queue.queue(), device.queue_family_graphics_compute(),
                                  substitute_path)) {
         SetInactive("substitute image could not be loaded");
         return;
       }
     }
+    if (REXCVAR_GET(dlss5_amd_mode) == 3 &&
+        !InitializeLiveResources(device, queue.queue(), device.queue_family_graphics_compute())) {
+      g_runtime.reset();
+      SetInactive("live NR resources could not be created");
+      return;
+    }
     g_status.state = State::kReady;
-    REXLOG_INFO("DLSS 5 NR (AMD): runtime built on {} at {}x{} (small model)", g_status.gpu, width,
-                height);
+    REXLOG_INFO("DLSS 5 NR (AMD): runtime built on {} at {}x{} (small model, mode {})",
+                g_status.gpu, width, height, REXCVAR_GET(dlss5_amd_mode));
   } catch (const std::exception& e) {
     g_runtime.reset();
     SetInactive(std::string("runtime initialization failed: ") + e.what());
@@ -732,6 +1340,32 @@ void ReportRecordedFrame(bool applied, float gpu_ms) {
 void Shutdown() {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   g_runtime.reset();
+  if (g_live_device != nullptr) {
+    const vulkan::VulkanDevice::Functions& dfn = g_live_device->functions();
+    const VkDevice device = g_live_device->device();
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, g_live_pipeline);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                       g_live_pipeline_layout);
+    g_live_pool.reset();
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device, g_live_set_layout);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroySampler, device, g_live_sampler);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_target_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_colour_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_live_motion_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_target);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_colour);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_live_motion);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_target_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_colour_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_live_motion_memory);
+    g_live_substitute_view = VK_NULL_HANDLE;
+    g_live_target_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_live_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_live_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_live_width = 0;
+    g_live_height = 0;
+    g_live_device = nullptr;
+  }
 #endif
   if (g_substitute_device != VK_NULL_HANDLE) {
     if (g_substitute_view_unorm != VK_NULL_HANDLE) {

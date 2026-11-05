@@ -96,6 +96,13 @@ class VulkanTextureCache final : public TextureCache {
   // fetch's color domain (UNORM vs SRGB etc.).
   VkFormat GetActiveBindingViewFormat(uint32_t fetch_constant_index, bool is_signed) const;
 
+  // Extent in texels of the guest texture bound for this fetch constant, or
+  // 0x0 when there is no valid binding. The live NR seam needs the composition
+  // source's real size to map it onto the evaluation extent (the scene resolve
+  // is 1000x600 today, but it is not a constant of the seam).
+  void GetActiveBindingExtent(uint32_t fetch_constant_index, uint32_t& width,
+                              uint32_t& height) const;
+
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,

@@ -684,6 +684,18 @@ VkFormat VulkanTextureCache::GetActiveBindingViewFormat(uint32_t fetch_constant_
   return (is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned).format;
 }
 
+void VulkanTextureCache::GetActiveBindingExtent(uint32_t fetch_constant_index, uint32_t& width,
+                                                uint32_t& height) const {
+  width = 0;
+  height = 0;
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return;
+  }
+  width = binding->key.GetWidth();
+  height = binding->key.GetHeight();
+}
+
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();

@@ -540,6 +540,19 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  // Live NR seam (dlss5_amd_mode=3): at the first composition draw of a guest
+  // frame, resolves the motion guide into the still-open submission, splits the
+  // submission (EndSubmission(false)), records one live NR frame into a one-off
+  // command buffer submitted on the graphics queue with no fence (same-queue
+  // ordering after EndSubmission), then resumes with BeginSubmission(true).
+  // `colour_view` is the guest composition source at `colour_width` x
+  // `colour_height`, resampled with `sampler` (the draw's own) onto the
+  // runtime extent. On success sets last_live_frame_ and returns true (the
+  // caller substitutes LiveTargetView()); on any failure logs once per frame,
+  // sets last_live_skip_frame_ and returns false (the caller keeps the guest
+  // view). Nothing is recorded without a valid guide field for this frame.
+  bool RecordLiveNrAtSeam(VkImageView colour_view, uint32_t colour_width, uint32_t colour_height,
+                          VkSampler sampler, uint64_t frame);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -627,6 +640,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   // instead of trusting the previous half.
   uint32_t motion_resolution_scale_x_ = 0;
   uint32_t motion_resolution_scale_y_ = 0;
+
+  // Live NR seam (dlss5_amd_mode=3): guest frame the live NR record succeeded
+  // for (last_live_frame_ == GetCurrentFrame() means this frame's composition
+  // draws substitute LiveTargetView()), the frame it failed for (no
+  // substitution that frame), and the guide frame id the last record consumed
+  // (a jump - including an invalid field - resets NR history next frame).
+  uint64_t last_live_frame_ = UINT64_MAX;
+  uint64_t last_live_skip_frame_ = UINT64_MAX;
+  uint64_t last_live_guide_frame_ = UINT64_MAX;
+  // One-off command buffers for the split submission, a small ring reused only
+  // once the submission after theirs has completed (queue order: the live CB is
+  // submitted between submission N and N+1, so it is done once N+1 completes).
+  // Each slot pairs the command buffer with the prep descriptor-set ring slot
+  // handed to RecordLiveFrame.
+  struct LiveSeamSlot {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer buffer = VK_NULL_HANDLE;
+    uint64_t submission_index = UINT64_MAX;
+  };
+  static constexpr uint32_t kLiveSeamSlotCount = 4;
+  LiveSeamSlot live_seam_slots_[kLiveSeamSlotCount];
 
   // Phase 2 motion guide: the key carried by the most recent kMotion marker and the
   // draw that consumes it. Set on the CP thread by OnTraceMarker, taken by the next

@@ -363,6 +363,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // both.
   void ResolveMotionGuideFrame();
 
+  // The device-local 1000x600 RGBA16F guide buffer the last resolve produced
+  // (see ResolveMotionGuideFrame). Consumed by the live NR seam's motion prep.
+  VkBuffer motion_guide_output_buffer() const { return motion_guide_output_buffer_; }
+  // Runs the ResolveMotionGuideFrame() body early - at the composition seam,
+  // while the submission is still open - for the current frame, exactly once
+  // per frame. The resolve swaps and clears the frame's framebuffer list, so
+  // the later IssueSwap call is a natural no-op (guarded inside
+  // ResolveMotionGuideFrame by motion_guide_seam_resolved_frame_).
+  void EnsureMotionGuideResolvedForSeam();
+
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
   VkFormat GetColorOwnershipTransferVulkanFormat(
@@ -1422,6 +1432,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Presented-frame number of the field currently in the output buffer, or
   // UINT64_MAX when the last frame produced none (the buffer is not cleared then).
   uint64_t motion_guide_output_frame_ = UINT64_MAX;
+  // Guide frame the live NR seam already resolved early
+  // (EnsureMotionGuideResolvedForSeam); ResolveMotionGuideFrame refuses to run
+  // a second composite for the same frame, which would overwrite the seam's
+  // output with keep_existing = 0.
+  uint64_t motion_guide_seam_resolved_frame_ = UINT64_MAX;
   uint32_t motion_guide_dump_frames_done_ = 0;
   // Bounded logging: a few lines show how many framebuffers the composite
   // resolved and the first attachment's extent and sample count per run, and

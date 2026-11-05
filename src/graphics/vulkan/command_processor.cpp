@@ -56,6 +56,8 @@ REXCVAR_DECLARE(bool, present_use_actual_aspect);
 REXCVAR_DECLARE(std::string, resolution);
 // Defined in ui/dlss5_amd_runtime.cpp.
 REXCVAR_DECLARE(int32_t, dlss5_amd_draw_filter);
+REXCVAR_DECLARE(bool, dlss5_live_trace);
+REXCVAR_DECLARE(bool, dlss5_live_no_substitute);
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -2180,6 +2182,15 @@ void VulkanCommandProcessor::ShutdownContext() {
     dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
   }
   command_buffers_writable_.clear();
+  // Live NR seam one-off command pools (the queue was drained above).
+  for (LiveSeamSlot& seam_slot : live_seam_slots_) {
+    if (seam_slot.pool != VK_NULL_HANDLE) {
+      dfn.vkDestroyCommandPool(device, seam_slot.pool, nullptr);
+      seam_slot.pool = VK_NULL_HANDLE;
+      seam_slot.buffer = VK_NULL_HANDLE;
+      seam_slot.submission_index = UINT64_MAX;
+    }
+  }
 
   for (const auto& destroy_pair : destroy_framebuffers_) {
     dfn.vkDestroyFramebuffer(device, destroy_pair.second, nullptr);
@@ -4289,6 +4300,67 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+
+  // Live NR seam (dlss5_amd_mode=3). This is the one clean point to split the
+  // submission: the composition source's transition into SHADER_READ_ONLY is
+  // already pending (RequestTextures above, flushed by EndSubmission) so the
+  // live command buffer may sample it, and nothing of this draw has been
+  // recorded yet - the pipeline bind, the dynamic state, the render pass and
+  // the descriptor sets are all re-emitted after the split. Splitting later
+  // (inside UpdateBindings) is unsafe: BeginSubmission resets the recorded
+  // state and nulls current_guest_graphics_pipeline_layout_, which the draw
+  // still needs.
+  if (rex::ui::dlss5_amd::LiveEnabled() && render_target_cache_ != nullptr &&
+      pixel_shader != nullptr && last_live_frame_ != GetCurrentFrame() &&
+      last_live_skip_frame_ != GetCurrentFrame()) {
+    const std::vector<VulkanShader::TextureBinding>& pixel_texture_bindings =
+        pixel_shader->GetTextureBindingsAfterTranslation();
+    uint32_t colour_fetch_constant = UINT32_MAX;
+    xenos::FetchOpDimension colour_dimension = xenos::FetchOpDimension::k2D;
+    bool fetches_composition_source = false;
+    bool fetches_seq1 = false;
+    for (const VulkanShader::TextureBinding& seam_binding : pixel_texture_bindings) {
+      const uint32_t seam_base =
+          register_file_->GetTextureFetch(seam_binding.fetch_constant).base_address;
+      if (seam_base == 0x11C6Fu) {
+        fetches_composition_source = true;
+        if (!seam_binding.is_signed) {
+          colour_fetch_constant = seam_binding.fetch_constant;
+          colour_dimension = seam_binding.dimension;
+        }
+      } else if (seam_base == 0x1212Fu) {
+        fetches_seq1 = true;
+      }
+    }
+    const bool seam_draw =
+        fetches_composition_source &&
+        (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || fetches_seq1);
+    if (seam_draw && colour_fetch_constant != UINT32_MAX) {
+      const VkImageView colour_view = texture_cache_->GetActiveBindingOrNullImageView(
+          colour_fetch_constant, colour_dimension, false);
+      uint32_t scene_width = 0;
+      uint32_t scene_height = 0;
+      texture_cache_->GetActiveBindingExtent(colour_fetch_constant, scene_width, scene_height);
+      // The draw's own sampler: the pre-upscale must resample exactly as the
+      // composition fetch would, or the live answer's mapping differs from the
+      // guest path (the live identity control measures this).
+      VkSampler composition_sampler = VK_NULL_HANDLE;
+      const std::vector<VulkanShader::SamplerBinding>& pixel_sampler_bindings =
+          pixel_shader->GetSamplerBindingsAfterTranslation();
+      const size_t pixel_sampler_count =
+          std::min(pixel_sampler_bindings.size(), current_samplers_pixel_.size());
+      for (size_t sampler_index = 0; sampler_index < pixel_sampler_count; ++sampler_index) {
+        if (pixel_sampler_bindings[sampler_index].fetch_constant == colour_fetch_constant) {
+          composition_sampler = current_samplers_pixel_[sampler_index].second;
+          break;
+        }
+      }
+      if (colour_view != VK_NULL_HANDLE) {
+        RecordLiveNrAtSeam(colour_view, scene_width, scene_height, composition_sampler,
+                           GetCurrentFrame());
+      }
+    }
+  }
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -6886,6 +6958,170 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 }
 
+bool VulkanCommandProcessor::RecordLiveNrAtSeam(VkImageView colour_view, uint32_t colour_width,
+                                                uint32_t colour_height, VkSampler sampler,
+                                                uint64_t frame) {
+  // Live NR seam (dlss5_amd_mode=3), per the Track 1 live path: at the first
+  // composition draw of a guest frame the scene is complete, so the motion
+  // guide can be composited early, the submission split, one NR frame recorded
+  // into a one-off command buffer submitted on the same graphics queue (no
+  // fence - queue order after EndSubmission orders it), and the submission
+  // resumed for the composition draw, which substitutes the NR answer.
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const bool trace = REXCVAR_GET(dlss5_live_trace);
+  auto trace_step = [&](const char* step) {
+    if (trace) {
+      REXGPU_INFO("dlss5_live frame={} seam step={}", frame, step);
+    }
+  };
+  trace_step("enter");
+
+  // Without the Phase 2 guide there is no motion input, so there is nothing to
+  // record; never pay for the split. Explained once, not per frame.
+  if (!motion_guide_enabled_) {
+    static bool guide_off_logged = false;
+    if (!guide_off_logged) {
+      guide_off_logged = true;
+      REXGPU_WARN(
+          "dlss5_live: dlss5_amd_mode=3 needs the motion guide; enable motion_guide (live NR "
+          "inactive until then)");
+    }
+    last_live_skip_frame_ = frame;
+    return false;
+  }
+
+  // The split needs an immediately endable submission, exactly like
+  // OnPrimaryBufferEnd: ending one while the pipeline cache is creating
+  // pipelines (async compilation) or a scratch buffer is in use is not
+  // supported (EndSubmission asserts on the latter). Skip this frame instead
+  // - the next composition draw retries; the draw keeps the guest view.
+  if (!submission_open_ || scratch_buffer_used_ || pipeline_cache_->IsCreatingPipelines()) {
+    last_live_skip_frame_ = frame;
+    return false;
+  }
+
+  // Composite the guide into the still-open submission first: the resolve
+  // records into this submission's deferred command buffer, so it must run
+  // before EndSubmission. Any render pass still open ends here (the draw after
+  // the seam re-enters it), exactly like IssueSwap's frame-end resolve.
+  EndRenderPass();
+  trace_step("render_pass_ended");
+  render_target_cache_->EnsureMotionGuideResolvedForSeam();
+  trace_step("guide_resolved");
+  const uint64_t guide_frame = render_target_cache_->motion_guide_output_frame();
+  const VkBuffer guide_buffer = render_target_cache_->motion_guide_output_buffer();
+  if (guide_frame == UINT64_MAX || guide_buffer == VK_NULL_HANDLE) {
+    // The scene drew no keyed motion this frame (menu, transition, an unfilled
+    // field): no valid motion input, so do not record and do not substitute.
+    // The resolve above already left the frame's list empty, so the frame-end
+    // call is a no-op.
+    last_live_skip_frame_ = frame;
+    return false;
+  }
+
+  if (!EndSubmission(false)) {
+    // The submission is still open on this failure path; keep the guest view.
+    REXGPU_WARN("dlss5_live frame={} seam: EndSubmission failed, keeping the guest view", frame);
+    last_live_skip_frame_ = frame;
+    return false;
+  }
+  trace_step("submission_split");
+
+  // One-off command buffer from the seam ring. A slot is reusable once the
+  // submission after the one its buffer was recorded in has completed: the
+  // live CB is submitted between submission N and N+1 on the same queue, so
+  // submission N+1 completing implies the live CB is done.
+  uint32_t slot = kLiveSeamSlotCount;
+  for (uint32_t i = 0; i < kLiveSeamSlotCount; ++i) {
+    const LiveSeamSlot& s = live_seam_slots_[i];
+    if (s.pool == VK_NULL_HANDLE || s.submission_index == UINT64_MAX ||
+        GetCompletedSubmission() >= s.submission_index) {
+      slot = i;
+      break;
+    }
+  }
+  bool applied = false;
+  bool submitted = false;
+  if (slot != kLiveSeamSlotCount) {
+    LiveSeamSlot& s = live_seam_slots_[slot];
+    if (s.pool == VK_NULL_HANDLE) {
+      VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+      pool_info.queueFamilyIndex = vulkan_device->queue_family_graphics_compute();
+      if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &s.pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo buffer_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        buffer_info.commandPool = s.pool;
+        buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        buffer_info.commandBufferCount = 1;
+        if (dfn.vkAllocateCommandBuffers(device, &buffer_info, &s.buffer) != VK_SUCCESS) {
+          dfn.vkDestroyCommandPool(device, s.pool, nullptr);
+          s.pool = VK_NULL_HANDLE;
+          s.buffer = VK_NULL_HANDLE;
+        }
+      } else {
+        s.pool = VK_NULL_HANDLE;
+      }
+    }
+    if (s.pool != VK_NULL_HANDLE && dfn.vkResetCommandPool(device, s.pool, 0) == VK_SUCCESS) {
+      VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      if (dfn.vkBeginCommandBuffer(s.buffer, &begin) == VK_SUCCESS) {
+        // History reset on the first live frame and whenever the guide frame
+        // id did not advance by exactly one (a jump or an invalid field).
+        const bool reset =
+            last_live_frame_ == UINT64_MAX || guide_frame != last_live_guide_frame_ + 1;
+        rex::ui::dlss5_amd::LiveFrameInput live_input;
+        live_input.colour_view = colour_view;
+        live_input.colour_width = colour_width;
+        live_input.colour_height = colour_height;
+        live_input.guide_buffer = guide_buffer;
+        live_input.sampler = sampler;
+        live_input.frame = frame;
+        live_input.reset = reset;
+        live_input.descriptor_slot = slot;
+        trace_step("record_begin");
+        applied = rex::ui::dlss5_amd::RecordLiveFrame(s.buffer, live_input);
+        trace_step("record_end");
+        dfn.vkEndCommandBuffer(s.buffer);
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &s.buffer;
+        ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+            vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+        submitted = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit, VK_NULL_HANDLE) ==
+                    VK_SUCCESS;
+        // The live CB sits between the submission just ended and the next one,
+        // so it is complete once GetCurrentSubmission()'s submission completes.
+        s.submission_index = GetCurrentSubmission();
+        trace_step("submitted");
+      }
+    }
+  }
+  if (!submitted) {
+    REXGPU_WARN("dlss5_live frame={} seam: live command buffer setup/submit failed, keeping the "
+                "guest view",
+                frame);
+  }
+
+  // Resume the submission for the composition draw and the rest of the frame.
+  trace_step("resume_begin");
+  if (!BeginSubmission(true)) {
+    REXGPU_ERROR("dlss5_live frame={} seam: BeginSubmission FAILED after the split", frame);
+    last_live_skip_frame_ = frame;
+    return false;
+  }
+  trace_step("resumed");
+  if (applied && submitted) {
+    last_live_frame_ = frame;
+    last_live_guide_frame_ = guide_frame;
+    return true;
+  }
+  last_live_skip_frame_ = frame;
+  return false;
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -7152,18 +7388,35 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
     }
   }
-  const bool nr_substitute = rex::ui::dlss5_amd::SubstituteEnabled() &&
-                             rex::ui::dlss5_amd::SubstituteForFrame(GetCurrentFrame()) &&
-                             (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || composition_draw);
+  // Live NR seam (dlss5_amd_mode=3): the substitute for a live frame is the NR
+  // answer recorded at this frame's first composition draw (RecordLiveNrAtSeam
+  // splits the submission there and submits the record on the same queue). A
+  // frame whose record failed (last_live_skip_frame_) keeps the guest view.
+  const bool live_mode = rex::ui::dlss5_amd::LiveEnabled();
+  const uint64_t seam_frame = GetCurrentFrame();
+  const bool static_substitute =
+      !live_mode && rex::ui::dlss5_amd::SubstituteEnabled() &&
+      rex::ui::dlss5_amd::SubstituteForFrame(seam_frame) &&
+      (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || composition_draw);
   if (write_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       VkImageView image_view = texture_cache_->GetActiveBindingOrNullImageView(
           texture_binding.fetch_constant, texture_binding.dimension,
           bool(texture_binding.is_signed));
-      if (image_view != VK_NULL_HANDLE && nr_substitute &&
+      const bool composition_source =
+          image_view != VK_NULL_HANDLE &&
           register_file_->GetTextureFetch(texture_binding.fetch_constant).base_address ==
-              0x11C6Fu) {
+              0x11C6Fu;
+      // Recomputed per fetch: the seam (IssueDraw, before this draw was
+      // recorded) already recorded this frame's live NR if this is the
+      // composition draw, so the substitution decision is a pure state read.
+      const bool live_substitute =
+          live_mode && last_live_frame_ == seam_frame &&
+          (REXCVAR_GET(dlss5_amd_draw_filter) == 0 || composition_draw) &&
+          !REXCVAR_GET(dlss5_live_no_substitute);
+      const bool nr_substitute = (live_substitute || static_substitute);
+      if (composition_source && nr_substitute) {
         // One-shot: log ALL pixel-texture fetches of this first substituted
         // draw, not just the 0x11C6F one - the composition co-samples other
         // sources (e.g. the seq-1 term), and the color-transfer fit needs every
@@ -7201,8 +7454,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         }
         // Per-fetch view: the composition samples base page 0x11C6F twice per
         // draw, once unsigned and once signed; each fetch gets the substitute
-        // view in its own domain (dlss5_amd_view / dlss5_amd_signed_view).
-        image_view = rex::ui::dlss5_amd::SubstituteViewForFetch(bool(texture_binding.is_signed));
+        // view in its own domain (dlss5_amd_view / dlss5_amd_signed_view). In
+        // live mode both get the NR answer: mode 3 uploads no image, so
+        // SubstituteViewForFetch() would return a null view for the signed
+        // fetch (an invalid descriptor even if the shader never samples it),
+        // and the live view is UNORM - the shader's signed decode is its own.
+        image_view = live_substitute
+                         ? rex::ui::dlss5_amd::LiveTargetView()
+                         : rex::ui::dlss5_amd::SubstituteViewForFetch(
+                               bool(texture_binding.is_signed));
       }
       descriptor_image_info.imageView = image_view;
       descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE

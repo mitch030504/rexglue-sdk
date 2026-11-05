@@ -2663,11 +2663,37 @@ void VulkanRenderTargetCache::MaybeLogMotionSeam(const draw_util::ResolveInfo& r
   }
 }
 
+void VulkanRenderTargetCache::EnsureMotionGuideResolvedForSeam() {
+  // Runs the normal frame-end composite early, at the composition seam, while
+  // the submission is still open (ResolveMotionGuideFrame refuses a closed
+  // submission). Once per frame: the resolve swaps and clears the frame's
+  // framebuffer list, so the IssueSwap call at the frame end is a natural
+  // no-op, and ResolveMotionGuideFrame also refuses a second composite for the
+  // same guide frame via motion_guide_seam_resolved_frame_.
+  if (!motion_guide_enabled()) {
+    return;
+  }
+  const uint64_t frame = command_processor_.motion_guide_frame();
+  if (motion_guide_seam_resolved_frame_ == frame) {
+    return;
+  }
+  ResolveMotionGuideFrame();
+  // Stamped after the call: ResolveMotionGuideFrame itself refuses when the
+  // seam already resolved this frame (the IssueSwap call at the frame end).
+  motion_guide_seam_resolved_frame_ = frame;
+}
+
 void VulkanRenderTargetCache::ResolveMotionGuideFrame() {
   // Guide off is the default, and everything below either allocates or records
   // commands, so this is deliberately the first check: a guide-off run executes
   // none of this and never touches the frame's framebuffer list.
   if (!motion_guide_enabled()) {
+    return;
+  }
+  // The live NR seam already resolved this frame's guide at the composition
+  // draw; running the composite again here (e.g. for a late motion draw) would
+  // restart it with keep_existing = 0 and overwrite the seam's field.
+  if (motion_guide_seam_resolved_frame_ == command_processor_.motion_guide_frame()) {
     return;
   }
   // Take the frame's list and clear it in one step. This is the start of the next
