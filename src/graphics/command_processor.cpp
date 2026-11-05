@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -952,6 +953,10 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
     if (auto marker = TraceMarker::Parse(words)) {
       OnTraceMarker(*marker);
+      // motion_guide needs a marker on every frame but must not turn the info-level
+      // per-draw rows on; those belong to an explicit nr_engine_trace_frame window.
+      const std::string trace_frame = rex::cvar::GetFlagByName("nr_engine_trace_frame");
+      trace_marker_log_ = !trace_frame.empty() && trace_frame != "-1";
       // Only kBegin opens a draw window. kMotion is a point record naming a draw
       // for the motion guide; it must not change the draw accounting, so it is
       // logged with the other kinds and otherwise ignored here until consumed.
@@ -961,9 +966,11 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
         trace_marker_frame_ = marker->frame;
         trace_marker_draw_ = 0;
       }
-      REXGPU_INFO("engine_trace frame={} kind={} node={:08X} geometry={:08X} draw={}",
-                  marker->frame, uint32_t(marker->kind), marker->node,
-                  marker->geometry, trace_marker_draw_);
+      if (trace_marker_log_) {
+        REXGPU_INFO("engine_trace frame={} kind={} node={:08X} geometry={:08X} draw={}",
+                    marker->frame, uint32_t(marker->kind), marker->node,
+                    marker->geometry, trace_marker_draw_);
+      }
     }
   } else {
     reader->AdvanceRead(count * sizeof(uint32_t));
@@ -989,10 +996,10 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
-  if (trace_marker_active_) {
+  if (trace_marker_active_ && trace_marker_log_) {
     REXGPU_INFO("engine_trace frame={} swap draws={}", trace_marker_frame_, trace_marker_draw_);
-    trace_marker_active_ = false;
   }
+  trace_marker_active_ = false;
   SCOPE_profile_cpu_f("gpu");
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -1481,7 +1488,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
-  if (trace_marker_active_) {
+  if (trace_marker_active_ && trace_marker_log_) {
     REXGPU_INFO("engine_trace frame={} draw={} indices={} vs={:016X} ps={:016X} "
                 "color={:08X} depth={:08X} surface={:08X} depth_control={:08X} "
                 "viewport={:08X},{:08X},{:08X},{:08X}",
