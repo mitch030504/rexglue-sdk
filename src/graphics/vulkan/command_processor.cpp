@@ -4302,15 +4302,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
 
-  // Live NR seam (dlss5_amd_mode=3). This is the one clean point to split the
-  // submission: the composition source's transition into SHADER_READ_ONLY is
-  // already pending (RequestTextures above, flushed by EndSubmission) so the
-  // live command buffer may sample it, and nothing of this draw has been
-  // recorded yet - the pipeline bind, the dynamic state, the render pass and
-  // the descriptor sets are all re-emitted after the split. Splitting later
-  // (inside UpdateBindings) is unsafe: BeginSubmission resets the recorded
-  // state and nulls current_guest_graphics_pipeline_layout_, which the draw
-  // still needs.
+  // Live NR/FSR 4 seam (dlss5_amd_mode=3/4). This is the one clean point to
+  // split the submission: the composition source's transition into
+  // SHADER_READ_ONLY is already pending (RequestTextures above, flushed by
+  // EndSubmission) so the live command buffer may sample it, and nothing of
+  // this draw has been recorded yet - the pipeline bind, the dynamic state, the
+  // render pass and the descriptor sets are all re-emitted after the split.
+  // Splitting later (inside UpdateBindings) is unsafe: BeginSubmission resets
+  // the recorded state and nulls current_guest_graphics_pipeline_layout_, which
+  // the draw still needs.
   if (rex::ui::dlss5_amd::LiveEnabled() && render_target_cache_ != nullptr &&
       pixel_shader != nullptr && last_live_frame_ != GetCurrentFrame() &&
       last_live_skip_frame_ != GetCurrentFrame()) {
@@ -7013,7 +7013,7 @@ bool VulkanCommandProcessor::RecordLiveNrAtSeam(VkImageView colour_view, uint32_
     if (!guide_off_logged) {
       guide_off_logged = true;
       REXGPU_WARN(
-          "dlss5_live: dlss5_amd_mode=3 needs the motion guide; enable motion_guide (live NR "
+          "dlss5_live: dlss5_amd_mode=3/4 needs the motion guide; enable motion_guide (live seam "
           "inactive until then)");
     }
     last_live_skip_frame_ = frame;

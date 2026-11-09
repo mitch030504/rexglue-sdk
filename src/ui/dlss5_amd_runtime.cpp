@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,9 +30,13 @@
 #include <rex/types.h>
 #include <rex/ui/dlss5_amd.h>
 #include <rex/ui/dlss5_amd_vulkan.h>
+#include <rex/ui/fsr4.h>
 #include <rex/ui/motion_contract.h>
+#include <rex/ui/temporal_jitter.h>
 #include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
 #include <rex/ui/vulkan/util.h>
+
+#include "ui/fsr4_runtime.h"
 
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
 #include <rex/runtime.h>
@@ -40,6 +46,17 @@
 namespace shaders {
 #include "shaders/vulkan_spirv/nr_motion_prep_cs.h"
 }  // namespace shaders
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// The FSR 4 seam (dlss5_amd_mode=4) runs the user-supplied provider through the
+// same ffx API the presenter uses. The provider .so is loaded by ffx_runtime;
+// only the entry points and the upscale descriptors are needed here.
+#include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_upscale.h>
+#include <ffx_api/vk/ffx_api_vk.h>
+
+#include "ui/ffx_runtime.h"
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
 #endif
 
 REXCVAR_DEFINE_BOOL(dlss5_amd, false, "GPU",
@@ -54,9 +71,12 @@ REXCVAR_DEFINE_STRING(dlss5_amd_data_path, "", "GPU",
 REXCVAR_DEFINE_INT32(dlss5_amd_mode, 0, "GPU",
                      "Development: 0 = off, 1 = substitute a pre-upscaled identity scene, "
                      "2 = substitute an NR image, 3 = live per-frame NR recorded at the "
-                     "composition seam (every frame; dlss5_amd_frame is ignored). Modes 1/2 "
-                     "require dlss5_amd=true and dlss5_amd_image; mode 3 requires dlss5_amd=true.")
-    .range(0, 3)
+                     "composition seam (every frame; dlss5_amd_frame is ignored), 4 = live "
+                     "per-frame FSR 4 pre-upscale at the same seam (needs fsr4=true and the "
+                     "FSR 4 provider; the presenter temporal upscaler must be off, i.e. "
+                     "present_effect != fsr3; the NR model is not used). Modes 1/2 require "
+                     "dlss5_amd=true and dlss5_amd_image; modes 3/4 require dlss5_amd=true.")
+    .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(dlss5_amd_image, "", "GPU",
                       "Development: 1920x1080 raw RGBA8 image substituted for the composition "
@@ -90,10 +110,15 @@ REXCVAR_DEFINE_INT32(dlss5_amd_draw_filter, 1, "GPU",
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(dlss5_live_bypass, false, "GPU",
-                    "Development (dlss5_amd_mode=3): the live seam's identity control - the "
+                    "Development (dlss5_amd_mode=3/4): the live seam's identity control - the "
                     "pre-upscaled scene colour is copied into the substitute instead of running "
-                    "NR, so the split, the pre-upscale and the transfer can be checked against "
-                    "the control without the network's edit.")
+                    "NR/FSR 4, so the split, the pre-upscale and the transfer can be checked "
+                    "against the control without the network's edit.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(dlss5_live_fsr4_timing, true, "GPU",
+                    "Development (dlss5_amd_mode=4): bracket the FSR 4 seam dispatch with GPU "
+                    "timestamps and log fsr4_seam timing frame=<n> gpu_ms=<ms> when an earlier "
+                    "frame's pair is provably complete (no queue wait). Off: no timestamps.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(dlss5_live_trace, false, "GPU",
                     "Development: log each step of the live seam (split, guide resolve, live "
@@ -246,6 +271,96 @@ uint32_t g_live_dump_pending_scene_width = 0;
 uint32_t g_live_dump_pending_scene_height = 0;
 bool g_live_dump_pending_depth = false;
 bool g_live_dump_pending_in_place = false;
+// Per-kind extents/byte sizes: mode 3 dumps all four images at the runtime
+// extent, mode 4 dumps its scene-extent inputs (colour/motion/depth) next to
+// the runtime-extent answer.
+uint32_t g_live_dump_pending_width[4] = {};
+uint32_t g_live_dump_pending_height[4] = {};
+VkDeviceSize g_live_dump_pending_bytes[4] = {};
+
+// --- Live FSR 4 pre-upscale (dlss5_amd_mode=4) ---
+// FSR 4 runs where NR runs in mode 3: at the composition seam, on the native
+// 1000x600 scene, before the HUD. It consumes its own scene-extent copies of
+// the same three inputs the mode-3 prep already produces (colour, guide motion,
+// guest depth) and writes the 1920x1080 answer into the existing live target.
+// The scene copies exist because FSR validates renderSize = the guest resolve
+// (1000x600) while the mode-3 prep writes at the NR evaluation extent
+// (1920x1080); everything else - the target, the descriptor ring, the prep
+// pipeline, the dump buffer and the layout discipline - is shared.
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+constexpr uint32_t kFsrSceneWidth = 1000;
+constexpr uint32_t kFsrSceneHeight = 600;
+
+ffxContext g_fsr_context = nullptr;
+const ffx::Functions* g_fsr_functions = nullptr;
+std::string g_fsr_provider;
+bool g_fsr_ready = false;
+VkImage g_fsr_colour = VK_NULL_HANDLE;
+VkDeviceMemory g_fsr_colour_memory = VK_NULL_HANDLE;
+VkImageView g_fsr_colour_view = VK_NULL_HANDLE;
+VkImage g_fsr_motion = VK_NULL_HANDLE;
+VkDeviceMemory g_fsr_motion_memory = VK_NULL_HANDLE;
+VkImageView g_fsr_motion_view = VK_NULL_HANDLE;
+VkImage g_fsr_depth = VK_NULL_HANDLE;
+VkDeviceMemory g_fsr_depth_memory = VK_NULL_HANDLE;
+VkImageView g_fsr_depth_view = VK_NULL_HANDLE;
+VkImageLayout g_fsr_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_fsr_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+VkImageLayout g_fsr_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+// The last measured dispatch, read from a completed timestamp pair on the next
+// reuse of its seam slot (never a queue wait). 0 until the second slot reuse.
+double g_fsr_last_gpu_ms = 0.0;
+// GPU timestamps: one pair per seam slot, reset and written inside the live
+// command buffer. A slot is reused only after the submission that followed the
+// live command buffer completed, so the pair is readable then.
+VkQueryPool g_fsr_timing_pool = VK_NULL_HANDLE;
+float g_fsr_timestamp_period_ns = 0.0f;
+uint64_t g_fsr_timing_frame[kLiveDescriptorSlots] = {};
+bool g_fsr_timing_recorded[kLiveDescriptorSlots] = {};
+// Frame time for FSR's history (per frame, not a timestamp query).
+std::chrono::steady_clock::time_point g_fsr_last_time;
+bool g_fsr_have_last_time = false;
+
+// The FSR 4 provider's VK backend resolves a few Vulkan 1.1 core entry points
+// through their legacy KHR aliases; RADV exposes only the core names. The
+// presenter carries the same shim for its own context (vulkan_presenter.cpp);
+// this copy keeps the seam independent of the presenter's lifecycle.
+std::atomic<PFN_vkGetDeviceProcAddr> g_fsr_vk_get_device_proc_addr{nullptr};
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FsrVkGetDeviceProcAddrCompat(VkDevice vk_device,
+                                                                      const char* name) {
+  if (!name) {
+    return nullptr;
+  }
+  PFN_vkGetDeviceProcAddr get_device_proc_addr =
+      g_fsr_vk_get_device_proc_addr.load(std::memory_order_relaxed);
+  if (!get_device_proc_addr) {
+    return nullptr;
+  }
+  PFN_vkVoidFunction proc = get_device_proc_addr(vk_device, name);
+  if (proc) {
+    return proc;
+  }
+  if (!std::strcmp(name, "vkGetBufferMemoryRequirements2KHR")) {
+    return get_device_proc_addr(vk_device, "vkGetBufferMemoryRequirements2");
+  }
+  if (!std::strcmp(name, "vkGetImageMemoryRequirements2KHR")) {
+    return get_device_proc_addr(vk_device, "vkGetImageMemoryRequirements2");
+  }
+  if (!std::strcmp(name, "vkBindBufferMemory2KHR")) {
+    return get_device_proc_addr(vk_device, "vkBindBufferMemory2");
+  }
+  if (!std::strcmp(name, "vkBindImageMemory2KHR")) {
+    return get_device_proc_addr(vk_device, "vkBindImageMemory2");
+  }
+  return nullptr;
+}
+
+int64_t CurrentGuestFrameIndex();
+void RecordLiveDumpFrameFsr4(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                             uint64_t frame, uint32_t scene_width, uint32_t scene_height,
+                             bool bypass, uint32_t descriptor_slot);
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
 
 // Defined below, after the SHA-256 helper (the dump hashes the readback).
 void ConsumePendingLiveDump();
@@ -488,9 +603,9 @@ bool SubstituteEnabled() {
 }
 
 bool SubstituteForFrame(uint64_t frame) {
-  // Mode 3 is live: every guest frame is substituted (the frame cvar's -1
-  // semantics), the per-frame gating happens in the command processor.
-  if (REXCVAR_GET(dlss5_amd_mode) == 3) {
+  // Modes 3 and 4 are live: every guest frame is substituted (the frame cvar's
+  // -1 semantics), the per-frame gating happens in the command processor.
+  if (REXCVAR_GET(dlss5_amd_mode) == 3 || REXCVAR_GET(dlss5_amd_mode) == 4) {
     return true;
   }
   const int32_t first = REXCVAR_GET(dlss5_amd_frame);
@@ -499,6 +614,13 @@ bool SubstituteForFrame(uint64_t frame) {
 
 bool LiveEnabled() {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  if (REXCVAR_GET(dlss5_amd_mode) == 4) {
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    return g_fsr_ready && g_live_substitute_view != VK_NULL_HANDLE;
+#else
+    return false;
+#endif
+  }
   return REXCVAR_GET(dlss5_amd_mode) == 3 && g_runtime != nullptr &&
          g_live_substitute_view != VK_NULL_HANDLE;
 #else
@@ -507,10 +629,10 @@ bool LiveEnabled() {
 }
 
 VkImageView LiveTargetView() {
-  // The view substituted for the unsigned composition fetch in mode 3: the NR
-  // answer (a separate target when the runtime takes one, else the in-place
-  // colour). The signed fetch keeps SubstituteViewForFetch - it is never
-  // sampled by the composition shader.
+  // The view substituted for the unsigned composition fetch in mode 3/4: the
+  // NR/FSR answer (a separate target when the runtime takes one, else the
+  // in-place colour). The signed fetch keeps SubstituteViewForFetch - it is
+  // never sampled by the composition shader.
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   return g_live_substitute_view;
 #else
@@ -518,46 +640,28 @@ VkImageView LiveTargetView() {
 #endif
 }
 
-bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
-  if (!g_runtime || g_live_device == nullptr || g_live_pipeline == VK_NULL_HANDLE ||
-      input.colour_view == VK_NULL_HANDLE || input.guide_buffer == VK_NULL_HANDLE ||
-      !input.colour_width || !input.colour_height ||
-      VkDeviceSize(input.colour_width) * VkDeviceSize(input.colour_height) * 8u > kLiveGuideBytes ||
-      input.descriptor_slot >= kLiveDescriptorSlots) {
-    return false;
-  }
-  const vulkan::VulkanDevice& device = *g_live_device;
-  const vulkan::VulkanDevice::Functions& dfn = device.functions();
-  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+namespace {
 
-  // A pending determinism dump is read back only when this call reuses the seam
-  // slot its copies were recorded with: the command processor hands that slot
-  // out only after the submission that followed the live command buffer has
-  // completed, so the copy is done. Never wait on the queue here.
-  if (g_live_dump_pending && input.descriptor_slot == g_live_dump_pending_slot) {
-    ConsumePendingLiveDump();
-  }
-
-  // Rebind the slot's descriptor set for this frame: the guide buffer is
-  // persistent but may have been recreated by a cache clear, and the guest
-  // colour view changes as the texture cache re-creates textures. The caller
-  // only hands out a slot whose previous submission has completed, so the set
-  // is not in use by in-flight work.
-  const VkDescriptorSet descriptor_set = g_live_sets[input.descriptor_slot];
+// Bindings of shaders/nr_motion_prep_cs.glsl for one frame: the guide buffer
+// and the guest colour/depth sources are per-frame, the three output images are
+// the caller's (the runtime extent in mode 3, the scene extent in mode 4).
+void UpdateLivePrepDescriptors(VkDescriptorSet descriptor_set, const LiveFrameInput& input,
+                               VkImageView motion_out, VkImageView colour_out,
+                               VkImageView depth_out) {
   VkDescriptorBufferInfo guide_info{};
   guide_info.buffer = input.guide_buffer;
   guide_info.offset = 0;
   guide_info.range = kLiveGuideBytes;
   VkDescriptorImageInfo motion_info{};
-  motion_info.imageView = g_live_motion_view;
+  motion_info.imageView = motion_out;
   motion_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkDescriptorImageInfo colour_src_info{};
   colour_src_info.sampler = input.sampler != VK_NULL_HANDLE ? input.sampler : g_live_sampler;
   colour_src_info.imageView = input.colour_view;
   colour_src_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   VkDescriptorImageInfo colour_out_info{};
-  colour_out_info.imageView = g_live_colour_view;
+  colour_out_info.imageView = colour_out;
   colour_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   const bool has_depth = input.depth_view != VK_NULL_HANDLE;
   VkDescriptorImageInfo depth_src_info{};
@@ -565,7 +669,7 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   depth_src_info.imageView = has_depth ? input.depth_view : g_live_null_depth_view;
   depth_src_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   VkDescriptorImageInfo depth_out_info{};
-  depth_out_info.imageView = g_live_depth_view;
+  depth_out_info.imageView = depth_out;
   depth_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   VkWriteDescriptorSet writes[6] = {};
   for (uint32_t i = 0; i < 6; ++i) {
@@ -586,7 +690,64 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   writes[4].pImageInfo = &depth_src_info;
   writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[5].pImageInfo = &depth_out_info;
-  dfn.vkUpdateDescriptorSets(device.device(), uint32_t(rex::countof(writes)), writes, 0, nullptr);
+  g_live_device->functions().vkUpdateDescriptorSets(g_live_device->device(),
+                                                    uint32_t(rex::countof(writes)), writes, 0,
+                                                    nullptr);
+}
+
+}  // namespace
+#endif  // REX_HAS_DLSS5_AMD
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// Defined after RecordLiveFrame; mode 4 dispatches here from the shared seam.
+bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input);
+#endif
+
+bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  const bool fsr4_seam = REXCVAR_GET(dlss5_amd_mode) == 4;
+  // Mode 4's identity control is deliberately the mode-3 bypass body below: it
+  // runs the same prep at the runtime extent and copies that colour into the
+  // target, so answer == colour is the same measurement in both modes.
+  const bool fsr4_bypass = fsr4_seam && REXCVAR_GET(dlss5_live_bypass);
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (fsr4_seam && !fsr4_bypass) {
+    return RecordLiveFsr4Frame(cmd, input);
+  }
+#else
+  if (fsr4_seam) {
+    return false;
+  }
+#endif
+  if ((!g_runtime && !fsr4_bypass) || g_live_device == nullptr ||
+      g_live_pipeline == VK_NULL_HANDLE || input.colour_view == VK_NULL_HANDLE ||
+      input.guide_buffer == VK_NULL_HANDLE || !input.colour_width || !input.colour_height ||
+      VkDeviceSize(input.colour_width) * VkDeviceSize(input.colour_height) * 8u > kLiveGuideBytes ||
+      input.descriptor_slot >= kLiveDescriptorSlots) {
+    return false;
+  }
+  const vulkan::VulkanDevice& device = *g_live_device;
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+  // A pending determinism dump is read back only when this call reuses the seam
+  // slot its copies were recorded with: the command processor hands that slot
+  // out only after the submission that followed the live command buffer has
+  // completed, so the copy is done. Never wait on the queue here.
+  if (g_live_dump_pending && input.descriptor_slot == g_live_dump_pending_slot) {
+    ConsumePendingLiveDump();
+  }
+
+  // Rebind the slot's descriptor set for this frame: the guide buffer is
+  // persistent but may have been recreated by a cache clear, and the guest
+  // colour view changes as the texture cache re-creates textures. The caller
+  // only hands out a slot whose previous submission has completed, so the set
+  // is not in use by in-flight work. The mode-3 outputs live at the runtime
+  // extent; mode 4 binds its scene-extent copies through the same helper.
+  const VkDescriptorSet descriptor_set = g_live_sets[input.descriptor_slot];
+  UpdateLivePrepDescriptors(descriptor_set, input, g_live_motion_view, g_live_colour_view,
+                            g_live_depth_view);
+  const bool has_depth = input.depth_view != VK_NULL_HANDLE;
 
   // Everything the previous (same-queue, already submitted) work wrote - the
   // guide resolve's buffer stores and the guest texture's detile/transfer
@@ -665,7 +826,10 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
                            nullptr);
 
   nr::Controls controls;
-  const bool takes_target = g_runtime->takes_target(controls);
+  // Mode 4's target is always the separate 1920x1080 answer; the in-place
+  // fallback is an NR-runtime choice (mode 3). The bypass body below then
+  // copies into that target exactly as mode 3 does with a separate target.
+  const bool takes_target = fsr4_bypass ? true : g_runtime->takes_target(controls);
   if (REXCVAR_GET(dlss5_live_bypass)) {
     // The live identity control: no network. The pre-upscaled colour is the
     // answer, so copy it into the target (or keep it in place) and leave it in
@@ -845,6 +1009,312 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   return false;
 #endif
 }
+
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD && \
+    defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// Mode 4: one FSR 4 dispatch at the same composition seam. The prep shader is
+// the mode-3 one, run at the scene extent into the FSR input copies; FSR then
+// upscales 1000x600 -> the live target, which the composition substitutes for
+// the guest scene exactly as mode 3 substitutes the NR answer. The HUD draws
+// after the seam and never sees the substitute.
+bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input) {
+  if (!g_fsr_ready || g_fsr_context == nullptr || g_fsr_functions == nullptr ||
+      g_live_device == nullptr || g_live_pipeline == VK_NULL_HANDLE ||
+      input.colour_view == VK_NULL_HANDLE || input.guide_buffer == VK_NULL_HANDLE ||
+      input.descriptor_slot >= kLiveDescriptorSlots) {
+    return false;
+  }
+  // The context was created for the guest scene extent; a different resolve
+  // size would be a different renderSize, which FSR validates. Skip the frame
+  // (guest view kept) rather than hand FSR a mismatched extent.
+  if (input.colour_width != kFsrSceneWidth || input.colour_height != kFsrSceneHeight) {
+    static bool extent_logged = false;
+    if (!extent_logged) {
+      extent_logged = true;
+      REXGPU_WARN("fsr4_seam: scene is {}x{}, expected {}x{}; keeping the guest view",
+                  input.colour_width, input.colour_height, kFsrSceneWidth, kFsrSceneHeight);
+    }
+    return false;
+  }
+  // FSR 4 uses depth for disocclusion; a frame without the guest depth resolve
+  // has no honest input, so it keeps the guest view too.
+  if (input.depth_view == VK_NULL_HANDLE) {
+    static bool depth_logged = false;
+    if (!depth_logged) {
+      depth_logged = true;
+      REXGPU_WARN("fsr4_seam: no guest depth resolve this frame; keeping the guest view");
+    }
+    return false;
+  }
+  const vulkan::VulkanDevice& device = *g_live_device;
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  const uint32_t slot = input.descriptor_slot;
+
+  // Read the timestamp pair recorded for this seam slot the previous time it
+  // was used. The command processor hands a slot out only after the submission
+  // following its live command buffer completed, so the pair is ready and the
+  // queue is never waited on.
+  if (g_fsr_timing_pool != VK_NULL_HANDLE && g_fsr_timing_recorded[slot]) {
+    uint64_t stamps[2] = {};
+    if (dfn.vkGetQueryPoolResults(device.device(), g_fsr_timing_pool, slot * 2, 2, sizeof(stamps),
+                                  stamps, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        stamps[1] > stamps[0]) {
+      g_fsr_last_gpu_ms =
+          double(stamps[1] - stamps[0]) * double(g_fsr_timestamp_period_ns) / 1e6;
+      if (REXCVAR_GET(dlss5_live_fsr4_timing)) {
+        REXGPU_INFO("fsr4_seam timing frame={} gpu_ms={:.3f}", g_fsr_timing_frame[slot],
+                    g_fsr_last_gpu_ms);
+      }
+    }
+    g_fsr_timing_recorded[slot] = false;
+  }
+  // A pending determinism dump is read back on the same slot-reuse proof as in
+  // mode 3 (the copies were recorded into this slot's previous command buffer).
+  if (g_live_dump_pending && slot == g_live_dump_pending_slot) {
+    ConsumePendingLiveDump();
+  }
+
+  // Bind the prep outputs at the scene extent: these are the images FSR reads,
+  // not the mode-3 runtime-extent ones (the target is the same 1920x1080 one).
+  UpdateLivePrepDescriptors(g_live_sets[slot], input, g_fsr_motion_view, g_fsr_colour_view,
+                            g_fsr_depth_view);
+
+  // The guide resolve and the guest textures wrote in the submission that just
+  // ended; make those writes visible to the prep dispatch, exactly as mode 3.
+  VkMemoryBarrier in_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  in_barrier.srcAccessMask =
+      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  in_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in_barrier, 0, nullptr, 0,
+                           nullptr);
+
+  // FSR sampled these images last frame or the composition will after this
+  // one, so their real layout is SHADER_READ_ONLY from the second frame on;
+  // the storage write needs GENERAL.
+  VkImageMemoryBarrier scene_to_general[3] = {};
+  const VkImage scene_images[3] = {g_fsr_colour, g_fsr_motion, g_fsr_depth};
+  const VkImageLayout scene_layouts[3] = {g_fsr_colour_layout, g_fsr_motion_layout,
+                                          g_fsr_depth_layout};
+  uint32_t scene_transition_count = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (scene_layouts[i] == VK_IMAGE_LAYOUT_GENERAL) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = scene_to_general[scene_transition_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = scene_layouts[i];
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = scene_images[i];
+    barrier.subresourceRange = full_range;
+  }
+  if (scene_transition_count != 0) {
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             scene_transition_count, scene_to_general);
+  }
+  g_fsr_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+  dfn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline);
+  dfn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline_layout, 0, 1,
+                              &g_live_sets[slot], 0, nullptr);
+  // [out extent, scene extent, depth enabled] - the scene inputs are a 1:1
+  // resample of the guest resolve at its own extent.
+  const uint32_t push_constants[5] = {kFsrSceneWidth, kFsrSceneHeight, input.colour_width,
+                                      input.colour_height, 1u};
+  dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         sizeof(push_constants), push_constants);
+  dfn.vkCmdDispatch(cmd, (kFsrSceneWidth + 7u) / 8u, (kFsrSceneHeight + 7u) / 8u, 1);
+
+  // Make the prep stores visible, then put the three images where FSR's
+  // PIXEL_COMPUTE_READ state says they are (SHADER_READ_ONLY).
+  VkMemoryBarrier prep_done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  prep_done.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  prep_done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &prep_done, 0, nullptr, 0,
+                           nullptr);
+  VkImageMemoryBarrier scene_to_sampled[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    VkImageMemoryBarrier& barrier = scene_to_sampled[i];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = scene_images[i];
+    barrier.subresourceRange = full_range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3,
+                           scene_to_sampled);
+  g_fsr_colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  g_fsr_motion_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  g_fsr_depth_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  // The answer image is FSR's UAV, i.e. GENERAL while it is dispatched. It is
+  // SHADER_READ_ONLY after the previous frame's composition sampled it.
+  if (g_live_target_layout != VK_IMAGE_LAYOUT_GENERAL) {
+    VkImageMemoryBarrier target_to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    target_to_general.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    target_to_general.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    target_to_general.oldLayout = g_live_target_layout;
+    target_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    target_to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    target_to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    target_to_general.image = g_live_target;
+    target_to_general.subresourceRange = full_range;
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &target_to_general);
+    g_live_target_layout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  // The frame's jitter is the guest projection's own Halton offset (flip 1,
+  // which fsr4=true selects at startup). The guide motion is already
+  // jitter-removed, so the context does not enable jitter cancellation and the
+  // motion scale below turns the guide's forward guest NDC into the backward
+  // top-left UV FSR consumes (motion_contract.h).
+  const int64_t guest_frame = CurrentGuestFrameIndex();
+  float jitter_x = 0.0f;
+  float jitter_y = 0.0f;
+  rex::ui::temporal::JitterForFrame(guest_frame >= 0 ? uint64_t(guest_frame) : input.frame,
+                                    jitter_x, jitter_y);
+  float frame_time_ms = 16.666f;
+  const auto now = std::chrono::steady_clock::now();
+  if (g_fsr_have_last_time) {
+    frame_time_ms = std::clamp(
+        std::chrono::duration<float, std::milli>(now - g_fsr_last_time).count(), 1.0f, 100.0f);
+  }
+  g_fsr_last_time = now;
+  g_fsr_have_last_time = true;
+
+  auto describe = [](VkImage image, VkFormat format, uint32_t width, uint32_t height,
+                     uint32_t extra_usage) {
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    return ffxApiGetResourceVK(
+        reinterpret_cast<void*>(image),
+        ffxApiGetImageResourceDescriptionVK(image, info, extra_usage),
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+  };
+  ffxDispatchDescUpscale desc{};
+  desc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+  desc.commandList = cmd;
+  desc.color = describe(g_fsr_colour, VK_FORMAT_R8G8B8A8_UNORM, kFsrSceneWidth, kFsrSceneHeight,
+                        FFX_API_RESOURCE_USAGE_READ_ONLY);
+  desc.depth = describe(g_fsr_depth, VK_FORMAT_R32_SFLOAT, kFsrSceneWidth, kFsrSceneHeight,
+                        FFX_API_RESOURCE_USAGE_READ_ONLY);
+  desc.motionVectors =
+      describe(g_fsr_motion, VK_FORMAT_R16G16_SFLOAT, kFsrSceneWidth, kFsrSceneHeight,
+               FFX_API_RESOURCE_USAGE_READ_ONLY);
+  desc.exposure = {};
+  desc.reactive = {};
+  desc.transparencyAndComposition = {};
+  {
+    VkImageCreateInfo output_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    output_info.imageType = VK_IMAGE_TYPE_2D;
+    output_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    output_info.extent = {g_live_width, g_live_height, 1};
+    output_info.mipLevels = 1;
+    output_info.arrayLayers = 1;
+    output_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    output_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    desc.output = ffxApiGetResourceVK(
+        reinterpret_cast<void*>(g_live_target),
+        ffxApiGetImageResourceDescriptionVK(g_live_target, output_info,
+                                            FFX_API_RESOURCE_USAGE_UAV |
+                                                FFX_API_RESOURCE_USAGE_READ_ONLY),
+        FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  desc.jitterOffset = {jitter_x, jitter_y};
+  desc.motionVectorScale = {rex::ui::kMotionNdcToBackwardUvScaleX,
+                            rex::ui::kMotionNdcToBackwardUvScaleY};
+  desc.renderSize = {kFsrSceneWidth, kFsrSceneHeight};
+  desc.upscaleSize = {g_live_width, g_live_height};
+  // Pure SR: no extra RCAS, the presenter's own output effect stays in charge.
+  desc.enableSharpening = false;
+  desc.sharpness = 0.0f;
+  desc.frameTimeDelta = frame_time_ms;
+  desc.preExposure = 1.0f;
+  desc.reset = input.reset;
+  // The recompiled game does not expose camera parameters; the presenter uses
+  // the same placeholders. FSR's depth use with these is the open T4.6/T4.12
+  // measurement (real depth, estimated camera).
+  desc.cameraNear = 0.1f;
+  desc.cameraFar = 1000.0f;
+  desc.cameraFovAngleVertical = 1.0472f;
+  desc.viewSpaceToMetersFactor = 1.0f;
+  desc.flags = 0;
+
+  const bool timing = g_fsr_timing_pool != VK_NULL_HANDLE;
+  if (timing) {
+    dfn.vkCmdResetQueryPool(cmd, g_fsr_timing_pool, slot * 2, 2);
+    dfn.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_fsr_timing_pool, slot * 2);
+  }
+  const ffxReturnCode_t dispatch_result =
+      g_fsr_functions->Dispatch(&g_fsr_context, &desc.header);
+  if (timing) {
+    dfn.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fsr_timing_pool,
+                            slot * 2 + 1);
+    g_fsr_timing_frame[slot] = input.frame;
+    g_fsr_timing_recorded[slot] = true;
+  }
+  if (dispatch_result != FFX_API_RETURN_OK) {
+    static bool dispatch_logged = false;
+    if (!dispatch_logged) {
+      dispatch_logged = true;
+      REXGPU_WARN("fsr4_seam: FSR 4 dispatch failed ({}), keeping the guest view",
+                  dispatch_result);
+    }
+    // The backend may have left the target in any layout when it bails out;
+    // stop substituting rather than track a guess.
+    g_fsr_ready = false;
+    return false;
+  }
+
+  // The backend reset the imported resources to their initial states, so the
+  // answer is GENERAL again; the composition samples it.
+  VkImageMemoryBarrier target_to_sampled{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  target_to_sampled.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  target_to_sampled.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  target_to_sampled.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  target_to_sampled.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  target_to_sampled.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  target_to_sampled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  target_to_sampled.image = g_live_target;
+  target_to_sampled.subresourceRange = full_range;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                           &target_to_sampled);
+  g_live_target_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  RecordLiveDumpFrameFsr4(cmd, dfn, input.frame, input.colour_width, input.colour_height, false,
+                          slot);
+  REXGPU_INFO("fsr4_seam frame={} applied=1 provider={} render={}x{} output={}x{} "
+              "jitter=({:.3f},{:.3f}) gpu_ms={:.3f} reset={}",
+              input.frame, g_fsr_provider, kFsrSceneWidth, kFsrSceneHeight, g_live_width,
+              g_live_height, jitter_x, jitter_y, g_fsr_last_gpu_ms, input.reset ? 1 : 0);
+  ReportRecordedFrame(true, float(g_fsr_last_gpu_ms));
+  return true;
+}
+#endif  // REX_HAS_DLSS5_AMD && REX_HAS_FIDELITYFX_RUNTIME
 
 VkImageView SubstituteView() {
   // Unsigned-fetch case of SubstituteViewForFetch(). dlss5_amd_view is
@@ -1203,6 +1673,66 @@ bool TransitionLiveImages(const vulkan::VulkanDevice& device, VkQueue queue, uin
   return ok;
 }
 
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// One-time UNDEFINED -> GENERAL for the three mode-4 FSR inputs (the prep
+// writes them as storage images). Kept separate from TransitionLiveImages so
+// mode 3's initial transition sequence is untouched.
+bool TransitionFsrSceneImages(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family) {
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool_info.queueFamilyIndex = family;
+  pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  if (dfn.vkCreateCommandPool(device.device(), &pool_info, nullptr, &pool) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBufferAllocateInfo buffer_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  buffer_info.commandPool = pool;
+  buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  buffer_info.commandBufferCount = 1;
+  if (dfn.vkAllocateCommandBuffers(device.device(), &buffer_info, &command_buffer) != VK_SUCCESS) {
+    dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+    return false;
+  }
+  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (dfn.vkCreateFence(device.device(), &fence_info, nullptr, &fence) != VK_SUCCESS) {
+    dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+    return false;
+  }
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  dfn.vkBeginCommandBuffer(command_buffer, &begin);
+  const VkImage images[3] = {g_fsr_colour, g_fsr_motion, g_fsr_depth};
+  VkImageMemoryBarrier barriers[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[i].srcAccessMask = 0;
+    barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[i].image = images[i];
+    barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  }
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3,
+                           barriers);
+  dfn.vkEndCommandBuffer(command_buffer);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command_buffer;
+  const bool ok = dfn.vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS &&
+                  dfn.vkWaitForFences(device.device(), 1, &fence, VK_TRUE, UINT64_MAX) ==
+                      VK_SUCCESS;
+  dfn.vkDestroyFence(device.device(), fence, nullptr);
+  dfn.vkDestroyCommandPool(device.device(), pool, nullptr);
+  return ok;
+}
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
+
 // --- dlss5_live_dump helpers ---
 // The guest frame the recorded live frame belongs to: the command processor
 // increments this once per XE_SWAP packet it actually processes, in stream
@@ -1290,15 +1820,16 @@ void ConsumePendingLiveDump() {
   std::string paths[4];
   std::string shas[4];
   for (uint32_t i = 0; i < 4; ++i) {
+    const VkDeviceSize bytes =
+        g_live_dump_pending_bytes[i] != 0 ? g_live_dump_pending_bytes[i] : g_live_dump_image_bytes;
     paths[i] = LiveDumpFilePath(prefix, frame, kKinds[i], kExtensions[i]);
     if (!WriteLiveDumpFile(paths[i], base + VkDeviceSize(i) * g_live_dump_image_bytes,
-                           size_t(g_live_dump_image_bytes), shas[i])) {
-      REXGPU_WARN("dlss5_live_dump: can't write {} ({} bytes)", paths[i],
-                  uint64_t(g_live_dump_image_bytes));
+                           size_t(bytes), shas[i])) {
+      REXGPU_WARN("dlss5_live_dump: can't write {} ({} bytes)", paths[i], uint64_t(bytes));
       continue;
     }
     REXGPU_INFO("dlss5_live_dump frame={} file={} bytes={} sha256={}", frame, paths[i],
-                uint64_t(g_live_dump_image_bytes), shas[i]);
+                uint64_t(bytes), shas[i]);
   }
   // The JSON is the run's index: it names the extents, formats and each file's
   // hash so a comparison script does not need the log. guest_frame is the
@@ -1322,9 +1853,12 @@ void ConsumePendingLiveDump() {
   json << "  \"answer_in_place\": " << (g_live_dump_pending_in_place ? "true" : "false") << ",\n";
   json << "  \"images\": {\n";
   for (uint32_t i = 0; i < 4; ++i) {
+    const VkDeviceSize bytes =
+        g_live_dump_pending_bytes[i] != 0 ? g_live_dump_pending_bytes[i] : g_live_dump_image_bytes;
     json << "    \"" << kKinds[i] << "\": {\"file\": \"" << JsonEscape(paths[i])
-         << "\", \"format\": \"" << kFormats[i] << "\", \"bytes\": "
-         << uint64_t(g_live_dump_image_bytes) << ", \"sha256\": \"" << shas[i] << "\"}"
+         << "\", \"format\": \"" << kFormats[i] << "\", \"extent\": ["
+         << g_live_dump_pending_width[i] << ", " << g_live_dump_pending_height[i]
+         << "], \"bytes\": " << uint64_t(bytes) << ", \"sha256\": \"" << shas[i] << "\"}"
          << (i + 1 < 4 ? "," : "") << "\n";
   }
   json << "  }\n}\n";
@@ -1462,11 +1996,160 @@ bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functi
   g_live_dump_pending_scene_height = scene_height;
   g_live_dump_pending_depth = depth_enabled;
   g_live_dump_pending_in_place = !takes_target;
+  // Mode 3: all four images are the runtime extent with the same byte size.
+  for (uint32_t i = 0; i < 4; ++i) {
+    g_live_dump_pending_width[i] = g_live_width;
+    g_live_dump_pending_height[i] = g_live_height;
+    g_live_dump_pending_bytes[i] = g_live_dump_image_bytes;
+  }
   if (REXCVAR_GET(dlss5_live_trace)) {
     REXGPU_INFO("dlss5_live_dump frame={} copies recorded ({} bytes/image, slot={})", frame,
                 uint64_t(g_live_dump_image_bytes), descriptor_slot);
   }
   return true;
+}
+
+// Mode-4 dump: the FSR inputs next to the answer. In bypass the pre-upscaled
+// colour is the 1920x1080 image the copy came from (answer == colour); in real
+// mode colour/motion/depth are the 1000x600 scene copies FSR consumed and the
+// answer is the 1920x1080 upscale. Offsets stay the mode-3 ones so one buffer
+// and one readback path serve both modes.
+void RecordLiveDumpFrameFsr4(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                             uint64_t frame, uint32_t scene_width, uint32_t scene_height,
+                             bool bypass, uint32_t descriptor_slot) {
+  if (g_live_dump_done || g_live_dump_pending || !g_live_dump_enabled ||
+      g_live_dump_buffer == VK_NULL_HANDLE || g_live_dump_image_bytes == 0) {
+    return;
+  }
+  if (g_live_dump_frame >= 0 && uint64_t(g_live_dump_frame) != frame) {
+    return;
+  }
+  if (g_live_target == VK_NULL_HANDLE) {
+    return;
+  }
+  struct DumpCopy {
+    VkImage image;
+    VkImageLayout layout;
+    VkDeviceSize offset;
+    uint32_t width;
+    uint32_t height;
+    VkDeviceSize bytes;
+  };
+  const VkDeviceSize scene_bytes = VkDeviceSize(scene_width) * scene_height * 4u;
+  DumpCopy copies[4];
+  if (bypass) {
+    if (g_live_colour == VK_NULL_HANDLE || g_live_motion == VK_NULL_HANDLE ||
+        g_live_depth == VK_NULL_HANDLE) {
+      return;
+    }
+    copies[0] = {g_live_colour, g_live_colour_layout, 0, g_live_width, g_live_height,
+                 g_live_dump_image_bytes};
+    copies[1] = {g_live_motion, g_live_motion_layout, g_live_dump_image_bytes, g_live_width,
+                 g_live_height, g_live_dump_image_bytes};
+    copies[2] = {g_live_depth, g_live_depth_layout, 2 * g_live_dump_image_bytes, g_live_width,
+                 g_live_height, g_live_dump_image_bytes};
+  } else {
+    if (g_fsr_colour == VK_NULL_HANDLE || g_fsr_motion == VK_NULL_HANDLE ||
+        g_fsr_depth == VK_NULL_HANDLE) {
+      return;
+    }
+    copies[0] = {g_fsr_colour, g_fsr_colour_layout, 0, scene_width, scene_height, scene_bytes};
+    copies[1] = {g_fsr_motion, g_fsr_motion_layout, g_live_dump_image_bytes, scene_width,
+                 scene_height, scene_bytes};
+    copies[2] = {g_fsr_depth, g_fsr_depth_layout, 2 * g_live_dump_image_bytes, scene_width,
+                 scene_height, scene_bytes};
+  }
+  copies[3] = {g_live_target, g_live_target_layout, 3 * g_live_dump_image_bytes, g_live_width,
+               g_live_height, g_live_dump_image_bytes};
+
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageMemoryBarrier src[4] = {};
+  uint32_t src_count = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    bool duplicate = false;
+    for (uint32_t j = 0; j < i; ++j) {
+      duplicate = duplicate || copies[j].image == copies[i].image;
+    }
+    if (duplicate) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = src[src_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask =
+        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = copies[i].layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = copies[i].image;
+    barrier.subresourceRange = range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, src_count,
+                           src);
+  for (const DumpCopy& copy : copies) {
+    VkBufferImageCopy region{};
+    region.bufferOffset = copy.offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {copy.width, copy.height, 1};
+    dfn.vkCmdCopyImageToBuffer(cmd, copy.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               g_live_dump_buffer, 1, &region);
+  }
+  VkImageMemoryBarrier dst[4] = {};
+  uint32_t dst_count = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    bool duplicate = false;
+    for (uint32_t j = 0; j < i; ++j) {
+      duplicate = duplicate || copies[j].image == copies[i].image;
+    }
+    if (duplicate) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = dst[dst_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = copies[i].layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = copies[i].image;
+    barrier.subresourceRange = range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                           dst_count, dst);
+  VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_host.buffer = g_live_dump_buffer;
+  to_host.offset = 0;
+  to_host.size = VK_WHOLE_SIZE;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                           nullptr, 1, &to_host, 0, nullptr);
+
+  g_live_dump_pending = true;
+  g_live_dump_done = true;
+  g_live_dump_pending_slot = descriptor_slot;
+  g_live_dump_pending_frame = frame;
+  g_live_dump_pending_guest_frame = CurrentGuestFrameIndex();
+  g_live_dump_pending_scene_width = scene_width;
+  g_live_dump_pending_scene_height = scene_height;
+  g_live_dump_pending_depth = true;
+  g_live_dump_pending_in_place = false;
+  for (uint32_t i = 0; i < 4; ++i) {
+    g_live_dump_pending_width[i] = copies[i].width;
+    g_live_dump_pending_height[i] = copies[i].height;
+    g_live_dump_pending_bytes[i] = copies[i].bytes;
+  }
+  if (REXCVAR_GET(dlss5_live_trace)) {
+    REXGPU_INFO("dlss5_live_dump frame={} fsr4 copies recorded ({}, slot={})", frame,
+                bypass ? "bypass" : "scene inputs", descriptor_slot);
+  }
 }
 
 bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family) {
@@ -1479,16 +2162,21 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   const vulkan::VulkanDevice::Functions& dfn = device.functions();
   const VkDevice vk_device = device.device();
   g_live_device = &device;
+  const bool fsr4_seam = REXCVAR_GET(dlss5_amd_mode) == 4;
   auto fail = [&](const char* what) {
-    REXLOG_WARN("DLSS 5 NR (AMD): failed to create the live NR {} - live mode inactive", what);
+    REXLOG_WARN("DLSS 5 NR (AMD): failed to create the live seam {} - live mode inactive", what);
     // Partially created handles stay set; Shutdown() releases them.
     g_live_resources_failed = true;
     return false;
   };
   // The runtime extent is what record_engine validates the frames against; the
   // images must exist at exactly that size, and the prep dispatch runs over it.
-  g_live_width = g_runtime->model_width();
-  g_live_height = g_runtime->model_height();
+  // Mode 4 has no NR runtime: InitializeRuntime set the live extent to the
+  // output size before calling this, because FSR's upscale size is the target's.
+  if (!g_live_width || !g_live_height) {
+    g_live_width = g_runtime->model_width();
+    g_live_height = g_runtime->model_height();
+  }
   if (!g_live_width || !g_live_height) {
     return fail("runtime extent");
   }
@@ -1541,6 +2229,42 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
       return fail("null depth image");
     }
   }
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  // Mode 4: FSR's render-resolution inputs. The mode-3 prep writes these in one
+  // dispatch over the guest resolve, 1:1, so FSR gets the native scene colour,
+  // the guide motion and the guest depth at the extent its renderSize declares.
+  if (fsr4_seam) {
+    struct SceneImage {
+      VkFormat format;
+      VkImage* image;
+      VkDeviceMemory* memory;
+    };
+    const SceneImage scene_images[3] = {
+        {VK_FORMAT_R8G8B8A8_UNORM, &g_fsr_colour, &g_fsr_colour_memory},
+        {VK_FORMAT_R16G16_SFLOAT, &g_fsr_motion, &g_fsr_motion_memory},
+        {VK_FORMAT_R32_SFLOAT, &g_fsr_depth, &g_fsr_depth_memory},
+    };
+    for (const SceneImage& scene_image : scene_images) {
+      VkImageCreateInfo scene_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      scene_info.imageType = VK_IMAGE_TYPE_2D;
+      scene_info.format = scene_image.format;
+      scene_info.extent = {kFsrSceneWidth, kFsrSceneHeight, 1};
+      scene_info.mipLevels = 1;
+      scene_info.arrayLayers = 1;
+      scene_info.samples = VK_SAMPLE_COUNT_1_BIT;
+      scene_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      scene_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      scene_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      scene_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      if (!vulkan::util::CreateDedicatedAllocationImage(
+              &device, scene_info, vulkan::util::MemoryPurpose::kDeviceLocal, *scene_image.image,
+              *scene_image.memory)) {
+        return fail("FSR scene image");
+      }
+    }
+  }
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
   // The optional determinism dump: one host-visible buffer for all four images,
   // sized for at least 1920x1080 each (every live image is 4 bytes per pixel).
   // Created and mapped here so the recorded-frame path never allocates or maps;
@@ -1583,6 +2307,14 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
       !CreateLiveView(device, g_live_null_depth, VK_FORMAT_R32_SFLOAT, g_live_null_depth_view)) {
     return fail("views");
   }
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (fsr4_seam &&
+      (!CreateLiveView(device, g_fsr_colour, VK_FORMAT_R8G8B8A8_UNORM, g_fsr_colour_view) ||
+       !CreateLiveView(device, g_fsr_motion, VK_FORMAT_R16G16_SFLOAT, g_fsr_motion_view) ||
+       !CreateLiveView(device, g_fsr_depth, VK_FORMAT_R32_SFLOAT, g_fsr_depth_view))) {
+    return fail("FSR scene views");
+  }
+#endif
   if (!TransitionLiveImages(device, queue, family)) {
     return fail("initial layout transition");
   }
@@ -1590,6 +2322,11 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   g_live_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
   g_live_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
   g_live_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  g_fsr_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+#endif
   // The colour pre-upscale resamples the 1000x600 scene onto the runtime
   // extent; the draw's own sampler is passed per frame when available, and this
   // one (linear, clamp) is the fallback for the same mapping.
@@ -1675,17 +2412,144 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   if (g_live_pipeline == VK_NULL_HANDLE) {
     return fail("prep pipeline");
   }
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (fsr4_seam) {
+    if (!TransitionFsrSceneImages(device, queue, family)) {
+      return fail("FSR scene layout transition");
+    }
+    // The optional timestamp ring around the FSR dispatch. A queue without
+    // timestamps only disables the measurement, never the seam.
+    if (REXCVAR_GET(dlss5_live_fsr4_timing)) {
+      const vulkan::VulkanInstance* instance = device.vulkan_instance();
+      VkPhysicalDeviceProperties properties{};
+      instance->functions().vkGetPhysicalDeviceProperties(device.physical_device(), &properties);
+      uint32_t family_count = 0;
+      instance->functions().vkGetPhysicalDeviceQueueFamilyProperties(
+          device.physical_device(), &family_count, nullptr);
+      std::vector<VkQueueFamilyProperties> families(family_count);
+      instance->functions().vkGetPhysicalDeviceQueueFamilyProperties(
+          device.physical_device(), &family_count, families.data());
+      const uint32_t graphics_family = device.queue_family_graphics_compute();
+      if (graphics_family < families.size() &&
+          families[graphics_family].timestampValidBits != 0 &&
+          properties.limits.timestampPeriod > 0.0f) {
+        VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_info.queryCount = kLiveDescriptorSlots * 2;
+        if (dfn.vkCreateQueryPool(vk_device, &query_info, nullptr, &g_fsr_timing_pool) ==
+            VK_SUCCESS) {
+          g_fsr_timestamp_period_ns = properties.limits.timestampPeriod;
+          REXLOG_INFO("FSR 4 seam: GPU timestamps enabled ({} slots, period {:.2f} ns)",
+                      kLiveDescriptorSlots, double(g_fsr_timestamp_period_ns));
+        }
+      }
+      if (g_fsr_timing_pool == VK_NULL_HANDLE) {
+        REXLOG_WARN("FSR 4 seam: the graphics queue has no usable timestamps; the seam still "
+                    "runs, the dispatch measurement is off");
+      }
+    }
+  }
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
   // Whether the runtime wants a separate answer image with the default controls;
-  // that decides which view the composition substitutes.
+  // that decides which view the composition substitutes. Mode 4 always writes
+  // the separate 1920x1080 target (the bypass body copies into it).
   nr::Controls controls;
-  const bool takes_target = g_runtime->takes_target(controls);
+  const bool takes_target = fsr4_seam ? true : g_runtime->takes_target(controls);
   g_live_substitute_view = takes_target ? g_live_target_view : g_live_colour_view;
   g_live_substitute_image = takes_target ? g_live_target : g_live_colour;
-  REXLOG_INFO("DLSS 5 NR (AMD): live mode resources ready ({}x{}, target={}, {})", g_live_width,
-              g_live_height, takes_target ? "separate" : "in-place",
+  REXLOG_INFO("{}: live seam resources ready ({}x{}, target={}, {})",
+              fsr4_seam ? "FSR 4" : "DLSS 5 NR (AMD)", g_live_width, g_live_height,
+              takes_target ? "separate" : "in-place",
               g_live_substitute_view == g_live_target_view ? "target view" : "colour view");
   return true;
 }
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+// Mode 4 setup: load the already-staged FSR 4 provider, create its upscale
+// context at the fixed guest-scene -> output extents, then build the shared
+// live-seam resources (plus the scene-extent FSR inputs). Any failure is a
+// named inactive reason; no Vulkan object is left half-bound in the frame.
+bool InitializeFsr4SeamRuntime(const vulkan::VulkanDevice& device, VkQueue queue, uint32_t family,
+                               uint32_t output_width, uint32_t output_height) {
+  if (g_fsr_ready) {
+    return true;
+  }
+  const ffx::Functions* functions = ffx::Get(ffx::Api::kVulkan);
+  if (!functions) {
+    SetInactive("the FidelityFX Vulkan runtime is unavailable");
+    return false;
+  }
+  if (!ffx::IsProviderActive()) {
+    const rex::ui::fsr4::Status& status = rex::ui::fsr4::GetStatus();
+    SetInactive(status.reason.empty()
+                    ? "dlss5_amd_mode=4 needs the FSR 4 provider .so (fsr4=true + fsr4_data_path)"
+                    : status.reason);
+    return false;
+  }
+  g_fsr_functions = functions;
+  g_live_device = &device;
+  g_live_width = output_width;
+  g_live_height = output_height;
+
+  ffxCreateContextDescUpscale create_desc{};
+  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+  // The guest scene resolve is perceptual UNORM (no gamma PWL anywhere on the
+  // guest path), so NON_LINEAR matches the presenter's FSR context. The guide
+  // motion is already jitter-removed, so jitter cancellation stays off.
+  create_desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+  create_desc.maxRenderSize = {kFsrSceneWidth, kFsrSceneHeight};
+  create_desc.maxUpscaleSize = {g_live_width, g_live_height};
+
+  ffxCreateBackendVKDesc backend_desc{};
+  backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+  PFN_vkGetDeviceProcAddr vk_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+      device.vulkan_instance()->functions().vkGetInstanceProcAddr(
+          device.vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
+  if (!vk_device_proc_addr) {
+    SetInactive("vkGetDeviceProcAddr is unavailable for the FSR 4 seam");
+    return false;
+  }
+  g_fsr_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
+  backend_desc.vkDevice = device.device();
+  backend_desc.vkPhysicalDevice = device.physical_device();
+  backend_desc.vkDeviceProcAddr = FsrVkGetDeviceProcAddrCompat;
+  create_desc.header.pNext = &backend_desc.header;
+
+  if (functions->CreateContext(&g_fsr_context, &create_desc.header, nullptr) !=
+      FFX_API_RETURN_OK) {
+    g_fsr_context = nullptr;
+    SetInactive("the FSR 4 provider could not create a context on this device (needs Vulkan 1.3, "
+                "cooperative matrix and float8)");
+    return false;
+  }
+  ffxQueryGetProviderVersion provider_version{};
+  provider_version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+  if (functions->Query(&g_fsr_context, &provider_version.header) == FFX_API_RETURN_OK &&
+      provider_version.versionName != nullptr) {
+    g_fsr_provider = provider_version.versionName;
+  } else {
+    g_fsr_provider = "unknown provider";
+  }
+  if (!InitializeLiveResources(device, queue, family)) {
+    functions->DestroyContext(&g_fsr_context, nullptr);
+    g_fsr_context = nullptr;
+    SetInactive("FSR 4 seam resources could not be created");
+    return false;
+  }
+  g_fsr_ready = true;
+  // The guest must render each frame with the sub-pixel offset FSR is told
+  // about, or there is no new sample to accumulate: the projection hook only
+  // jitters while the temporal path reports an active render size. The
+  // presenter normally sets this when its own temporal upscaler runs; mode 4
+  // replaces that path, so it reports the scene extent itself. The guide's
+  // MotionJitterDeltaNdc then removes the same flip-adjusted jitter, keeping
+  // the motion input jitter-free as the context expects.
+  rex::ui::temporal::SetActive(kFsrSceneWidth, kFsrSceneHeight);
+  REXLOG_INFO("FSR 4 seam: provider {} ready, render {}x{} -> {}x{} (mode 4, guest jitter active)",
+              g_fsr_provider, kFsrSceneWidth, kFsrSceneHeight, g_live_width, g_live_height);
+  return true;
+}
+#endif  // REX_HAS_FIDELITYFX_RUNTIME
 #endif  // REX_HAS_DLSS5_AMD
 }  // namespace
 
@@ -1707,6 +2571,28 @@ void InitializeAssets() {
   if (!g_device_reason.empty()) {
     SetInactive(g_device_reason);
     return;
+  }
+
+  if (REXCVAR_GET(dlss5_amd_mode) == 4) {
+    // Mode 4 is the FSR 4 seam: the NR model and shader tree are not used at
+    // all, so their absence must not make it inactive. The provider is loaded
+    // by ffx_runtime when fsr4=true; InitializeRuntime creates the context.
+#if !defined(REX_HAS_FIDELITYFX_RUNTIME) || !REX_HAS_FIDELITYFX_RUNTIME
+    SetInactive("this build has no FidelityFX Vulkan runtime for the FSR 4 seam");
+    return;
+#else
+    if (!rex::ui::fsr4::Selected()) {
+      SetInactive("dlss5_amd_mode=4 needs fsr4=true (the FSR 4 provider .so)");
+      return;
+    }
+    g_status.data_root = rex::ui::fsr4::DataRoot().string();
+    g_status.state = State::kReady;
+    g_status.reason.clear();
+    REXLOG_INFO("DLSS 5 NR (AMD): mode 4 is the FSR 4 composition seam; provider data root {} "
+                "(the NR model is not loaded)",
+                g_status.data_root);
+    return;
+#endif
   }
 
   std::filesystem::path root = REXCVAR_GET(dlss5_amd_data_path);
@@ -1752,6 +2638,27 @@ void InitializeRuntime(const vulkan::VulkanDevice& device, uint32_t width, uint3
   }
   if (device.queue_family_graphics_compute() == UINT32_MAX) {
     SetInactive("no graphics+compute queue family");
+    return;
+  }
+  if (REXCVAR_GET(dlss5_amd_mode) == 4) {
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    try {
+      vulkan::VulkanDevice::Queue::Acquisition queue =
+          device.AcquireQueue(device.queue_family_graphics_compute(), 0);
+      if (!InitializeFsr4SeamRuntime(device, queue.queue(),
+                                     device.queue_family_graphics_compute(), width, height)) {
+        // InitializeFsr4SeamRuntime names the reason (provider, context, or
+        // resources); the renderer keeps the guest composition.
+        return;
+      }
+      g_status.gpu = device.properties().deviceName;
+      g_status.state = State::kReady;
+    } catch (const std::exception& e) {
+      SetInactive(std::string("FSR 4 seam initialization failed: ") + e.what());
+    }
+#else
+    SetInactive("this build has no FidelityFX Vulkan runtime for the FSR 4 seam");
+#endif
     return;
   }
   try {
@@ -1826,9 +2733,46 @@ void ReportRecordedFrame(bool applied, float gpu_ms) {
 void Shutdown() {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
   g_runtime.reset();
+  const bool fsr4_seam = REXCVAR_GET(dlss5_amd_mode) == 4;
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (fsr4_seam) {
+    // Mode 4 reported itself as the temporal path for the projection jitter;
+    // drop that so a teardown does not leave the guest jittering.
+    rex::ui::temporal::SetInactive();
+  }
+  if (g_fsr_context != nullptr && g_fsr_functions != nullptr) {
+    g_fsr_functions->DestroyContext(&g_fsr_context, nullptr);
+  }
+  g_fsr_context = nullptr;
+  g_fsr_functions = nullptr;
+  g_fsr_ready = false;
+  g_fsr_provider.clear();
+  g_fsr_last_gpu_ms = 0.0;
+  g_fsr_have_last_time = false;
+  for (uint32_t i = 0; i < kLiveDescriptorSlots; ++i) {
+    g_fsr_timing_recorded[i] = false;
+    g_fsr_timing_frame[i] = 0;
+  }
+#endif
   if (g_live_device != nullptr) {
     const vulkan::VulkanDevice::Functions& dfn = g_live_device->functions();
     const VkDevice device = g_live_device->device();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device, g_fsr_timing_pool);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_fsr_colour_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_fsr_motion_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, g_fsr_depth_view);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_fsr_colour);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_fsr_motion);
+    vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, g_fsr_depth);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_fsr_colour_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_fsr_motion_memory);
+    vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, g_fsr_depth_memory);
+    g_fsr_colour_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_fsr_motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_fsr_depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_fsr_timestamp_period_ns = 0.0f;
+#endif
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, g_live_pipeline);
     vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                        g_live_pipeline_layout);
