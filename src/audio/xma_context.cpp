@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/audio/submission_trace.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
@@ -457,8 +458,14 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
       current_frame_remaining_subframes_;
 
-  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-                   subframes_to_write * kOutputBytesPerBlock);
+  const uint8_t* written =
+      raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset);
+  const size_t written_bytes = subframes_to_write * kOutputBytesPerBlock;
+  trace::LogBytes("xma", static_cast<uint32_t>(id()), static_cast<uint32_t>(subframes_to_write),
+                  static_cast<int>(output_rb->write_count() / kOutputBytesPerBlock),
+                  static_cast<int>(output_rb->read_count() / kOutputBytesPerBlock),
+                  data->is_stereo ? 2u : 1u, written, written_bytes);
+  output_rb->Write(written, written_bytes);
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding
