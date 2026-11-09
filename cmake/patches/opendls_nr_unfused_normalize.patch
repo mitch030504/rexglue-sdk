@@ -1,0 +1,140 @@
+--- a/shaders/window_normalize.comp
++++ b/shaders/window_normalize.comp
+@@ -1,10 +1,16 @@
+ #version 460
+ // Cosine-attention Q/K normalization for the fused Swin blocks
+ // (the network's normalization order).
+-// One thread per (token, head); the square sums use the specified half
+-// reduction order: fma(low, low, f16(high*high)) for the 16 pairs, then a
+-// stride 8/4/2/1 tree, every add published as FP16.
++//
++// One half-warp (32 lanes) per (token, head); 8 half-warps per 256-thread workgroup.
++// The scalar form of this kernel read one 192-byte head record per thread, so every warp
++// touched 32 cache lines to use 64 bytes of them (~50 GB/s measured). This form has each
++// half-warp load Q, K and V as three contiguous 64-byte records and reduces the 16 square
++// sums with subgroup shuffles in exactly the reference's tree order (stride 8/4/2/1).
+ #extension GL_EXT_shader_explicit_arithmetic_types : require
++#extension GL_KHR_memory_scope_semantics : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_shuffle : require
+ #extension GL_GOOGLE_include_directive : require
+ #include "common.glsl"
+ 
+@@ -21,53 +27,73 @@
+ layout(std430, binding = 4) readonly buffer Aux { uint aux32[]; };
+ layout(std430, binding = 5) writeonly buffer Normalized { uint8_t normalized[]; }; // E4M3 [tokens][channels*3]
+ 
+-float16_t treeSum16(float16_t r[16]) {
+-  // reduction[c] += reduction[c + stride] for stride 8, 4, 2, 1.
+-  precise float16_t s8[8];
+-  for (uint c = 0u; c < 8u; ++c) s8[c] = r[c] + r[c + 8u];
+-  precise float16_t s4[4];
+-  for (uint c = 0u; c < 4u; ++c) s4[c] = s8[c] + s8[c + 4u];
+-  precise float16_t s2[2];
+-  s2[0] = s4[0] + s4[2];
+-  s2[1] = s4[1] + s4[3];
+-  return s2[0] + s2[1];
++// Tree sum over the 16 pair sums, in the reference order: stride 8, 4, 2, 1. Every add is
++// published as f16. `bits` holds r[lane] on lanes 0..15; the result lands on lane 0 and is
++// broadcast back to the half-warp.
++uint treeSum16(uint bits, uint lane, uint halfBase) {
++  uint other = subgroupShuffle(bits, halfBase + ((lane + 8u) & 31u));
++  if (lane < 8u) bits = f16Bits(f16FromBits(bits) + f16FromBits(other));
++  other = subgroupShuffle(bits, halfBase + ((lane + 4u) & 31u));
++  if (lane < 4u) bits = f16Bits(f16FromBits(bits) + f16FromBits(other));
++  other = subgroupShuffle(bits, halfBase + ((lane + 2u) & 31u));
++  if (lane < 2u) bits = f16Bits(f16FromBits(bits) + f16FromBits(other));
++  other = subgroupShuffle(bits, halfBase + ((lane + 1u) & 31u));
++  if (lane == 0u) bits = f16Bits(f16FromBits(bits) + f16FromBits(other));
++  return subgroupShuffle(bits, halfBase);
+ }
+ 
+ void main() {
+-  uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 65535u * 256u;
+-  if (id >= pc.tokens * pc.heads) return;
+-  uint token = id / pc.heads;
+-  uint head = id % pc.heads;
+-  // Native fused-Swin QKV weights are head-major: q, k, v of one head are
+-  // three consecutive 32-channel groups.
+-  uint base = token * pc.channels * 3u + head * 96u;
+-
+-  float16_t q[32];
+-  float16_t k[32];
+-  for (uint c = 0u; c < 32u; ++c) {
+-    q[c] = qkv[base + c];
+-    k[c] = qkv[base + 32u + c];
+-  }
+-  float16_t r[16];
+-  for (uint c = 0u; c < 16u; ++c) {
+-    precise float16_t highSquare = q[c + 16u] * q[c + 16u];
+-    r[c] = fma(q[c], q[c], highSquare);
+-  }
+-  float16_t qSum = treeSum16(r);
+-  for (uint c = 0u; c < 16u; ++c) {
+-    precise float16_t highSquare = k[c + 16u] * k[c + 16u];
+-    r[c] = fma(k[c], k[c], highSquare);
+-  }
+-  float16_t kSum = treeSum16(r);
+-  float16_t qNorm = float16_t(inversesqrt(float(qSum)));
+-  float16_t kNorm = float16_t(inversesqrt(float(kSum)));
+-  float16_t scale = float16_t(uintBitsToFloat(aux32[pc.scaleWordOffset + head]));
+-  for (uint c = 0u; c < 32u; ++c) {
+-    precise float16_t nq = q[c] * qNorm;
++  const uint inv = gl_SubgroupInvocationID;
++  const uint lane = inv & 31u;
++  const uint halfBase = inv & ~31u;
++  const uint halvesPerSubgroup = gl_SubgroupSize / 32u;
++  const uint halfWarp = gl_SubgroupID * halvesPerSubgroup + (inv >> 5u);   // 0..7 in the workgroup
++  const uint pairs = pc.tokens * pc.heads;
++  const uint groupBase = gl_WorkGroupID.x * 256u;
++
++  // One half-warp per (token, head); 8 half-warps cover 8 of the group's 256 pairs per pass.
++  // Every half-warp runs all 32 iterations: a 64-lane subgroup can hold two half-warps with
++  // different tails, and a break in one would leave the other's subgroup shuffle undefined.
++  for (uint i = 0u; i < 32u; ++i) {
++    uint id = groupBase + halfWarp * 32u + i;
++    bool valid = id < pairs;
++    uint token = valid ? id / pc.heads : 0u;
++    uint head = valid ? id % pc.heads : 0u;
++    // Native fused-Swin QKV weights are head-major: q, k, v of one head are
++    // three consecutive 32-channel groups.
++    uint base = token * pc.channels * 3u + head * 96u;
++
++    float16_t q = valid ? qkv[base + lane] : float16_t(0.0);
++    float16_t k = valid ? qkv[base + 32u + lane] : float16_t(0.0);
++    float16_t v = valid ? qkv[base + 64u + lane] : float16_t(0.0);
++
++    // r[c] = fma(q[c], q[c], q[c+16]^2) on lanes 0..15.
++    uint qHighBits = subgroupShuffle(f16Bits(q), halfBase + ((lane + 16u) & 31u));
++    uint kHighBits = subgroupShuffle(f16Bits(k), halfBase + ((lane + 16u) & 31u));
++    uint qSquare = 0u, kSquare = 0u;
++    if (lane < 16u) {
++      float16_t qHigh = f16FromBits(qHighBits);
++      float16_t kHigh = f16FromBits(kHighBits);
++      precise float16_t qHighSquare = qHigh * qHigh;
++      precise float16_t kHighSquare = kHigh * kHigh;
++      precise float16_t qPair = fma(q, q, qHighSquare);
++      precise float16_t kPair = fma(k, k, kHighSquare);
++      qSquare = f16Bits(qPair);
++      kSquare = f16Bits(kPair);
++    }
++    float16_t qSum = f16FromBits(treeSum16(qSquare, lane, halfBase));
++    float16_t kSum = f16FromBits(treeSum16(kSquare, lane, halfBase));
++    float16_t qNorm = float16_t(inversesqrt(float(qSum)));
++    float16_t kNorm = float16_t(inversesqrt(float(kSum)));
++    float16_t scale = float16_t(uintBitsToFloat(aux32[pc.scaleWordOffset + head]));
++
++    precise float16_t nq = q * qNorm;
+     precise float16_t nqs = nq * scale;
+-    precise float16_t nk = k[c] * kNorm;
+-    normalized[base + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(nqs)));
+-    normalized[base + 32u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(nk)));
+-    normalized[base + 64u + c] = uint8_t(e4m3CodeFromF16Bits(f16Bits(qkv[base + 64u + c])));
++    precise float16_t nk = k * kNorm;
++    if (valid) {
++      normalized[base + lane] = uint8_t(e4m3CodeFromF16Bits(f16Bits(nqs)));
++      normalized[base + 32u + lane] = uint8_t(e4m3CodeFromF16Bits(f16Bits(nk)));
++      normalized[base + 64u + lane] = uint8_t(e4m3CodeFromF16Bits(f16Bits(v)));
++    }
+   }
+ }

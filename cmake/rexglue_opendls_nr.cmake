@@ -2,8 +2,9 @@
 #
 # maanHimself/OpenDLSS-NR reimplements the DLSS 5 NR network (71 blocks, 310.8.0-class) in
 # Vulkan/GLSL compute. Upstream builds with PowerShell/MSVC only, so this module fetches the
-# pinned commit, applies the carried Linux patch (cmake/patches/opendls_nr_linux.patch) to a
-# build-dir copy of src/, compiles the 13 shaders/*.comp with glslang and builds the standalone
+# pinned commit, applies the carried Linux patch (cmake/patches/opendls_nr_linux.patch) and two
+# RADV shader patches (f32 accumulators; coalesced unfused normalization) to a build-dir copy of
+# src/ and shaders/, compiles the 13 shaders/*.comp with glslang and builds the standalone
 # `dlss5vk` tool. The tool loads the Vulkan loader at run time through volk, so it links no
 # libvulkan and shares no device with the application.
 #
@@ -184,10 +185,33 @@ if(NOT _patched_gemm_fp8 MATCHES "coopmat<float, gl_ScopeSubgroup, 16, 16")
         "OpenDLSS-NR: shader patch reported success but the f32 accumulator marker is missing")
 endif()
 
+# The unfused normalization kernel was one thread per (token, head): each thread read a
+# 192-byte head record with scalar half loads, so a warp's 64 useful bytes were spread over
+# 32 cache lines (~50 GB/s measured on the 9070 XT). The carried patch turns it into one
+# half-warp per (token, head) with three coalesced 64-byte loads and subgroup-shuffle tree
+# sums in the reference's exact f16 order. It is byte-identical on block 0 (same E4M3 output
+# hash) and takes the kernel from 61.1 ms to 9.1 ms of the 1920x1080 unfused frame.
+set(_normalize_patch_file "${CMAKE_CURRENT_LIST_DIR}/patches/opendls_nr_unfused_normalize.patch")
+execute_process(
+    COMMAND "${REXGLUE_PATCH_EXECUTABLE}" -p1 --no-backup-if-mismatch -i "${_normalize_patch_file}"
+    WORKING_DIRECTORY "${_patched_root}"
+    RESULT_VARIABLE _normalize_patch_result OUTPUT_VARIABLE _normalize_patch_out
+    ERROR_VARIABLE _normalize_patch_err)
+if(NOT _normalize_patch_result EQUAL 0)
+    message(FATAL_ERROR
+        "OpenDLSS-NR: unfused-normalize shader patch does not apply to ${_rexglue_opendls_nr_pin}: "
+        "${_normalize_patch_err}")
+endif()
+file(READ "${_patched_root}/shaders/window_normalize.comp" _patched_window_normalize)
+if(NOT _patched_window_normalize MATCHES "treeSum16")
+    message(FATAL_ERROR
+        "OpenDLSS-NR: normalize patch reported success but the half-warp marker is missing")
+endif()
+
 # The staged tool tree: the executable, the 13 .spv next to it and the license files.
 set(_stage_dir "${CMAKE_BINARY_DIR}/opendls-nr")
 
-# Compile from the patched copies (the C++ patch's Linux route plus the f32 accumulator shaders).
+# Compile from the patched copies (the C++ patch's Linux route plus the shader patches).
 file(GLOB _opendls_shaders CONFIGURE_DEPENDS "${_patched_root}/shaders/*.comp")
 file(GLOB _opendls_glsl CONFIGURE_DEPENDS "${_patched_root}/shaders/*.glsl")
 list(SORT _opendls_shaders)
