@@ -11,6 +11,8 @@
 
 #include "guest_audio_stretch.h"
 
+#include <rex/audio/submission_trace.h>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -30,8 +32,9 @@ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 
 namespace rex::audio::sdl {
 
-SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
-    : AudioDriver(memory), semaphore_(semaphore) {}
+SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore,
+                               uint32_t client_index)
+    : AudioDriver(memory), semaphore_(semaphore), client_index_(client_index) {}
 
 SDLAudioDriver::~SDLAudioDriver() {
   assert_true(frames_queued_.empty());
@@ -148,6 +151,9 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     }
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+    trace::Log("submit", client_index_, frame_ptr, channel_samples_,
+               static_cast<int>(frames_queued_.size()), 0, frame_channels_, output_frame,
+               frame_samples_);
   }
 }
 
@@ -208,8 +214,17 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       }
     }
     while (additional_amount > 0) {
-      driver->stretch_->Read(std::span<float>(data, sample_count));
+      const size_t written = driver->stretch_->Read(std::span<float>(data, sample_count));
+      if (written != channel_samples_) {
+        trace::Log("short", driver->client_index_, 0, static_cast<uint32_t>(written),
+                   static_cast<int>(driver->stretch_->BufferedFrames()), additional_amount, 2,
+                   data, written * std::max<uint8_t>(driver->sdl_device_channels_, 1));
+      }
       if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
+      trace::Log("sdl", driver->client_index_, 0, channel_samples_,
+                 SDL_GetAudioStreamQueued(stream), SDL_GetAudioStreamAvailable(stream),
+                 driver->sdl_device_channels_, data,
+                 static_cast<size_t>(channel_samples_) * driver->sdl_device_channels_);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while stretching: {}", SDL_GetError());
         break;
@@ -228,6 +243,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         sdl_callback_count++;
       }
       std::memset(data, 0, len);
+      trace::Log("sdl", driver->client_index_, 0, channel_samples_,
+                 SDL_GetAudioStreamQueued(stream), SDL_GetAudioStreamAvailable(stream),
+                 driver->sdl_device_channels_, data,
+                 static_cast<size_t>(channel_samples_) * driver->sdl_device_channels_);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
@@ -253,6 +272,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             break;
         }
       }
+      trace::Log("sdl", driver->client_index_, 0, channel_samples_,
+                 SDL_GetAudioStreamQueued(stream), SDL_GetAudioStreamAvailable(stream),
+                 driver->sdl_device_channels_, data,
+                 static_cast<size_t>(channel_samples_) * driver->sdl_device_channels_);
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
         driver->frames_unused_.push(buffer);

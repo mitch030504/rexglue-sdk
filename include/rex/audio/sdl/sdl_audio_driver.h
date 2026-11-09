@@ -27,7 +27,8 @@ class GuestAudioStretch;
 
 class SDLAudioDriver : public AudioDriver {
  public:
-  SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore);
+  SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore,
+                 uint32_t client_index = 0);
   ~SDLAudioDriver() override;
 
   bool Initialize();
@@ -39,6 +40,7 @@ class SDLAudioDriver : public AudioDriver {
                           int total_amount);
 
   rex::thread::Semaphore* semaphore_ = nullptr;
+  uint32_t client_index_ = 0;
 
   std::unique_ptr<GuestAudioStretch> stretch_;
   SDL_AudioStream* sdl_stream_ = nullptr;

@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/audio/audio_system.h>
+#include <rex/audio/submission_trace.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -100,7 +101,16 @@ u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samp
 
   auto* audio_system =
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system());
-  audio_system->SubmitFrame(driver_ptr.guest_address() & 0x0000FFFF, samples_ptr.guest_address());
+  const uint32_t client = driver_ptr.guest_address() & 0x0000FFFF;
+  if (audio::trace::Enabled()) {
+    const float* samples =
+        audio_system->memory()->TranslateVirtual<const float*>(samples_ptr.guest_address());
+    if (samples) {
+      audio::trace::Log("xa", client, samples_ptr.guest_address(), 256, 0, 0, 6, samples,
+                        256 * 6);
+    }
+  }
+  audio_system->SubmitFrame(client, samples_ptr.guest_address());
 
   return X_ERROR_SUCCESS;
 }
