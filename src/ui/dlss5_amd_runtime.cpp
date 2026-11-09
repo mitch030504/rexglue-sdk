@@ -133,13 +133,16 @@ REXCVAR_DEFINE_BOOL(dlss5_live_no_substitute, false, "GPU",
                     "the substitute descriptor from the split and the record).")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(dlss5_live_dump, "", "GPU",
-                      "Development (dlss5_amd_mode=3): if non-empty, one live frame is read back "
-                      "for a byte-for-byte determinism comparison. Writes <prefix>-f<frame>-"
-                      "colour.rgba, -motion.rg16f, -depth.r32f and -answer.rgba (raw, no header, "
-                      "1920x1080 RGBA8 / RG16F / R32F / RGBA8) and <prefix>-f<frame>.json "
-                      "(extents, formats, guest_frame, per-file SHA-256). The copy is recorded "
-                      "in the live command buffer and read on a later live frame, so the queue "
-                      "is never waited on; the recorded frame itself is unchanged.")
+                      "Development (dlss5_amd_mode=3/4): if non-empty, one live frame is read "
+                      "back for a byte-for-byte determinism comparison. Writes <prefix>-f<frame>-"
+                      "colour.rgba, -motion.rg16f, -depth.r32f, -answer.rgba and -baseline.rgba "
+                      "(raw, no header; mode 3 at 1920x1080, mode 4's inputs at 1000x600) and "
+                      "<prefix>-f<frame>.json (extents, formats, guest_frame, per-file SHA-256). "
+                      "The baseline is the mode-3 pre-upscale (bilinear) answer for the same "
+                      "frame, so mode 4's A/B pair shares one frame and one set of inputs. The "
+                      "copy is recorded in the live command buffer and read on a later live "
+                      "frame, so the queue is never waited on; the recorded frame itself is "
+                      "unchanged.")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(dlss5_live_dump_frame, -1, "GPU",
                      "Development: guest frame the live determinism dump records; -1 = the first "
@@ -197,6 +200,10 @@ constexpr uint32_t kLiveGuideHeight = 600;
 constexpr VkDeviceSize kLiveGuideBytes =
     VkDeviceSize(kLiveGuideWidth) * VkDeviceSize(kLiveGuideHeight) * 8u;
 constexpr uint32_t kLiveDescriptorSlots = 4;
+// One extra set holds the mode-4 dump's same-frame baseline prep, so updating
+// it cannot retarget the real seam's already-recorded dispatch (descriptor set
+// contents are read at execution time, not bind time).
+constexpr uint32_t kLivePrepSets = kLiveDescriptorSlots + 1;
 
 const vulkan::VulkanDevice* g_live_device = nullptr;
 uint32_t g_live_width = 0;
@@ -235,21 +242,21 @@ VkImage g_live_substitute_image = VK_NULL_HANDLE;
 VkSampler g_live_sampler = VK_NULL_HANDLE;
 VkDescriptorSetLayout g_live_set_layout = VK_NULL_HANDLE;
 std::unique_ptr<vulkan::SingleLayoutDescriptorSetPool> g_live_pool;
-VkDescriptorSet g_live_sets[kLiveDescriptorSlots] = {};
+VkDescriptorSet g_live_sets[kLivePrepSets] = {};
 VkPipelineLayout g_live_pipeline_layout = VK_NULL_HANDLE;
 VkPipeline g_live_pipeline = VK_NULL_HANDLE;
 bool g_live_resources_failed = false;
 
 // --- Live determinism dump (dlss5_live_dump) ---
-// One host-visible buffer holding the four 1920x1080 images at fixed offsets
-// (colour RGBA8, motion RG16F, depth R32F, answer RGBA8 - 4 bytes per pixel
-// each). It is created and mapped once at setup. A matching frame records the
-// four copies into it and sets pending; the next RecordLiveFrame call that
-// reuses the same seam slot reads it back. That slot is only handed out after
-// the submission following the live command buffer has completed, so the copy
-// is provably done: the queue is never waited on and the host never reads a
-// buffer that may still be in flight. One frame, one buffer, no per-frame
-// allocation.
+// One host-visible buffer holding the five 1920x1080 images at fixed offsets
+// (colour RGBA8, motion RG16F, depth R32F, answer RGBA8, baseline RGBA8 - 4
+// bytes per pixel each). It is created and mapped once at setup. A matching
+// frame records the five copies into it and sets pending; the next
+// RecordLiveFrame call that reuses the same seam slot reads it back. That slot
+// is only handed out after the submission following the live command buffer has
+// completed, so the copy is provably done: the queue is never waited on and the
+// host never reads a buffer that may still be in flight. One frame, one buffer,
+// no per-frame allocation.
 VkBuffer g_live_dump_buffer = VK_NULL_HANDLE;
 VkDeviceMemory g_live_dump_memory = VK_NULL_HANDLE;
 void* g_live_dump_mapped = nullptr;
@@ -271,12 +278,12 @@ uint32_t g_live_dump_pending_scene_width = 0;
 uint32_t g_live_dump_pending_scene_height = 0;
 bool g_live_dump_pending_depth = false;
 bool g_live_dump_pending_in_place = false;
-// Per-kind extents/byte sizes: mode 3 dumps all four images at the runtime
-// extent, mode 4 dumps its scene-extent inputs (colour/motion/depth) next to
-// the runtime-extent answer.
-uint32_t g_live_dump_pending_width[4] = {};
-uint32_t g_live_dump_pending_height[4] = {};
-VkDeviceSize g_live_dump_pending_bytes[4] = {};
+// Per-kind extents/byte sizes: mode 3 dumps all five images at the runtime
+// extent; mode 4 dumps its scene-extent inputs (colour/motion/depth), the
+// runtime-extent answer and the same-frame bilinear baseline.
+uint32_t g_live_dump_pending_width[5] = {};
+uint32_t g_live_dump_pending_height[5] = {};
+VkDeviceSize g_live_dump_pending_bytes[5] = {};
 
 // --- Live FSR 4 pre-upscale (dlss5_amd_mode=4) ---
 // FSR 4 runs where NR runs in mode 3: at the composition seam, on the native
@@ -701,50 +708,25 @@ void UpdateLivePrepDescriptors(VkDescriptorSet descriptor_set, const LiveFrameIn
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 // Defined after RecordLiveFrame; mode 4 dispatches here from the shared seam.
 bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input);
+// Defined with mode 4 below; the mode-4 bypass dump calls it so both runs record
+// the same scene-extent FSR inputs.
+void RunSceneExtentPrep(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                        const LiveFrameInput& input, VkDescriptorSet descriptor_set,
+                        VkImageSubresourceRange full_range);
 #endif
 
-bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
-#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
-  const bool fsr4_seam = REXCVAR_GET(dlss5_amd_mode) == 4;
-  // Mode 4's identity control is deliberately the mode-3 bypass body below: it
-  // runs the same prep at the runtime extent and copies that colour into the
-  // target, so answer == colour is the same measurement in both modes.
-  const bool fsr4_bypass = fsr4_seam && REXCVAR_GET(dlss5_live_bypass);
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  if (fsr4_seam && !fsr4_bypass) {
-    return RecordLiveFsr4Frame(cmd, input);
-  }
-#else
-  if (fsr4_seam) {
-    return false;
-  }
-#endif
-  if ((!g_runtime && !fsr4_bypass) || g_live_device == nullptr ||
-      g_live_pipeline == VK_NULL_HANDLE || input.colour_view == VK_NULL_HANDLE ||
-      input.guide_buffer == VK_NULL_HANDLE || !input.colour_width || !input.colour_height ||
-      VkDeviceSize(input.colour_width) * VkDeviceSize(input.colour_height) * 8u > kLiveGuideBytes ||
-      input.descriptor_slot >= kLiveDescriptorSlots) {
-    return false;
-  }
-  const vulkan::VulkanDevice& device = *g_live_device;
-  const vulkan::VulkanDevice::Functions& dfn = device.functions();
-  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
-  // A pending determinism dump is read back only when this call reuses the seam
-  // slot its copies were recorded with: the command processor hands that slot
-  // out only after the submission that followed the live command buffer has
-  // completed, so the copy is done. Never wait on the queue here.
-  if (g_live_dump_pending && input.descriptor_slot == g_live_dump_pending_slot) {
-    ConsumePendingLiveDump();
-  }
-
+// Runs the prep shader at the runtime extent into the mode-3 images (colour,
+// guide motion and depth). Used by the normal NR/bypass path and, on the dump
+// frame only, by mode 4 to record the same-frame bilinear baseline the bypass
+// path would hand the composition. Leaves the three images in GENERAL.
+void RunRuntimeExtentPrep(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                          const LiveFrameInput& input, VkDescriptorSet descriptor_set,
+                          VkImageSubresourceRange full_range) {
   // Rebind the slot's descriptor set for this frame: the guide buffer is
   // persistent but may have been recreated by a cache clear, and the guest
   // colour view changes as the texture cache re-creates textures. The caller
   // only hands out a slot whose previous submission has completed, so the set
-  // is not in use by in-flight work. The mode-3 outputs live at the runtime
-  // extent; mode 4 binds its scene-extent copies through the same helper.
-  const VkDescriptorSet descriptor_set = g_live_sets[input.descriptor_slot];
+  // is not in use by in-flight work.
   UpdateLivePrepDescriptors(descriptor_set, input, g_live_motion_view, g_live_colour_view,
                             g_live_depth_view);
   const bool has_depth = input.depth_view != VK_NULL_HANDLE;
@@ -810,8 +792,7 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                          sizeof(push_constants), push_constants);
   dfn.vkCmdDispatch(cmd, (g_live_width + 7u) / 8u, (g_live_height + 7u) / 8u, 1);
-  const bool trace = REXCVAR_GET(dlss5_live_trace);
-  if (trace) {
+  if (REXCVAR_GET(dlss5_live_trace)) {
     REXGPU_INFO("dlss5_live frame={} prep dispatched {}x{} -> {}x{}", input.frame,
                 input.colour_width, input.colour_height, g_live_width, g_live_height);
   }
@@ -824,6 +805,51 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &out_barrier, 0, nullptr, 0,
                            nullptr);
+}
+
+bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
+  const bool fsr4_seam = REXCVAR_GET(dlss5_amd_mode) == 4;
+  // Mode 4's identity control is deliberately the mode-3 bypass body below: it
+  // runs the same prep at the runtime extent and copies that colour into the
+  // target, so answer == colour is the same measurement in both modes.
+  const bool fsr4_bypass = fsr4_seam && REXCVAR_GET(dlss5_live_bypass);
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (fsr4_seam && !fsr4_bypass) {
+    return RecordLiveFsr4Frame(cmd, input);
+  }
+#else
+  if (fsr4_seam) {
+    return false;
+  }
+#endif
+  if ((!g_runtime && !fsr4_bypass) || g_live_device == nullptr ||
+      g_live_pipeline == VK_NULL_HANDLE || input.colour_view == VK_NULL_HANDLE ||
+      input.guide_buffer == VK_NULL_HANDLE || !input.colour_width || !input.colour_height ||
+      VkDeviceSize(input.colour_width) * VkDeviceSize(input.colour_height) * 8u > kLiveGuideBytes ||
+      input.descriptor_slot >= kLiveDescriptorSlots) {
+    return false;
+  }
+  const vulkan::VulkanDevice& device = *g_live_device;
+  const vulkan::VulkanDevice::Functions& dfn = device.functions();
+  const VkImageSubresourceRange full_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+  // A pending determinism dump is read back only when this call reuses the seam
+  // slot its copies were recorded with: the command processor hands that slot
+  // out only after the submission that followed the live command buffer has
+  // completed, so the copy is done. Never wait on the queue here.
+  if (g_live_dump_pending && input.descriptor_slot == g_live_dump_pending_slot) {
+    ConsumePendingLiveDump();
+  }
+
+  // Rebind the slot's descriptor set for this frame: the guide buffer is
+  // persistent but may have been recreated by a cache clear, and the guest
+  // colour view changes as the texture cache re-creates textures. The caller
+  // only hands out a slot whose previous submission has completed, so the set
+  // is not in use by in-flight work. The mode-3 outputs live at the runtime
+  // extent; mode 4 binds its scene-extent copies through the same helper.
+  RunRuntimeExtentPrep(cmd, dfn, input, g_live_sets[input.descriptor_slot], full_range);
+  const bool has_depth = input.depth_view != VK_NULL_HANDLE;
 
   nr::Controls controls;
   // Mode 4's target is always the separate 1920x1080 answer; the in-place
@@ -834,6 +860,20 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
     // The live identity control: no network. The pre-upscaled colour is the
     // answer, so copy it into the target (or keep it in place) and leave it in
     // the layout the composition sample needs.
+    //
+    // A mode-4 bypass dump must record the same scene-extent inputs the FSR
+    // run consumes, or the two dumps' colour/motion/depth hashes can't be
+    // compared (the mode-3 prep below writes at the runtime extent). Run the
+    // shared scene prep once, only on the frame the dump records.
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    const bool fsr4_dump_frame =
+        fsr4_bypass && g_live_dump_enabled && !g_live_dump_done &&
+        (g_live_dump_frame < 0 || uint64_t(g_live_dump_frame) == input.frame);
+    if (fsr4_dump_frame && input.colour_width == kFsrSceneWidth &&
+        input.colour_height == kFsrSceneHeight) {
+      RunSceneExtentPrep(cmd, dfn, input, g_live_sets[kLiveDescriptorSlots], full_range);
+    }
+#endif
     if (takes_target) {
       if (g_live_target_layout != VK_IMAGE_LAYOUT_GENERAL) {
         VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -885,8 +925,18 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
     }
     // The dump copies are recorded after the answer is final, in this same
     // command buffer; they restore every image to the layout tracked above.
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    if (fsr4_bypass) {
+      RecordLiveDumpFrameFsr4(cmd, dfn, input.frame, input.colour_width, input.colour_height,
+                              true, input.descriptor_slot);
+    } else {
+      RecordLiveDumpFrame(cmd, dfn, input.frame, input.colour_width, input.colour_height,
+                          takes_target, has_depth, input.descriptor_slot);
+    }
+#else
     RecordLiveDumpFrame(cmd, dfn, input.frame, input.colour_width, input.colour_height,
                         takes_target, has_depth, input.descriptor_slot);
+#endif
     REXGPU_INFO("dlss5_live frame={} BYPASS pre-upscale only ({}x{} -> {}x{})", input.frame,
                 input.colour_width, input.colour_height, g_live_width, g_live_height);
     ReportRecordedFrame(true, 0.0f);
@@ -1017,6 +1067,101 @@ bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
 // upscales 1000x600 -> the live target, which the composition substitutes for
 // the guest scene exactly as mode 3 substitutes the NR answer. The HUD draws
 // after the seam and never sees the substitute.
+// Runs the shared prep shader at the scene extent into the three FSR inputs:
+// colour, guide motion and guest depth. Leaves them SHADER_READ_ONLY for FSR
+// (and for the determinism dump). The real seam and the mode-4 bypass dump both
+// call it, so a bypass run records exactly the inputs the FSR run consumes.
+void RunSceneExtentPrep(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
+                        const LiveFrameInput& input, VkDescriptorSet descriptor_set,
+                        VkImageSubresourceRange full_range) {
+  // Bind the prep outputs at the scene extent: these are the images FSR reads,
+  // not the mode-3 runtime-extent ones (the target is the same 1920x1080 one).
+  UpdateLivePrepDescriptors(descriptor_set, input, g_fsr_motion_view, g_fsr_colour_view,
+                            g_fsr_depth_view);
+
+  // The guide resolve and the guest textures wrote in the submission that just
+  // ended; make those writes visible to the prep dispatch, exactly as mode 3.
+  VkMemoryBarrier in_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  in_barrier.srcAccessMask =
+      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  in_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in_barrier, 0, nullptr, 0,
+                           nullptr);
+
+  // FSR sampled these images last frame or the composition will after this
+  // one, so their real layout is SHADER_READ_ONLY from the second frame on;
+  // the storage write needs GENERAL.
+  VkImageMemoryBarrier scene_to_general[3] = {};
+  const VkImage scene_images[3] = {g_fsr_colour, g_fsr_motion, g_fsr_depth};
+  const VkImageLayout scene_layouts[3] = {g_fsr_colour_layout, g_fsr_motion_layout,
+                                          g_fsr_depth_layout};
+  uint32_t scene_transition_count = 0;
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (scene_layouts[i] == VK_IMAGE_LAYOUT_GENERAL) {
+      continue;
+    }
+    VkImageMemoryBarrier& barrier = scene_to_general[scene_transition_count++];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = scene_layouts[i];
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = scene_images[i];
+    barrier.subresourceRange = full_range;
+  }
+  if (scene_transition_count != 0) {
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             scene_transition_count, scene_to_general);
+  }
+  g_fsr_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
+  g_fsr_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+  dfn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline);
+  dfn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline_layout, 0, 1,
+                              &descriptor_set, 0, nullptr);
+  // [out extent, scene extent, depth enabled] - the scene inputs are a 1:1
+  // resample of the guest resolve at its own extent.
+  const uint32_t push_constants[5] = {kFsrSceneWidth, kFsrSceneHeight, input.colour_width,
+                                      input.colour_height,
+                                      input.depth_view != VK_NULL_HANDLE ? 1u : 0u};
+  dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                         sizeof(push_constants), push_constants);
+  dfn.vkCmdDispatch(cmd, (kFsrSceneWidth + 7u) / 8u, (kFsrSceneHeight + 7u) / 8u, 1);
+
+  // Make the prep stores visible, then put the three images where FSR's
+  // PIXEL_COMPUTE_READ state says they are (SHADER_READ_ONLY).
+  VkMemoryBarrier prep_done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  prep_done.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  prep_done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &prep_done, 0, nullptr, 0,
+                           nullptr);
+  VkImageMemoryBarrier scene_to_sampled[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    VkImageMemoryBarrier& barrier = scene_to_sampled[i];
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = scene_images[i];
+    barrier.subresourceRange = full_range;
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3,
+                           scene_to_sampled);
+  g_fsr_colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  g_fsr_motion_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  g_fsr_depth_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
 bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   if (!g_fsr_ready || g_fsr_context == nullptr || g_fsr_functions == nullptr ||
       g_live_device == nullptr || g_live_pipeline == VK_NULL_HANDLE ||
@@ -1076,91 +1221,18 @@ bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input) {
     ConsumePendingLiveDump();
   }
 
+  // On the dump frame, run the mode-3 pre-upscale too: it writes the runtime-
+  // extent bilinear answer the bypass path would substitute, from this same
+  // frame's scene. The dump records it next to the FSR answer, so the A/B pair
+  // shares one guest frame and one set of inputs by construction.
+  if (g_live_dump_enabled && !g_live_dump_done &&
+      (g_live_dump_frame < 0 || uint64_t(g_live_dump_frame) == input.frame)) {
+    RunRuntimeExtentPrep(cmd, dfn, input, g_live_sets[kLiveDescriptorSlots], full_range);
+  }
+
   // Bind the prep outputs at the scene extent: these are the images FSR reads,
   // not the mode-3 runtime-extent ones (the target is the same 1920x1080 one).
-  UpdateLivePrepDescriptors(g_live_sets[slot], input, g_fsr_motion_view, g_fsr_colour_view,
-                            g_fsr_depth_view);
-
-  // The guide resolve and the guest textures wrote in the submission that just
-  // ended; make those writes visible to the prep dispatch, exactly as mode 3.
-  VkMemoryBarrier in_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  in_barrier.srcAccessMask =
-      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  in_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in_barrier, 0, nullptr, 0,
-                           nullptr);
-
-  // FSR sampled these images last frame or the composition will after this
-  // one, so their real layout is SHADER_READ_ONLY from the second frame on;
-  // the storage write needs GENERAL.
-  VkImageMemoryBarrier scene_to_general[3] = {};
-  const VkImage scene_images[3] = {g_fsr_colour, g_fsr_motion, g_fsr_depth};
-  const VkImageLayout scene_layouts[3] = {g_fsr_colour_layout, g_fsr_motion_layout,
-                                          g_fsr_depth_layout};
-  uint32_t scene_transition_count = 0;
-  for (uint32_t i = 0; i < 3; ++i) {
-    if (scene_layouts[i] == VK_IMAGE_LAYOUT_GENERAL) {
-      continue;
-    }
-    VkImageMemoryBarrier& barrier = scene_to_general[scene_transition_count++];
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.oldLayout = scene_layouts[i];
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = scene_images[i];
-    barrier.subresourceRange = full_range;
-  }
-  if (scene_transition_count != 0) {
-    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                             scene_transition_count, scene_to_general);
-  }
-  g_fsr_colour_layout = VK_IMAGE_LAYOUT_GENERAL;
-  g_fsr_motion_layout = VK_IMAGE_LAYOUT_GENERAL;
-  g_fsr_depth_layout = VK_IMAGE_LAYOUT_GENERAL;
-
-  dfn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline);
-  dfn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_live_pipeline_layout, 0, 1,
-                              &g_live_sets[slot], 0, nullptr);
-  // [out extent, scene extent, depth enabled] - the scene inputs are a 1:1
-  // resample of the guest resolve at its own extent.
-  const uint32_t push_constants[5] = {kFsrSceneWidth, kFsrSceneHeight, input.colour_width,
-                                      input.colour_height, 1u};
-  dfn.vkCmdPushConstants(cmd, g_live_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                         sizeof(push_constants), push_constants);
-  dfn.vkCmdDispatch(cmd, (kFsrSceneWidth + 7u) / 8u, (kFsrSceneHeight + 7u) / 8u, 1);
-
-  // Make the prep stores visible, then put the three images where FSR's
-  // PIXEL_COMPUTE_READ state says they are (SHADER_READ_ONLY).
-  VkMemoryBarrier prep_done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  prep_done.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-  prep_done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &prep_done, 0, nullptr, 0,
-                           nullptr);
-  VkImageMemoryBarrier scene_to_sampled[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
-    VkImageMemoryBarrier& barrier = scene_to_sampled[i];
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = scene_images[i];
-    barrier.subresourceRange = full_range;
-  }
-  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 3,
-                           scene_to_sampled);
-  g_fsr_colour_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  g_fsr_motion_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  g_fsr_depth_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  RunSceneExtentPrep(cmd, dfn, input, g_live_sets[slot], full_range);
 
   // The answer image is FSR's UAV, i.e. GENERAL while it is dispatched. It is
   // SHADER_READ_ONLY after the previous frame's composition sampled it.
@@ -1254,12 +1326,29 @@ bool RecordLiveFsr4Frame(VkCommandBuffer cmd, const LiveFrameInput& input) {
   desc.frameTimeDelta = frame_time_ms;
   desc.preExposure = 1.0f;
   desc.reset = input.reset;
-  // The recompiled game does not expose camera parameters; the presenter uses
-  // the same placeholders. FSR's depth use with these is the open T4.6/T4.12
-  // measurement (real depth, estimated camera).
-  desc.cameraNear = 0.1f;
-  desc.cameraFar = 1000.0f;
-  desc.cameraFovAngleVertical = 1.0472f;
+  // The projection hook stores the guest's real near/far/vertical FOV each frame (see
+  // rex/ui/temporal_jitter.h); FSR uses them to rebuild view-space depth from the guest depth
+  // resolve. Until the hook has captured a camera (offline tools, a title-screen frame before the
+  // first scene projection), keep the placeholders the presenter uses.
+  float camera_near = 0.1f;
+  float camera_far = 1000.0f;
+  float camera_fov_y = 1.0472f;
+  const bool camera_from_guest =
+      rex::ui::temporal::GetCameraProjection(camera_near, camera_far, camera_fov_y);
+  static bool camera_logged = false;
+  if (!camera_logged) {
+    camera_logged = true;
+    if (camera_from_guest) {
+      REXGPU_INFO("fsr4_seam: camera from the guest projection near={:.4f} far={:.1f} "
+                  "fov_y={:.4f} rad ({:.2f} deg)",
+                  camera_near, camera_far, camera_fov_y, camera_fov_y * 57.2957795f);
+    } else {
+      REXGPU_WARN("fsr4_seam: no guest camera captured yet; using near=0.1 far=1000 fov_y=60 deg");
+    }
+  }
+  desc.cameraNear = camera_near;
+  desc.cameraFar = camera_far;
+  desc.cameraFovAngleVertical = camera_fov_y;
   desc.viewSpaceToMetersFactor = 1.0f;
   desc.flags = 0;
 
@@ -1812,14 +1901,14 @@ void ConsumePendingLiveDump() {
 
   const std::string& prefix = g_live_dump_prefix;
   const uint64_t frame = g_live_dump_pending_frame;
-  static constexpr const char* kKinds[4] = {"colour", "motion", "depth", "answer"};
-  static constexpr const char* kExtensions[4] = {".rgba", ".rg16f", ".r32f", ".rgba"};
-  static constexpr const char* kFormats[4] = {"R8G8B8A8_UNORM", "R16G16_SFLOAT", "R32_SFLOAT",
-                                              "R8G8B8A8_UNORM"};
+  static constexpr const char* kKinds[5] = {"colour", "motion", "depth", "answer", "baseline"};
+  static constexpr const char* kExtensions[5] = {".rgba", ".rg16f", ".r32f", ".rgba", ".rgba"};
+  static constexpr const char* kFormats[5] = {"R8G8B8A8_UNORM", "R16G16_SFLOAT", "R32_SFLOAT",
+                                              "R8G8B8A8_UNORM", "R8G8B8A8_UNORM"};
   const auto* const base = static_cast<const uint8_t*>(g_live_dump_mapped);
-  std::string paths[4];
-  std::string shas[4];
-  for (uint32_t i = 0; i < 4; ++i) {
+  std::string paths[5];
+  std::string shas[5];
+  for (uint32_t i = 0; i < 5; ++i) {
     const VkDeviceSize bytes =
         g_live_dump_pending_bytes[i] != 0 ? g_live_dump_pending_bytes[i] : g_live_dump_image_bytes;
     paths[i] = LiveDumpFilePath(prefix, frame, kKinds[i], kExtensions[i]);
@@ -1852,14 +1941,14 @@ void ConsumePendingLiveDump() {
   json << "  \"depth_enabled\": " << (g_live_dump_pending_depth ? "true" : "false") << ",\n";
   json << "  \"answer_in_place\": " << (g_live_dump_pending_in_place ? "true" : "false") << ",\n";
   json << "  \"images\": {\n";
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     const VkDeviceSize bytes =
         g_live_dump_pending_bytes[i] != 0 ? g_live_dump_pending_bytes[i] : g_live_dump_image_bytes;
     json << "    \"" << kKinds[i] << "\": {\"file\": \"" << JsonEscape(paths[i])
          << "\", \"format\": \"" << kFormats[i] << "\", \"extent\": ["
          << g_live_dump_pending_width[i] << ", " << g_live_dump_pending_height[i]
          << "], \"bytes\": " << uint64_t(bytes) << ", \"sha256\": \"" << shas[i] << "\"}"
-         << (i + 1 < 4 ? "," : "") << "\n";
+         << (i + 1 < 5 ? "," : "") << "\n";
   }
   json << "  }\n}\n";
   json.close();
@@ -1875,7 +1964,7 @@ void ConsumePendingLiveDump() {
               g_live_dump_pending_in_place ? "in-place" : "target");
 }
 
-// Records the four dump copies into the live command buffer after the answer is
+// Records the five dump copies into the live command buffer after the answer is
 // final and restores every image to the layout the caller tracked. Returns true
 // when this frame recorded the dump.
 bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functions& dfn,
@@ -1894,27 +1983,29 @@ bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functi
       g_live_depth == VK_NULL_HANDLE || g_live_substitute_image == VK_NULL_HANDLE) {
     return false;
   }
-  // Colour, motion, depth and the answer at four fixed offsets. All four live
-  // images are 4 bytes per pixel (RGBA8 / RG16F / R32F / RGBA8), so the offset
-  // stride is one image's byte size. In-place live NR makes the answer the
-  // colour image itself; slot 3 then duplicates slot 0 and the JSON says so.
+  // Colour, motion, depth, the answer and the bilinear baseline at five fixed offsets. All five
+  // live images are 4 bytes per pixel (RGBA8 / RG16F / R32F / RGBA8 / RGBA8), so the offset
+  // stride is one image's byte size. In-place live NR makes the answer the colour image itself;
+  // slot 3 then duplicates slot 0 and the JSON says so. The baseline is the pre-upscaled colour
+  // at the runtime extent - the answer the bypass path hands the composition.
   struct DumpCopy {
     VkImage image;
     VkImageLayout layout;
     VkDeviceSize offset;
   };
-  const DumpCopy copies[4] = {
+  const DumpCopy copies[5] = {
       {g_live_colour, g_live_colour_layout, 0},
       {g_live_motion, g_live_motion_layout, g_live_dump_image_bytes},
       {g_live_depth, g_live_depth_layout, 2 * g_live_dump_image_bytes},
       {g_live_substitute_image,
        takes_target ? g_live_target_layout : g_live_colour_layout,
        3 * g_live_dump_image_bytes},
+      {g_live_colour, g_live_colour_layout, 4 * g_live_dump_image_bytes},
   };
   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  VkImageMemoryBarrier src[4] = {};
+  VkImageMemoryBarrier src[5] = {};
   uint32_t src_count = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     bool duplicate = false;
     for (uint32_t j = 0; j < i; ++j) {
       duplicate = duplicate || copies[j].image == copies[i].image;
@@ -1950,9 +2041,9 @@ bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functi
   }
   // Back to exactly the layout the caller tracked, so the composition draw and
   // the next frame see the same state as without the dump.
-  VkImageMemoryBarrier dst[4] = {};
+  VkImageMemoryBarrier dst[5] = {};
   uint32_t dst_count = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     bool duplicate = false;
     for (uint32_t j = 0; j < i; ++j) {
       duplicate = duplicate || copies[j].image == copies[i].image;
@@ -1996,8 +2087,8 @@ bool RecordLiveDumpFrame(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functi
   g_live_dump_pending_scene_height = scene_height;
   g_live_dump_pending_depth = depth_enabled;
   g_live_dump_pending_in_place = !takes_target;
-  // Mode 3: all four images are the runtime extent with the same byte size.
-  for (uint32_t i = 0; i < 4; ++i) {
+  // Mode 3: all five images are the runtime extent with the same byte size.
+  for (uint32_t i = 0; i < 5; ++i) {
     g_live_dump_pending_width[i] = g_live_width;
     g_live_dump_pending_height[i] = g_live_height;
     g_live_dump_pending_bytes[i] = g_live_dump_image_bytes;
@@ -2036,36 +2127,30 @@ void RecordLiveDumpFrameFsr4(VkCommandBuffer cmd, const vulkan::VulkanDevice::Fu
     VkDeviceSize bytes;
   };
   const VkDeviceSize scene_bytes = VkDeviceSize(scene_width) * scene_height * 4u;
-  DumpCopy copies[4];
-  if (bypass) {
-    if (g_live_colour == VK_NULL_HANDLE || g_live_motion == VK_NULL_HANDLE ||
-        g_live_depth == VK_NULL_HANDLE) {
-      return;
-    }
-    copies[0] = {g_live_colour, g_live_colour_layout, 0, g_live_width, g_live_height,
-                 g_live_dump_image_bytes};
-    copies[1] = {g_live_motion, g_live_motion_layout, g_live_dump_image_bytes, g_live_width,
-                 g_live_height, g_live_dump_image_bytes};
-    copies[2] = {g_live_depth, g_live_depth_layout, 2 * g_live_dump_image_bytes, g_live_width,
-                 g_live_height, g_live_dump_image_bytes};
-  } else {
-    if (g_fsr_colour == VK_NULL_HANDLE || g_fsr_motion == VK_NULL_HANDLE ||
-        g_fsr_depth == VK_NULL_HANDLE) {
-      return;
-    }
-    copies[0] = {g_fsr_colour, g_fsr_colour_layout, 0, scene_width, scene_height, scene_bytes};
-    copies[1] = {g_fsr_motion, g_fsr_motion_layout, g_live_dump_image_bytes, scene_width,
-                 scene_height, scene_bytes};
-    copies[2] = {g_fsr_depth, g_fsr_depth_layout, 2 * g_live_dump_image_bytes, scene_width,
-                 scene_height, scene_bytes};
+  DumpCopy copies[5];
+  // Both variants dump the scene-extent FSR inputs next to the runtime-extent
+  // answer: mode 4's bypass runs the same prep for this frame (see RecordLiveFrame),
+  // so a bypass and an FSR dump of one guest frame have identical input hashes.
+  // Slot 4 is the runtime-extent bilinear baseline this same frame's mode-3 prep
+  // writes (the answer the bypass path would substitute).
+  if (g_fsr_colour == VK_NULL_HANDLE || g_fsr_motion == VK_NULL_HANDLE ||
+      g_fsr_depth == VK_NULL_HANDLE || g_live_colour == VK_NULL_HANDLE) {
+    return;
   }
+  copies[0] = {g_fsr_colour, g_fsr_colour_layout, 0, scene_width, scene_height, scene_bytes};
+  copies[1] = {g_fsr_motion, g_fsr_motion_layout, g_live_dump_image_bytes, scene_width,
+               scene_height, scene_bytes};
+  copies[2] = {g_fsr_depth, g_fsr_depth_layout, 2 * g_live_dump_image_bytes, scene_width,
+               scene_height, scene_bytes};
   copies[3] = {g_live_target, g_live_target_layout, 3 * g_live_dump_image_bytes, g_live_width,
+               g_live_height, g_live_dump_image_bytes};
+  copies[4] = {g_live_colour, g_live_colour_layout, 4 * g_live_dump_image_bytes, g_live_width,
                g_live_height, g_live_dump_image_bytes};
 
   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  VkImageMemoryBarrier src[4] = {};
+  VkImageMemoryBarrier src[5] = {};
   uint32_t src_count = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     bool duplicate = false;
     for (uint32_t j = 0; j < i; ++j) {
       duplicate = duplicate || copies[j].image == copies[i].image;
@@ -2096,9 +2181,9 @@ void RecordLiveDumpFrameFsr4(VkCommandBuffer cmd, const vulkan::VulkanDevice::Fu
     dfn.vkCmdCopyImageToBuffer(cmd, copy.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                g_live_dump_buffer, 1, &region);
   }
-  VkImageMemoryBarrier dst[4] = {};
+  VkImageMemoryBarrier dst[5] = {};
   uint32_t dst_count = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     bool duplicate = false;
     for (uint32_t j = 0; j < i; ++j) {
       duplicate = duplicate || copies[j].image == copies[i].image;
@@ -2141,7 +2226,7 @@ void RecordLiveDumpFrameFsr4(VkCommandBuffer cmd, const vulkan::VulkanDevice::Fu
   g_live_dump_pending_scene_height = scene_height;
   g_live_dump_pending_depth = true;
   g_live_dump_pending_in_place = false;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 5; ++i) {
     g_live_dump_pending_width[i] = copies[i].width;
     g_live_dump_pending_height[i] = copies[i].height;
     g_live_dump_pending_bytes[i] = copies[i].bytes;
@@ -2265,7 +2350,7 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
     }
   }
 #endif  // REX_HAS_FIDELITYFX_RUNTIME
-  // The optional determinism dump: one host-visible buffer for all four images,
+  // The optional determinism dump: one host-visible buffer for all five images,
   // sized for at least 1920x1080 each (every live image is 4 bytes per pixel).
   // Created and mapped here so the recorded-frame path never allocates or maps;
   // a failure only disables the dump, never live NR.
@@ -2274,7 +2359,7 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
         VkDeviceSize(g_live_width) * VkDeviceSize(g_live_height),
         VkDeviceSize(1920) * VkDeviceSize(1080));
     g_live_dump_image_bytes = pixels * 4;
-    const VkDeviceSize dump_bytes = g_live_dump_image_bytes * 4;
+    const VkDeviceSize dump_bytes = g_live_dump_image_bytes * 5;
     if (!vulkan::util::CreateDedicatedAllocationBuffer(
             &device, dump_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             vulkan::util::MemoryPurpose::kReadback, g_live_dump_buffer,
@@ -2379,15 +2464,14 @@ bool InitializeLiveResources(const vulkan::VulkanDevice& device, VkQueue queue, 
   }
   VkDescriptorPoolSize pool_sizes[3] = {};
   pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_sizes[0].descriptorCount = kLiveDescriptorSlots;
+  pool_sizes[0].descriptorCount = kLivePrepSets;
   pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  pool_sizes[1].descriptorCount = 3 * kLiveDescriptorSlots;
+  pool_sizes[1].descriptorCount = 3 * kLivePrepSets;
   pool_sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  pool_sizes[2].descriptorCount = 2 * kLiveDescriptorSlots;
+  pool_sizes[2].descriptorCount = 2 * kLivePrepSets;
   g_live_pool = std::make_unique<vulkan::SingleLayoutDescriptorSetPool>(
-      &device, kLiveDescriptorSlots, uint32_t(rex::countof(pool_sizes)), pool_sizes,
-      g_live_set_layout);
-  for (uint32_t i = 0; i < kLiveDescriptorSlots; ++i) {
+      &device, kLivePrepSets, uint32_t(rex::countof(pool_sizes)), pool_sizes, g_live_set_layout);
+  for (uint32_t i = 0; i < kLivePrepSets; ++i) {
     const size_t index = g_live_pool->Allocate();
     if (index == SIZE_MAX) {
       return fail("descriptor set");

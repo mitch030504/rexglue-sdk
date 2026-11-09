@@ -29,6 +29,16 @@ void SetActive(uint32_t render_width, uint32_t render_height);
 void SetInactive();
 bool IsActive(uint32_t& render_width_out, uint32_t& render_height_out);
 
+/// The guest's latest scene perspective camera, captured by the game's projection hook for
+/// upscalers that map device depth back to view space (FSR's cameraNear/cameraFar/
+/// cameraFovAngleVertical). Values are the ones the guest used to build this frame's projection:
+/// the near and far plane distances and the full vertical field of view, in radians. The hook
+/// supplies them before any sub-pixel jitter, which shifts both frustum edges equally and leaves
+/// the vertical span unchanged. GetCameraProjection returns false until a valid capture exists.
+void SetCameraProjection(float near_plane, float far_plane, float vertical_fov_radians);
+bool GetCameraProjection(float& near_plane_out, float& far_plane_out,
+                         float& vertical_fov_radians_out);
+
 /// Guest frame index on the CPU side: how many times the guest has called VdSwap.
 void OnGuestSwap();
 uint64_t GuestSwapCount();
