@@ -3804,15 +3804,15 @@ void VulkanCommandProcessor::AdvanceMotionFrame(uint64_t frame) {
     REXLOG_INFO(
         "motion_guide frame={} blocks={} realloc={} index_set_changed={} clamped={} keys={} "
         "draws={} missing={} stale={} no_variant={} no_bounds={} no_viewport={} history={} "
-        "new={} moved={} layout_end={} live_end={} freed={} holes={} free_slots={} tail_free={} "
-        "drawn_end={} reused={} bumped={} grew={} repack={} ff_steps={} no_space={}",
+        "aliased={} new={} moved={} layout_end={} live_end={} freed={} holes={} free_slots={} "
+        "tail_free={} drawn_end={} reused={} bumped={} grew={} repack={} ff_steps={} no_space={}",
         report.frame, report.blocks, report.reallocated, report.index_set_changed, report.clamped,
         motion_frame_keys_, motion_frame_draws_, motion_frame_missing_, motion_frame_stale_,
         motion_frame_no_variant_, motion_frame_no_bounds_, motion_frame_no_viewport_,
-        report.history, report.new_blocks, report.moved_blocks, report.layout_end, report.live_end,
-        report.freed, report.holes, report.free_slots, report.tail_free, report.drawn_end,
-        report.reused, report.bumped, report.grew, report.repacked, report.ff_steps,
-        report.no_space);
+        report.history, report.aliased, report.new_blocks, report.moved_blocks, report.layout_end,
+        report.live_end, report.freed, report.holes, report.free_slots, report.tail_free,
+        report.drawn_end, report.reused, report.bumped, report.grew, report.repacked,
+        report.ff_steps, report.no_space);
   }
 
   // The guest projection carries the temporal-upscaler jitter (the projection hook
@@ -4760,8 +4760,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // The draw command is recorded, so the block now holds this frame's clip data
   // in the current half and becomes the previous frame for the next one. Stamping
   // it only now keeps skipped draws (async placeholders, failed binds) out of the
-  // history.
-  if (motion_clip_draw.allocated) {
+  // history. A key already drawn this frame aliases this block, so it has no
+  // single owner and must not be stamped - see MotionClipArena.
+  if (motion_clip_draw.allocated && motion_clip_draw.history_write) {
     CommitMotionClipBlock(motion_clip_draw.key);
   }
 

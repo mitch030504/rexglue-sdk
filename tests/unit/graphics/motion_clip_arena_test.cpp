@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <random>
@@ -248,6 +249,44 @@ TEST_CASE("motion clip arena reset clears every range", "[graphics]") {
   REQUIRE(arena.Validate());
 }
 
+TEST_CASE("motion clip arena denies history to a key drawn twice in one frame", "[graphics]") {
+  // Two draw calls carrying one identity key place the same block: the key is
+  // the identity, so the map cannot hold two. The slot then holds whichever draw
+  // wrote last, so neither draw may leave history behind - the next frame must
+  // not read one draw's clip for the other.
+  MotionClipArena arena(kHalfSlots, kMaxDrawSlots);
+  MotionClipArena::FrameReport report;
+  MotionClipArena::Draw first;
+  MotionClipArena::Draw second;
+
+  REQUIRE(arena.BeginFrame(1, report));
+  REQUIRE(arena.Allocate(7, 0, 7, 0x11, first));
+  REQUIRE(first.history_write);
+  arena.Commit(7);
+
+  REQUIRE(arena.BeginFrame(2, report));
+  REQUIRE(arena.Allocate(7, 0, 7, 0x11, first));
+  REQUIRE(first.prev_clip_base != UINT32_MAX);
+  REQUIRE(first.history_write);
+  arena.Commit(7);
+
+  // The second draw of the same key aliases the first draw's slot. It must not
+  // read the previous half either: that half belongs to whichever draw wrote
+  // last frame, not necessarily this one.
+  REQUIRE(arena.Allocate(7, 0, 7, 0x11, second));
+  REQUIRE(second.prev_clip_base == UINT32_MAX);
+  REQUIRE_FALSE(second.history_write);
+  REQUIRE(arena.stats().aliased == 1);
+  arena.Commit(7);
+
+  REQUIRE(arena.BeginFrame(3, report));
+  REQUIRE(report.aliased == 1);
+  REQUIRE(arena.Allocate(7, 0, 7, 0x11, first));
+  REQUIRE(first.prev_clip_base == UINT32_MAX);
+  REQUIRE(arena.stats().history == 0);
+  REQUIRE(arena.Validate());
+}
+
 TEST_CASE("motion clip arena never aliases a previous-half owner", "[graphics]") {
   // Shadow model of the GPU arena: history is valid only if every slot the draw
   // claims to have written last frame is still owned by the same key in the
@@ -267,6 +306,7 @@ TEST_CASE("motion clip arena never aliases a previous-half owner", "[graphics]")
     current_owner.clear();
 
     const uint32_t draw_count = rng() % 12;
+    std::map<uint64_t, uint32_t> draws_this_frame;
     for (uint32_t i = 0; i < draw_count; ++i) {
       const uint64_t key = rng() % 8;
       const uint32_t min_index = rng() % 24;
@@ -274,6 +314,13 @@ TEST_CASE("motion clip arena never aliases a previous-half owner", "[graphics]")
       MotionClipArena::Draw draw;
       if (!arena.Allocate(key, min_index, min_index + span - 1, key * 101 + span, draw)) {
         continue;
+      }
+      // A key drawn a second time in the frame aliases the first draw's block:
+      // it may neither read the previous half nor be stamped as history.
+      const bool aliased = draws_this_frame[key]++ != 0;
+      REQUIRE(draw.history_write == !aliased);
+      if (aliased) {
+        REQUIRE(draw.prev_clip_base == UINT32_MAX);
       }
       const uint32_t offset = SlotOffset(arena, draw);
       const uint32_t capacity = draw.index_max - draw.index_min + 1;
@@ -289,12 +336,22 @@ TEST_CASE("motion clip arena never aliases a previous-half owner", "[graphics]")
       }
       if (rng() & 1) {
         arena.Commit(key);
-        for (uint32_t slot = offset; slot < offset + capacity; ++slot) {
-          current_owner[slot] = key;
+        // Commit is a no-op for an aliased block; the shadow model must not
+        // record an owner the arena will not honour either.
+        if (draw.history_write) {
+          for (uint32_t slot = offset; slot < offset + capacity; ++slot) {
+            current_owner[slot] = key;
+          }
         }
       }
     }
-    REQUIRE(arena.Validate());
+    REQUIRE(arena.stats().aliased ==
+            std::count_if(draws_this_frame.begin(), draws_this_frame.end(),
+                          [](const auto& entry) { return entry.second > 1; }));
+    std::string why;
+    const bool valid = arena.Validate(&why);
+    INFO(why);
+    REQUIRE(valid);
   }
 }
 

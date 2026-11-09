@@ -68,6 +68,10 @@ class MotionClipArena {
     // is placed once per frame and every later sub-draw reuses that placement.
     uint64_t allocated_frame = UINT64_MAX;
     uint32_t frame_prev_clip_base = UINT32_MAX;
+    // Cleared when a second draw claims this block in `allocated_frame`: the
+    // slot then holds more than one draw's clip, so it must not be stamped as
+    // written and must not be read as history by the next frame.
+    bool history_write = true;
   };
 
   // Per-draw result handed to the system constants. 0xFFFFFFFF in either base
@@ -79,6 +83,10 @@ class MotionClipArena {
     uint32_t index_min = 0;
     uint32_t index_max = 0;
     bool allocated = false;
+    // False for a placement whose key was already drawn this frame (the draws
+    // alias one block). The caller must not stamp it as written; the previous
+    // half is cleared as well, because it belongs to whichever draw wrote last.
+    bool history_write = true;
   };
 
   // Counters for the frame that just ended, reported by BeginFrame. The layout
@@ -92,6 +100,7 @@ class MotionClipArena {
     uint32_t index_set_changed = 0;
     uint32_t clamped = 0;
     uint32_t history = 0;  // draw sub-draws with a readable previous half
+    uint32_t aliased = 0;  // keys drawn more than once this frame (no history)
     uint32_t new_blocks = 0;
     uint32_t moved_blocks = 0;  // reused blocks whose placement was recomputed
     uint32_t repacked = 0;      // reused blocks whose offset actually changed
@@ -185,6 +194,7 @@ inline bool MotionClipArena::BeginFrame(uint64_t frame, FrameReport& report) {
     report.index_set_changed = stats_.index_set_changed;
     report.clamped = stats_.clamped;
     report.history = stats_.history;
+    report.aliased = stats_.aliased;
     report.new_blocks = stats_.new_blocks;
     report.moved_blocks = stats_.moved_blocks;
     report.repacked = stats_.repacked;
@@ -273,20 +283,30 @@ inline bool MotionClipArena::Allocate(uint64_t key, uint32_t draw_index_min,
                                       uint32_t draw_index_max, uint64_t index_fingerprint,
                                       Draw& draw_out) {
   // A key may be drawn as several primitives. The block is placed once per
-  // frame; every later sub-draw reuses that placement and its history decision.
+  // frame; every later sub-draw reuses that placement. Those later draws alias
+  // the first draw's slot, though, so the block can no longer be attributed to
+  // one draw: the previous half belongs to whichever draw wrote it last, and the
+  // current half is a mix. Both the read and the history stamp are dropped so a
+  // key that is not stable geometry never feeds the next frame's motion.
   {
     auto existing = blocks_.find(key);
     if (existing != blocks_.end() && existing->second.allocated_frame == frame_) {
-      const Block& block = existing->second;
+      Block& block = existing->second;
+      // Count the key once: the first repeat is the aliasing event, later draws
+      // are already accounted for.
+      if (block.history_write) {
+        block.history_write = false;
+        block.frame_prev_clip_base = UINT32_MAX;
+        block.last_frame = UINT64_MAX;
+        ++stats_.aliased;
+      }
       draw_out.key = key;
       draw_out.clip_base = parity_ * slot_capacity_ + block.slot_offset;
-      draw_out.prev_clip_base = block.frame_prev_clip_base;
+      draw_out.prev_clip_base = UINT32_MAX;
       draw_out.index_min = block.index_min;
       draw_out.index_max = block.index_max;
       draw_out.allocated = true;
-      if (block.frame_prev_clip_base != UINT32_MAX) {
-        ++stats_.history;
-      }
+      draw_out.history_write = false;
       return true;
     }
   }
@@ -366,6 +386,7 @@ inline bool MotionClipArena::Allocate(uint64_t key, uint32_t draw_index_min,
   block.index_max = new_index_min + capacity - 1;
   block.index_fingerprint = index_fingerprint;
   block.allocated_frame = frame_;
+  block.history_write = true;
   block.frame_prev_clip_base = history_valid ? (parity_ ^ 1) * slot_capacity_ + offset : UINT32_MAX;
   if (reused && (min_changed || capacity_changed)) {
     ++stats_.reallocated;
@@ -391,7 +412,8 @@ inline bool MotionClipArena::Allocate(uint64_t key, uint32_t draw_index_min,
 
 inline void MotionClipArena::Commit(uint64_t key) {
   auto it = blocks_.find(key);
-  if (it != blocks_.end()) {
+  // An aliased block has no single owner, so it never becomes readable history.
+  if (it != blocks_.end() && it->second.history_write) {
     it->second.last_frame = frame_;
   }
 }
@@ -532,8 +554,12 @@ inline bool MotionClipArena::Validate(std::string* why) const {
     previous_end = range.second;
     live_slots += range.second - range.first;
   }
-  if (previous_end != layout_end_) {
-    return Fail(why, "layout end is not the live end");
+  // `layout_end_` is the frame's high-water mark and is only recomputed at
+  // rotation, so moving a frontier block into a lower hole leaves it above the
+  // highest live range for the rest of the frame. The live+free coverage check
+  // below still requires every slot up to it to be accounted for exactly once.
+  if (previous_end > layout_end_) {
+    return Fail(why, "layout end is below the live end");
   }
   uint32_t free_slots = 0;
   uint32_t free_end = 0;
