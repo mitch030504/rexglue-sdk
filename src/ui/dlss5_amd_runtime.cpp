@@ -715,6 +715,7 @@ void RunSceneExtentPrep(VkCommandBuffer cmd, const vulkan::VulkanDevice::Functio
                         VkImageSubresourceRange full_range);
 #endif
 
+#if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
 // Runs the prep shader at the runtime extent into the mode-3 images (colour,
 // guide motion and depth). Used by the normal NR/bypass path and, on the dump
 // frame only, by mode 4 to record the same-frame bilinear baseline the bypass
@@ -806,6 +807,7 @@ void RunRuntimeExtentPrep(VkCommandBuffer cmd, const vulkan::VulkanDevice::Funct
                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &out_barrier, 0, nullptr, 0,
                            nullptr);
 }
+#endif  // REX_HAS_DLSS5_AMD
 
 bool RecordLiveFrame(VkCommandBuffer cmd, const LiveFrameInput& input) {
 #if defined(REX_HAS_DLSS5_AMD) && REX_HAS_DLSS5_AMD
